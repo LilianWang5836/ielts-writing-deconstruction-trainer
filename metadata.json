@@ -1,0 +1,8 @@
+{
+  "name": "IELTS Writing Deconstruction Trainer -2",
+  "description": "An interactive IELTS Writing Task 2 trainer that guides users step-by-step through topic analysis, argument selection, template fitting, block-based writing, and deep logical AI feedback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

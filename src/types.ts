@@ -1,0 +1,253 @@
+export interface Topic {
+  id: string;
+  question: string;
+  topic: 'Education' | 'Technology' | 'Environment' | 'Government' | 'Health' | 'Media' | 'Crime' | 'Culture' | 'Work';
+  questionType: 'Agree / Disagree' | 'Discuss Both Views' | 'Advantages / Disadvantages' | 'Two-part Question' | 'Problem / Solution';
+  difficulty: 'Easy' | 'Medium' | 'Hard';
+}
+
+export interface TopicAnalysis {
+  questionType: string;
+  isCorrectType: boolean;
+  correctType: string;
+  coreIssue: string;
+  constraints: string[];
+  explanation: string;
+}
+
+export interface Dimension {
+  id: string;
+  name: string;
+  prompt: string; // e.g. "accessibility (who can access)"
+  selected: boolean;
+  isCustom?: boolean;
+}
+
+export interface ArgumentSeed {
+  id: string;
+  dimension: string;
+  direction: 'SUPPORT' | 'AGAINST' | 'MIXED';
+  mechanism: string; // e.g. "more rural students reach education"
+  scope: string; // e.g. "removes distance constraint"
+}
+
+export interface ArgumentBundle {
+  id: string;
+  name: string; // e.g. "Option A"
+  seeds: ArgumentSeed[];
+  implicitImpact: string; // e.g. "positive impact"
+}
+
+export interface ThesisOption {
+  id: string;
+  thesis: string;
+  strength: string; // "Strong" | "Balanced" | "Weak"
+  logicFlow: string;
+}
+
+export interface Template {
+  id: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+  name: string;
+  structure: string; // e.g. "Claim -> Reason -> Mechanism -> Result"
+  description: string;
+  exampleTopic: string;
+  exampleElements: {
+    claim: string;
+    reason: string;
+    mechanism?: string;
+    example?: string;
+    result?: string;
+    contrast?: string;
+    concession?: string;
+    definition?: string;
+    affectedGroup?: string;
+    evaluation?: string;
+  };
+  keywords: string[];
+}
+
+export interface ArgumentationFeedback {
+  structure: {
+    claim: boolean;
+    reason: boolean;
+    mechanism: boolean;
+    example: boolean;
+    result: boolean;
+    evaluation: boolean;
+    concession: boolean;
+    contrast: boolean;
+    definition: boolean;
+    affectedGroup: boolean;
+  };
+  missingElements: string[];
+  socraticQuestions: string[];
+  suggestedChain: {
+    claim: string;
+    reason: string;
+    mechanism?: string;
+    example?: string;
+    result?: string;
+    evaluation?: string;
+    concession?: string;
+    contrast?: string;
+    definition?: string;
+    affectedGroup?: string;
+  };
+  critique: string;
+}
+
+export interface SentencePracticeTask {
+  id: string;
+  concept: string; // e.g. "Students have the flexibility to manage their study schedules"
+  prompts: string[]; // Lexical cues: "have the flexibility to...", "manage study schedules"
+  userDraft?: string;
+  aiFeedback?: {
+    grammar: string[];
+    lexicalResource: string[];
+    improved: string;
+    score: number; // 1-9 Band
+  };
+}
+
+export interface OverallFeedback {
+  bandScore: number;
+  taScore: number; // Task Achievement
+  ccScore: number; // Coherence and Cohesion
+  lrScore: number; // Lexical Resource
+  graScore: number; // Grammatical Accuracy and Range
+  structureDiagnosis: string;
+  logicCritique: string;
+  detailedFeedback: string;
+  revisions: {
+    before: string;
+    after: string;
+    explanation: string;
+  }[];
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: 'ai' | 'user';
+  text: string;
+  timestamp: string;
+  isSplit?: boolean;
+}
+
+export interface PracticeSession {
+  id: string;
+  topic: Topic;
+  currentStep: number; // 1 to 5
+  step1: {
+    selectedType?: string;
+    userCoreIssue?: string;
+    analysis?: TopicAnalysis;
+    userAnalysisNotes?: string; // User self-written analysis
+    coachEvaluation?: {
+      correctType: string;
+      coreIssue: string;
+      constraints: string[];
+      critique: string;
+      score: number;
+      writingTask?: string;
+      keyQualifier?: string;
+      suggestedDimensions?: string[];
+    };
+    isCompleted: boolean;
+    chatHistory?: ChatMessage[];
+  };
+  step2: {
+    dimensions: Dimension[];
+    seeds: ArgumentSeed[];
+    bundles: ArgumentBundle[];
+    selectedBundleId?: string;
+    thesisOptions: ThesisOption[];
+    selectedThesis?: string;
+    userStance?: string; // User self-written overall stance
+    userPoints?: string; // User self-written sub-arguments
+    currentStage?: 'explore_A' | 'explore_B' | 'stance' | 'summary';
+    coachEvaluation?: {
+      userStance: string;
+      userPoints: string;
+      currentStage?: 'explore_A' | 'explore_B' | 'stance' | 'summary';
+      critique: string;
+      suggestions: string[];
+      suggestedStance: string;
+      suggestedPoints: string;
+      blueprint?: {
+        question: string;
+        position: string;
+        body1?: string;
+        body2?: string;
+        bodies?: { title: string; content: string }[];
+      };
+      clustering?: {
+        totalPoints: number;
+        pointsList: string[];
+        clusters: {
+          theme: string;
+          points: string[];
+          targetBody: string;
+          content: string;
+        }[];
+        outliers?: {
+          point: string;
+          suggestion: string;
+        }[];
+      };
+      onlinePros?: string[];
+      offlinePros?: string[];
+      positionCheckPassed?: boolean;
+      positionCheckDesc?: string;
+      coverageCheckPassed?: boolean;
+      coverageCheckDesc?: string;
+      structureCheckPassed?: boolean;
+      structureCheckDesc?: string;
+    };
+    isCompleted: boolean;
+    chatHistory?: ChatMessage[];
+  };
+  step3: {
+    selectedTemplateId?: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+    userDraft?: string;
+    subpoints: {
+      id: string;
+      content: string;
+      points?: string[];
+      targetBody?: string;
+      theme?: string;
+      draft?: string;
+      hint?: string;
+      isCompleted: boolean;
+      claim?: string;
+      mechanism?: string;
+      result?: string;
+      reason?: string;
+      supportType?: 'example' | 'mechanism' | 'scenario';
+      supportContent?: string;
+      impact?: string;
+      completenessChecks?: { label: string; passed: boolean; desc: string }[];
+      transitionChecks?: { label: string; passed: boolean; desc: string }[];
+      sufficiencyCheck?: { label: string; passed: boolean; desc: string };
+      structureSteps?: {
+        key: string;
+        label: string;
+        placeholder: string;
+        value?: string;
+      }[];
+    }[];
+    activeSubpointId?: string;
+    isCompleted: boolean;
+    chatHistory?: ChatMessage[];
+  };
+  step4: {
+    tasks: SentencePracticeTask[];
+    isCompleted: boolean;
+    chatHistory?: ChatMessage[];
+  };
+  step5: {
+    overallFeedback?: OverallFeedback;
+    isCompleted: boolean;
+    chatHistory?: ChatMessage[];
+  };
+  createdAt: string;
+}
