@@ -57,6 +57,123 @@ function parseAIResponse(text: string | undefined, defaultData: any = {}): any {
   }
 }
 
+function splitTwoParts(
+  text: string | undefined,
+  minPart2Length: number = 6,
+): {
+  ok: boolean;
+  part1: string;
+  part2: string;
+  reason: string;
+} {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return { ok: false, part1: "", part2: "", reason: "empty_text" };
+  }
+  const parts = raw.split(/\n\s*---\s*\n/);
+  if (parts.length < 2) {
+    return {
+      ok: false,
+      part1: raw,
+      part2: "",
+      reason: "missing_delimiter",
+    };
+  }
+  const part1 = String(parts[0] || "").trim();
+  const part2 = String(parts.slice(1).join("\n---\n") || "").trim();
+  if (!part1) {
+    return { ok: false, part1, part2, reason: "empty_part1" };
+  }
+  if (!part2) {
+    return { ok: false, part1, part2, reason: "empty_part2" };
+  }
+  if (part2.replace(/\s+/g, "").length < minPart2Length) {
+    return { ok: false, part1, part2, reason: "part2_too_short" };
+  }
+  return { ok: true, part1, part2, reason: "" };
+}
+
+function fallbackNextStep(stepNum: number, session: any): string {
+  if (stepNum === 1) {
+    const eval1 = session?.step1?.coachEvaluation || {};
+    if (!eval1.correctType) {
+      return "先完成题型识别：这道 Task 2 题属于哪一类（如 Agree/Disagree、Discussion、Advantages/Disadvantages）？请直接给出你的判断。";
+    }
+    if (!eval1.coreIssue) {
+      return "请用一句话说出题目的核心争议：作者真正让你判断的焦点是什么（不要直译题干）？";
+    }
+    if (!Array.isArray(eval1.constraints) || eval1.constraints.length === 0) {
+      return "再补一步：这道题有哪些关键限定词（人群、场景、程度、时间）必须在论证中回应？请列 1-3 个。";
+    }
+    return "很好。请把你的审题结论整合成一句写作任务说明：你准备如何回应题目、覆盖哪些限定并给出什么立场？";
+  }
+
+  if (stepNum === 2) {
+    const stage =
+      session?.step2?.coachEvaluation?.currentStage ||
+      session?.step2?.currentStage ||
+      "explore_A";
+    if (stage === "explore_A") {
+      return "我们先完成 A 面发散：请给出 1-2 个支持 A 面的具体论据，并说明每个论据对应的受益对象。";
+    }
+    if (stage === "explore_B") {
+      return "继续补齐 B 面：请给出 1-2 个 B 面不可替代的点，并尽量和刚才 A 面形成可对照关系。";
+    }
+    if (stage === "stance") {
+      return "现在请明确你的全文立场（支持/反对/部分同意），并用一句话说明“为什么这个立场最能回应题目限定”。";
+    }
+    if (stage === "summary") {
+      return "请确认最终蓝图：你的 Body 1 和 Body 2 分别打算写什么核心分论点？每个分论点给出一句可展开的中心句。";
+    }
+    return "请基于目前讨论，给出“全文立场 + 两个主体段分论点”的简版草图，我来帮你即时校准逻辑闭环。";
+  }
+
+  if (stepNum === 3) {
+    const activeId = session?.step3?.activeSubpointId;
+    const activeSubpoint = (session?.step3?.subpoints || []).find(
+      (sp: any) => sp.id === activeId,
+    );
+    if (!activeSubpoint) {
+      return "请先确认要推进的主体段分论点（当前没有激活分论点）。确认后我会直接做单点/多点诊断并给出 paragraphPlan。";
+    }
+
+    const plan = activeSubpoint.paragraphPlan;
+    if (plan && Array.isArray(plan.pointBlocks)) {
+      for (const block of plan.pointBlocks) {
+        if (!Array.isArray(block?.steps)) continue;
+        const pending = block.steps.find(
+          (s: any) => !String(s?.value || "").trim(),
+        );
+        if (pending) {
+          return `继续推进「${block.label || "分点"}」：请先回答这一步「${pending.label || "展开"}」的具体内容。`;
+        }
+      }
+      return "这个分论点的关键步骤已基本齐全。要继续完善，我建议你补一句更有力度的收束句，或者告诉我现在切换到下一个分论点。";
+    }
+
+    if (Array.isArray(activeSubpoint.structureSteps)) {
+      const pending = activeSubpoint.structureSteps.find(
+        (s: any) => !String(s?.value || "").trim(),
+      );
+      if (pending) {
+        return `我们继续当前链条：请完成「${pending.label || "下一步"}」这一步，用一句具体可论证的话表达。`;
+      }
+    }
+
+    return "请基于这个分论点补充一个最关键的“为什么成立”的理由，我会据此继续向下一步（机制/举例/影响）推进。";
+  }
+
+  if (stepNum === 4) {
+    return "请把你当前最薄弱的那一句先贴出来（主题句/解释句/例证句都可以），我先做一轮针对性升级。";
+  }
+
+  if (stepNum === 5) {
+    return "请先选择你最想优先修正的一项（任务回应、逻辑连贯、词句准确性），我会按这一项给你可执行的改写动作。";
+  }
+
+  return "我们继续下一步：请基于当前内容补充一个最具体、最可展开的论证点。";
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
@@ -315,6 +432,10 @@ async function startServer() {
       const step2Eval = session?.step2?.coachEvaluation;
       const step3Draft = session?.step3?.userDraft || "";
       const step3Subpoints = session?.step3?.subpoints || [];
+      const activeStep3Subpoint = step3Subpoints.find(
+        (sp: any) => sp.id === session?.step3?.activeSubpointId,
+      );
+      const activeStep3Claim = activeStep3Subpoint?.content?.trim?.() || "";
 
       let contextStr = "No previous step data available yet.";
       if (session) {
@@ -323,7 +444,10 @@ async function startServer() {
           step1Summary += `User's Actual Notes/Stance: "${step1Notes}"\n`;
         }
         if (step1Eval) {
-          step1Summary += `Coach Evaluation:\n- Question Type: ${step1Eval.correctType}\n- Core Issue: ${step1Eval.coreIssue}\n- Constraints: ${(step1Eval.constraints || []).join(", ")}\n- Critique: ${step1Eval.critique}`;
+          const step1Dims = (step1Eval.suggestedDimensions || [])
+            .map((d: string) => d?.trim?.() || "")
+            .filter((d: string) => d.length > 0);
+          step1Summary += `Coach Evaluation:\n- Question Type: ${step1Eval.correctType}\n- Core Issue: ${step1Eval.coreIssue}\n- Constraints: ${(step1Eval.constraints || []).join(", ")}\n- Suggested Dimensions: ${step1Dims.length > 0 ? step1Dims.join(", ") : "Not provided"}\n- Critique: ${step1Eval.critique}`;
         }
         if (!step1Summary) {
           step1Summary = "Not provided";
@@ -356,6 +480,8 @@ ${step2Summary}
 [Step 3 (Drafting) Ideas]:
 - Paragraph Drafts: ${step3Draft || "Not provided"}
 - Subpoint logic chains: ${JSON.stringify(step3Subpoints)}
+- Active Subpoint (= starting claim for this turn): ${activeStep3Claim || "Not selected / not provided"}
+- Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. Start diagnosis and paragraphPlan directly. Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
 
 Current objective:
 Review the context above and the current step's instructions. Organize and develop the existing ideas. Keep full consistency with the established positions.
@@ -611,18 +737,19 @@ Review the context above and the current step's instructions. Organize and devel
 
   This sequence is PLAN-AGNOSTIC. If 'paragraphPlan' exists, walk through its optional totalClaim and each pointBlock's nested steps, ONE micro-step per turn, in order. If no paragraphPlan exists, fall back to the flattened 'step3SubpointSteps'.
 
-  1. 进入 Step 3 / 尚未选择或确认分论点:
-     - 提示语: "你已经确定了两个核心分论点。请选择一个分论点开始构建论证。
-       ① [分论点1内容]
-       ② [分论点2内容]
-       （可以直接在右侧卡片选择或在下方告诉我）"
+  1. 进入 Step 3:
+     - 若 ContextSummary 中 "Active Subpoint (= starting claim)" 已存在且不是空值：
+       - 把它视为学生在 Step 2 已确认的起始 claim。
+       - 直接进入结构诊断并输出 paragraphPlan；不要再次要求学生先选择分论点，也不要让学生重复输入 claim。
+     - 仅当 Active Subpoint 为空时，才提示学生选择/确认一个分论点开始。
 
   2. 结构诊断与方案确立阶段 (Structure Diagnostic & Scheme Declaration):
+     - 若已有 Active Subpoint：先复述一句你接收到的起始 claim，然后直接推进诊断与方案，不要反问“你想选哪一个分论点”。
      - 一旦选定或输入分论点，AI 先按【STEP 3 DECISION ORDER】做单点/多点识别。
      - 若包含多个可独立展开的支撑点（例如：行为监管 + 同伴互动 / 教师监督 + 促进社交）：
        - 明确指出这几个支撑点分别是什么（每个点将成为一个 pointBlock）。
        - 你自己决定用 'total_then_points' 还是 'direct_points'，并说明为什么这样分配详略，直接推进。不要让学生在方案 A/B 之间做选择。
-       - 仅当 claim 本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
+      - 仅当 claim 为空、过短、或本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
      - 然后，按上文规则【声明 paragraphPlan mode、分点、详略权重、展开策略】，并立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`。
      - *数据同步*: 把已确认的总观点或第一个子观点写入对应 plan field/step value。
 
@@ -1059,15 +1186,91 @@ Student says:
         },
       });
 
-      const data = parseAIResponse(response.text, {
+      let data = parseAIResponse(response.text, {
         text: "Error parsing AI response.",
         progressUpdate: { isCompleted: false },
       });
 
+      const currentStepNum = Number(step);
+      const checkNeedsRepair = (parsed: any) => {
+        const split = splitTwoParts(parsed?.text);
+        if (!split.ok) {
+          return { needsRepair: true, reason: `text_${split.reason}`, split };
+        }
+
+        // Optional signal: only for Step 2 summary stage.
+        if (currentStepNum === 2) {
+          const stageFromOutput =
+            parsed?.progressUpdate?.step2Data?.currentStage || "";
+          const stageFromSession =
+            session?.step2?.coachEvaluation?.currentStage || "";
+          const stage = stageFromOutput || stageFromSession || "";
+          const bodies = parsed?.progressUpdate?.step2Data?.blueprint?.bodies;
+          if (
+            stage === "summary" &&
+            (!Array.isArray(bodies) || bodies.length === 0)
+          ) {
+            return {
+              needsRepair: true,
+              reason: "step2_summary_missing_blueprint",
+              split,
+            };
+          }
+        }
+        return { needsRepair: false, reason: "", split };
+      };
+
+      const firstCheck = checkNeedsRepair(data);
+      if (firstCheck.needsRepair) {
+        console.warn(
+          `[CoachGuard] Response requires repair. reason=${firstCheck.reason}`,
+        );
+        const correctionSuffix = `
+
+[SYSTEM CORRECTION]
+你的上一次输出存在格式或推进缺陷（reason=${firstCheck.reason}）。
+请严格重写本轮 JSON：
+1) text 必须包含两段，且用单独一行的 --- 分隔；
+2) Part 1 是简明反馈；
+3) Part 2 必须是一个具体、可执行的下一步问题或明确行动指令（不能省略）。
+4) 保持与当前步骤一致，继续推进流程，不要停在空泛回应。`;
+
+        const retryResponse = await generateContentWithFallback({
+          contents: `${prompt}${correctionSuffix}`,
+          config: {
+            maxOutputTokens: 8192,
+            responseMimeType: "application/json",
+          },
+        });
+        const retryData = parseAIResponse(retryResponse.text, {
+          text: "Error parsing AI response.",
+          progressUpdate: { isCompleted: false },
+        });
+        const retryCheck = checkNeedsRepair(retryData);
+
+        if (retryCheck.needsRepair) {
+          const bestSplit = splitTwoParts(
+            retryData?.text || data?.text || "",
+            1,
+          );
+          const safePart1 =
+            bestSplit.part1 ||
+            String(retryData?.text || data?.text || "我们继续推进。").trim();
+          const safePart2 = fallbackNextStep(currentStepNum, session);
+          retryData.text = `${safePart1}\n\n---\n\n${safePart2}`;
+          if (!retryData.progressUpdate) {
+            retryData.progressUpdate = { isCompleted: false };
+          }
+          console.warn(
+            `[CoachGuard] Retry still invalid. Applied fallback next-step template. reason=${retryCheck.reason}`,
+          );
+        }
+        data = retryData;
+      }
+
       // Heuristic fallback: if AI explicitly tells the user to enter the next step, force isCompleted to true
       if (data && data.text) {
         const t = data.text;
-        const currentStepNum = Number(step);
         let shouldForceComplete = false;
 
         if (currentStepNum === 1) {
@@ -1529,7 +1732,7 @@ Student says:
   // 3. API - Brainstorm Dimensions (Step 2 - 3.1)
   app.post("/api/brainstorm-dimensions", async (req, res) => {
     try {
-      const { question, questionType, userNotes } = req.body;
+      const { question, questionType, userNotes, suggestedDimensions } = req.body;
       if (!question) {
         res.status(400).json({ error: "Missing question text" });
         return;
@@ -1545,6 +1748,21 @@ Student says:
         - Ensure at least 2 dimensions are directly related to exploring the specific themes or vocabulary words in their perspective (e.g. "mutual complementarity", "distinct demands", "socializing needs", "discipline").
         `;
       }
+      const approvedDimensions = Array.isArray(suggestedDimensions)
+        ? suggestedDimensions
+            .map((d: any) => (typeof d === "string" ? d.trim() : ""))
+            .filter((d: string) => d.length > 0)
+        : [];
+      const approvedDimensionInstructions =
+        approvedDimensions.length > 0
+          ? `
+        Step 1 already surfaced these approved analytical angles:
+        ${approvedDimensions.map((d: string, idx: number) => `${idx + 1}. ${d}`).join("\n")}
+        You MUST treat them as baseline thinking directions.
+        Keep the generated dimensions aligned with, deepening, or refining these angles.
+        Avoid duplicates or near-duplicates of these baseline dimensions.
+        `
+          : "";
 
       const prompt = `
         You are an IELTS Writing Coach.
@@ -1552,6 +1770,7 @@ Student says:
         "${question}"
         (Question Type: ${questionType || "Standard Task 2"})
         ${userNotesInstructions}
+        ${approvedDimensionInstructions}
 
         Brainstorm 4 to 5 "Thinking Dimensions" (critical angles / analytical entry points) to analyze the issue.
         Each dimension must be concise and represented as: "dimension_name (short explanation of scope/meaning)".

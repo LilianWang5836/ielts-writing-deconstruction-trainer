@@ -11,6 +11,9 @@ interface CoachChatProps {
   onUpdateSession: (updates: Partial<PracticeSession>) => void;
   stepContext: any;
   welcomeMessage: string;
+  autoKickoff?: boolean;
+  kickoffPrompt?: string;
+  kickoffContextKey?: string;
   children?: React.ReactNode; // For any extra structured evaluation UI
 }
 
@@ -22,6 +25,9 @@ export default function CoachChat({
   onUpdateSession,
   stepContext,
   welcomeMessage,
+  autoKickoff = false,
+  kickoffPrompt = '',
+  kickoffContextKey = '',
   children,
 }: CoachChatProps) {
   const [inputText, setInputText] = useState('');
@@ -29,12 +35,14 @@ export default function CoachChat({
   const [errorMsg, setErrorMsg] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const kickoffRef = useRef<string | null>(null);
 
   // Get current step's chat history or initialize it
   const chatHistory = session[stepKey]?.chatHistory || [];
 
   useEffect(() => {
     setShowResetConfirm(false); // Reset confirmation state on step change
+    kickoffRef.current = null;
     if (chatHistory.length === 0) {
       // Initialize with welcome message
       const initialMessage: ChatMessage = {
@@ -145,7 +153,10 @@ export default function CoachChat({
     return parts.join('\n\n');
   };
 
-  const sendUserMessage = async (textToSend: string) => {
+  const sendUserMessage = async (
+    textToSend: string,
+    options?: { hiddenUserMessage?: boolean },
+  ) => {
     if (!textToSend.trim() || loading) return;
 
     setErrorMsg('');
@@ -157,15 +168,21 @@ export default function CoachChat({
       timestamp: new Date().toISOString(),
     };
 
-    const updatedHistory = [...chatHistory, newUserMessage];
+    const hiddenUserMessage = !!options?.hiddenUserMessage;
+    const promptHistory = [...chatHistory, newUserMessage];
+    const updatedHistory = hiddenUserMessage
+      ? [...chatHistory]
+      : [...chatHistory, newUserMessage];
 
-    // Optimistically update UI
-    onUpdateSession({
-      [stepKey]: {
-        ...session[stepKey],
-        chatHistory: updatedHistory,
-      },
-    });
+    // Optimistically update UI (skip the synthetic kickoff user bubble)
+    if (!hiddenUserMessage) {
+      onUpdateSession({
+        [stepKey]: {
+          ...session[stepKey],
+          chatHistory: updatedHistory,
+        },
+      });
+    }
 
     setLoading(true);
 
@@ -176,7 +193,7 @@ export default function CoachChat({
         body: JSON.stringify({
           question: topic.question,
           step,
-          messages: updatedHistory,
+          messages: promptHistory,
           stepContext,
           session,
           userMessage: textToSend.trim(),
@@ -412,6 +429,25 @@ export default function CoachChat({
     }
   };
 
+  useEffect(() => {
+    if (!autoKickoff || !kickoffPrompt.trim() || loading) return;
+    if (!chatHistory.length) return;
+    const firstMsg = chatHistory[0];
+    const hasUserMessage = chatHistory.some((m) => m.sender === 'user');
+    if (!firstMsg || firstMsg.sender !== 'ai' || hasUserMessage) return;
+    const kickoffKey = `${stepKey}:${kickoffContextKey}:${firstMsg.id}`;
+    if (kickoffRef.current === kickoffKey) return;
+    kickoffRef.current = kickoffKey;
+    sendUserMessage(kickoffPrompt, { hiddenUserMessage: true });
+  }, [
+    autoKickoff,
+    kickoffPrompt,
+    loading,
+    chatHistory,
+    stepKey,
+    kickoffContextKey,
+  ]);
+
   const handleSendMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim() || loading) return;
@@ -448,6 +484,7 @@ export default function CoachChat({
     onUpdateSession({
       [stepKey]: updatedStepState,
     });
+    kickoffRef.current = null;
     setErrorMsg('');
     setInputText('');
     setShowResetConfirm(false);
@@ -539,6 +576,7 @@ export default function CoachChat({
                     stepKey === 'step3' &&
                     stepContext?.subpoints &&
                     stepContext.subpoints.length > 0 &&
+                    !session?.step3?.activeSubpointId &&
                     chatHistory[0] &&
                     msg.id.startsWith(chatHistory[0].id) && (
                       <div className="mt-3 space-y-2">

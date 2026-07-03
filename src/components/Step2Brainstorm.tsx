@@ -24,6 +24,40 @@ export default function Step2Brainstorm({
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [activeTab, setActiveTab] = useState<'step1' | 'step2' | 'step3' | 'step4'>('step2');
+  const eval1 = session.step1.coachEvaluation;
+  const userNotes = session.step1.userAnalysisNotes?.trim();
+  const step1SuggestedDimensions = (eval1?.suggestedDimensions || [])
+    .map((d) => (typeof d === 'string' ? d.trim() : ''))
+    .filter((d): d is string => !!d);
+
+  const normalizeDimensionCard = (rawText: string, idx: number): Dimension => {
+    const text = rawText.trim();
+    const bracketMatch = text.match(/^(.+?)\s*[（(]\s*(.+?)\s*[)）]\s*$/);
+    const name = (bracketMatch?.[1] || text).trim();
+    const prompt = bracketMatch ? `${name} (${bracketMatch[2].trim()})` : `${name} (from step1)`;
+    return {
+      id: `s1d-${idx + 1}`,
+      name,
+      prompt,
+      selected: false,
+    };
+  };
+
+  const mergeDimensionCards = (seed: Dimension[], fetched: Dimension[]) => {
+    const seen = new Set<string>();
+    const merged: Dimension[] = [];
+    [...seed, ...fetched].forEach((dim, idx) => {
+      const key = `${(dim.name || '').trim().toLowerCase()}|${(dim.prompt || '').trim().toLowerCase()}`;
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      merged.push({
+        ...dim,
+        id: dim.id || `dim-${idx + 1}`,
+        selected: !!dim.selected,
+      });
+    });
+    return merged;
+  };
 
   // Load brainstorming dimensions as inspiration cards on mount
   useEffect(() => {
@@ -38,23 +72,38 @@ export default function Step2Brainstorm({
   const fetchDimensions = async () => {
     setLoadingDims(true);
     try {
+      const seededFromStep1: Dimension[] = step1SuggestedDimensions.map((d, idx) =>
+        normalizeDimensionCard(d, idx),
+      );
+      if (!session.step2.dimensions?.length && seededFromStep1.length > 0) {
+        setDimensions(seededFromStep1);
+        onUpdateSession({
+          step2: {
+            ...session.step2,
+            dimensions: seededFromStep1,
+          },
+        });
+      }
+
       const res = await fetch('/api/brainstorm-dimensions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           question: topic.question,
           questionType: topic.questionType,
-          userNotes: session.step1.userAnalysisNotes?.trim() || ''
+          userNotes: userNotes || '',
+          suggestedDimensions: step1SuggestedDimensions,
         }),
       });
       const data = await res.json();
       if (data.dimensions) {
-        const mapped: Dimension[] = data.dimensions.map((d: any) => ({
+        const mappedFromApi: Dimension[] = data.dimensions.map((d: any) => ({
           id: d.id,
           name: d.name,
           prompt: d.prompt,
           selected: false,
         }));
+        const mapped = mergeDimensionCards(seededFromStep1, mappedFromApi);
         setDimensions(mapped);
         onUpdateSession({
           step2: {
@@ -150,11 +199,12 @@ export default function Step2Brainstorm({
     clustering: undefined as any,
   } : null);
 
-  const eval1 = session.step1.coachEvaluation;
-  const userNotes = session.step1.userAnalysisNotes?.trim();
   let previousNotes = "";
   if (eval1) {
     previousNotes = `题型判定：${eval1.correctType}\n核心争议：${eval1.coreIssue}${eval1.constraints && eval1.constraints.length > 0 ? `\n关键限定：${eval1.constraints.join('、')}` : ''}`;
+    if (step1SuggestedDimensions.length > 0) {
+      previousNotes += `\n建议讨论维度：${step1SuggestedDimensions.join('、')}`;
+    }
     if (userNotes) {
       previousNotes += `\n我的审题想法：${userNotes}`;
     }
@@ -162,59 +212,9 @@ export default function Step2Brainstorm({
     previousNotes = userNotes || session.step1.chatHistory?.filter((m: any) => m.sender === 'user').map((m: any) => m.text).join(' | ').trim() || '';
   }
 
-  // Dynamically tailor the initial question (Q1) based on the user's Step 1 insights
-  const dynamicQ1 = (() => {
-    const notesText = (userNotes || "").trim();
-    const isGenericStance = (text: string) => {
-      const t = text.trim().toLowerCase();
-      return t === 'agree' || t === 'disagree' || t === 'agree or disagree' || 
-             t === 'agreeordisagree' || t === 'disagree or agree' ||
-             t === '同意' || t === '不同意' || t === '支持' || t === '反对' || 
-             t === '有道理' || t === '无道理' || t === '对的' || t === '错的' ||
-             t === '';
-    };
-
-    const hasRealNotes = notesText && !isGenericStance(notesText);
-    const issueText = eval1?.coreIssue || "";
-    const constraintsText = eval1?.constraints && eval1.constraints.length > 0
-      ? eval1.constraints.join('、')
-      : "";
-
-    // 1. Replacement / Substitution theme (e.g. online replacing traditional schools, computers replacing teachers, etc.)
-    const isReplacementTheme = issueText.includes("取代") || issueText.includes("代替") || issueText.includes("消失") || issueText.includes("replace") || issueText.includes("disappear");
-    // 2. Government funding / Spending theme
-    const isGovSpendingTheme = issueText.includes("政府") || issueText.includes("资金") || issueText.includes("资助") || issueText.includes("投资") || issueText.includes("花钱") || issueText.includes("government") || issueText.includes("fund") || issueText.includes("spend");
-    // 3. Environmental theme
-    const isEnvironmentalTheme = issueText.includes("环境") || issueText.includes("动物") || issueText.includes("自然") || issueText.includes("污染") || issueText.includes("保护") || issueText.includes("environment") || issueText.includes("pollution");
-    // 4. Technology / Digital theme
-    const isTechTheme = issueText.includes("科技") || issueText.includes("智能") || issueText.includes("机器") || issueText.includes("AI") || issueText.includes("technology") || issueText.includes("machine") || issueText.includes("internet") || issueText.includes("线上");
-
-    if (isReplacementTheme) {
-      return `我们顺着这个思路继续深入：你觉得在哪些具体场景或情况下，这种取代【确实有可能发生】？而在哪些维度或对哪些人群来说，传统学校和传统方式【是绝对无法被替代的】？它们各自最独特、最不可替代的特点是什么？`;
-    }
-
-    if (isGovSpendingTheme) {
-      return `针对“${issueText || '政府资金分配'}”这个决策争议，你觉得政府资助或投资这一领域的最大正面好处（如社会效益、长远回报）是什么？如果不资助或减少资助，会有什么负面代价？相比其他民生领域，它的优先级应该如何衡量？`;
-    }
-
-    if (isEnvironmentalTheme) {
-      return `针对“${issueText || '环境保护'}”这个生态议题，你觉得最关键的突破口在哪里？我们应该付出怎样的代价去解决它，或者它会带来哪些长远的正面效益/社会价值？`;
-    }
-
-    if (isTechTheme) {
-      return `针对“${issueText || '科技数字化变革'}”这个议题，你觉得这项技术/趋势给个人或社会带来的最显著的【便利/优势】是什么？同时，它是否也带来了【人际疏离、隐私安全或过度依赖】等不可忽视的代价？`;
-    }
-
-    // Default Fallback
-    if (issueText) {
-      const constraintHint = constraintsText ? `（特别是关键限定“${constraintsText}”）` : "";
-      return `针对核心争议“${issueText}”${constraintHint}，你觉得支持它或反对它的最核心、最具体的论据应该是什么？它们各自有什么特点？`;
-    }
-
-    // Completely basic fallback if absolutely no metadata is available
-    return `你觉得应该如何更具体地探讨其正面好处 (Pros) 或负面代价 (Cons)？聊聊你的直观想法（哪怕只有只言片语也行）！`;
-  })();
-
+  // Welcome bubble is a pure bridge (recap only, no committed question). The
+  // real, context-reasoned first question is generated by the LLM via
+  // autoKickoff below, so the two never compete or duplicate each other.
   const welcomeMessage = previousNotes
     ? `【雅思写作原题 (Topic)】
 ${topic.question}
@@ -225,14 +225,37 @@ ${topic.question}
 在第一步审题中，你已经记录了以下核心想法：
 ${previousNotes.split('\n').map(line => `> *“${line}”*`).join('\n')}
 
-${dynamicQ1}`
+我正在结合你第一步的审题结论，为你定制第一个发散问题...`
     : `【雅思写作原题 (Topic)】
 ${topic.question}
 
 【第二步：立场与论点 🧠】
-欢迎进入第二步！一个优秀的雅思议论文需要极强的逻辑链条。我们不急于一下子要立场或答案，让我们一步一步来：
+欢迎进入第二步！一个优秀的雅思议论文需要极强的逻辑链条。我们不急于一下子要立场或答案，让我们一步一步来。
 
-👉 你觉得针对这个话题，有哪些最值得探讨的正面好处 (Pros) 或负面代价 (Cons)？聊聊你的直观想法！`;
+我正在结合这道题目，为你定制第一个发散问题...`;
+
+  const kickoffPrompt = (() => {
+    const issueText = eval1?.coreIssue || "";
+    const constraintsText = eval1?.constraints && eval1.constraints.length > 0
+      ? eval1.constraints.join('、')
+      : "";
+    const dimensionsText = step1SuggestedDimensions.length > 0
+      ? step1SuggestedDimensions.join('、')
+      : "";
+
+    const contextLines = [
+      issueText ? `核心争议：${issueText}` : "",
+      constraintsText ? `关键限定：${constraintsText}` : "",
+      dimensionsText ? `建议讨论维度：${dimensionsText}` : "",
+      userNotes ? `我的审题想法：${userNotes}` : "",
+    ].filter(Boolean);
+
+    return `这是第二步的开场，我还没有说任何话，请不要假装在回应我说过的内容。${
+      contextLines.length > 0
+        ? `请直接结合我第一步的审题结论（${contextLines.join('；')}），`
+        : "请直接结合这道题目本身，"
+    }给我一个高质量、有针对性的发散问题（Explore-A 阶段），引导我先谈这个立场下最值得展开的具体支持论据或正面好处；不要泛泛而问，要让问题贴合这道题目和已知信息。`;
+  })();
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
@@ -246,6 +269,8 @@ ${topic.question}
           onUpdateSession={onUpdateSession}
           stepContext={{ userStance, userPoints }}
           welcomeMessage={welcomeMessage}
+          autoKickoff={true}
+          kickoffPrompt={kickoffPrompt}
         >
           {errorMsg && (
             <div className="bg-rose-50 border border-rose-100 rounded-lg p-3 text-rose-800 text-xs flex items-center gap-2 mt-2">

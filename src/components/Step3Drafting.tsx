@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion } from "motion/react";
 import {
   CheckCircle2,
@@ -32,6 +32,7 @@ export default function Step3Drafting({
   const [activeTab, setActiveTab] = useState<
     "step1" | "step2" | "step3" | "step4"
   >("step3");
+  const hasAutoSelectedRef = useRef(false);
 
   const subpointsStr =
     session.step2.coachEvaluation?.userPoints ||
@@ -41,11 +42,32 @@ export default function Step3Drafting({
 
   const clusters = session.step2.coachEvaluation?.clustering?.clusters;
   const fallbackBodies = session.step2.coachEvaluation?.blueprint?.bodies;
+  const cleanedPointLines = subpointsStr
+    .split(/(?:\n|;|；)/)
+    .flatMap((p) => p.split(/(?=\b\d+\.\s)/))
+    .map((p) => p.replace(/^\d+\.\s*/, "").trim())
+    .filter((p) => p !== "");
+
+  const resolveSubpointContent = (
+    preferred: string | undefined,
+    idx: number,
+    fallback: string,
+  ) => {
+    const preferredText = preferred?.trim();
+    if (preferredText && preferredText.length >= 8) return preferredText;
+    const pointLine = cleanedPointLines[idx];
+    if (pointLine && pointLine.length >= 8) return pointLine;
+    return fallback;
+  };
 
   const parsedSubpoints: Step3Subpoint[] = clusters && Array.isArray(clusters) && clusters.length > 0
     ? clusters.map((cluster: any, i: number) => ({
         id: `body-${i + 1}`,
-        content: cluster.content || `${cluster.targetBody || `Body Paragraph ${i + 1}`}: ${cluster.theme || `主题 ${i + 1}`}`,
+        content: resolveSubpointContent(
+          cluster.content,
+          i,
+          `${cluster.targetBody || `Body Paragraph ${i + 1}`}: ${cluster.theme || `主题 ${i + 1}`}`,
+        ),
         points: cluster.points || [],
         targetBody: cluster.targetBody || `Body Paragraph ${i + 1}`,
         theme: cluster.theme || `主题 ${i + 1}`,
@@ -86,18 +108,46 @@ export default function Step3Drafting({
       !session.step3.subpoints ||
       session.step3.subpoints.length !== parsedSubpoints.length
     ) {
+      const currentActive = session.step3.activeSubpointId;
+      const activeStillExists =
+        currentActive && parsedSubpoints.some((sp) => sp.id === currentActive);
+      const nextActiveSubpointId =
+        activeStillExists || parsedSubpoints.length === 0
+          ? currentActive
+          : parsedSubpoints[0].id;
       onUpdateSession({
         step3: {
           ...session.step3,
           subpoints: parsedSubpoints,
+          activeSubpointId: nextActiveSubpointId,
         },
       });
     }
   }, [parsedSubpoints.length, onUpdateSession, session.step3]);
 
+  useEffect(() => {
+    if (
+      hasAutoSelectedRef.current ||
+      !!session.step3.activeSubpointId ||
+      subpoints.length === 0
+    ) {
+      return;
+    }
+    hasAutoSelectedRef.current = true;
+    onUpdateSession({
+      step3: {
+        ...session.step3,
+        activeSubpointId: subpoints[0].id,
+      },
+    });
+  }, [onUpdateSession, session.step3, subpoints]);
+
   const activeSubpoint = subpoints.find(
     (s) => s.id === session.step3.activeSubpointId,
   );
+  const kickoffPrompt = activeSubpoint?.content
+    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先完成单点/多点诊断，再直接给出 paragraphPlan 与 step3SubpointSteps；不要再次要求我先选择或重述 claim。`
+    : "";
 
   const isStep3Finished = session.step3.isCompleted || (subpoints.length > 0 && subpoints.every((s) => s.isCompleted));
 
@@ -133,10 +183,10 @@ export default function Step3Drafting({
 已规划的主体段落核心内容为：
 ${userPoints ? `> *“${userPoints}”*` : `> *见右侧主体段落列表*`}
 
-请从右侧列表中选择一个主体段落卡片，或者在下方告诉我想先开始论证哪一个部分？`
+我会默认从第一个主体段落开始诊断并构建论证链。你也可以随时在右侧顶部切换到其他主体段落。`
     : `【第三步：段落论证起 scratch ✍️】
 欢迎进入第三步！我们要为每一个主体段落 (Body Paragraph) 构建一个具有强说服力的【逻辑闭环】。
-请告诉我，你想先开始论证哪一个段落？`;
+我会先从第一个主体段落开始，随后你可以切换到其他段落继续完善。`;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
@@ -150,6 +200,9 @@ ${userPoints ? `> *“${userPoints}”*` : `> *见右侧主体段落列表*`}
           onUpdateSession={onUpdateSession}
           stepContext={{ subpoints }}
           welcomeMessage={welcomeMessage}
+          autoKickoff={!!activeSubpoint}
+          kickoffPrompt={kickoffPrompt}
+          kickoffContextKey={activeSubpoint?.id || ''}
         >
           {/* Coach Controls / Action bar - Auto-progression upon AI completion */}
           {isStep3Finished && (
