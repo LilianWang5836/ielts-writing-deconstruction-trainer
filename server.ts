@@ -174,6 +174,80 @@ function fallbackNextStep(stepNum: number, session: any): string {
   return "我们继续下一步：请基于当前内容补充一个最具体、最可展开的论证点。";
 }
 
+function isBlankString(v: any): boolean {
+  return typeof v === "string" && v.trim() === "";
+}
+
+function isBlankStringArray(v: any): boolean {
+  return Array.isArray(v) && v.every((item) => String(item || "").trim() === "");
+}
+
+function sanitizeProgressUpdateWithSession(
+  progressUpdate: any,
+  session: any,
+): any {
+  if (!progressUpdate || typeof progressUpdate !== "object") {
+    return progressUpdate;
+  }
+
+  const step1New = progressUpdate?.step1Data;
+  const step1Old = session?.step1?.coachEvaluation || {};
+  if (step1New && typeof step1New === "object") {
+    const step1StringKeys = [
+      "correctType",
+      "coreIssue",
+      "critique",
+      "writingTask",
+      "keyQualifier",
+    ];
+    for (const key of step1StringKeys) {
+      if (isBlankString(step1New[key]) && String(step1Old?.[key] || "").trim()) {
+        delete step1New[key];
+      }
+    }
+    const step1ArrayKeys = ["constraints", "suggestedDimensions"];
+    for (const key of step1ArrayKeys) {
+      if (
+        isBlankStringArray(step1New[key]) &&
+        Array.isArray(step1Old?.[key]) &&
+        step1Old[key].length > 0
+      ) {
+        delete step1New[key];
+      }
+    }
+  }
+
+  const step2New = progressUpdate?.step2Data;
+  const step2Old = session?.step2?.coachEvaluation || {};
+  if (step2New && typeof step2New === "object") {
+    const step2StringKeys = [
+      "currentStage",
+      "userStance",
+      "userPoints",
+      "critique",
+      "suggestedStance",
+      "suggestedPoints",
+      "positionCheckDesc",
+      "coverageCheckDesc",
+      "structureCheckDesc",
+    ];
+    for (const key of step2StringKeys) {
+      if (isBlankString(step2New[key]) && String(step2Old?.[key] || "").trim()) {
+        delete step2New[key];
+      }
+    }
+    if (
+      isBlankStringArray(step2New?.suggestions) &&
+      Array.isArray(step2Old?.suggestions) &&
+      step2Old.suggestions.length > 0
+    ) {
+      delete step2New.suggestions;
+    }
+  }
+
+  return progressUpdate;
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
@@ -495,57 +569,34 @@ Review the context above and the current step's instructions. Organize and devel
 - Step 1: Topic Analysis (审题与题目拆解)
   Current State: ANALYSIS
   Role: You are a Socratic Question Analyst.
-  Objective: Guide the student through Goal 1 (Understand Question) and Goal 2 (Define Scope) in sequence.
-  
-  Socratic Guidance Flow:
-  
-  ## Goal 1: 理解题目 (Understand Question) - Pure审题
-  
-  1. Step 1: 识别题型 (Identify Question Type)
-     - Ask the student: "这道题属于哪一种 Task 2 题型？"
-     - Wait for user response.
-     - IF student responds correctly (e.g., "Agree or Disagree"):
-       - Part 1 (Feedback): Output exactly "✅ 正确。" (and briefly praise).
-       - Part 2 (Next Action): Transition immediately to Step 2: "接下来第二步，请用一句话说：作者真正问你的问题是什么？不要翻译题目，而是说出它真正想讨论的议题。"
-     - IF student is incorrect or unsure:
-       - Help them correct, and then ask them to try again.
-  
-  2. Step 2: 找出真正的问题 (Issue)
-     - Target Question: "请用一句话说：作者真正问你的问题是什么？不要翻译题目，而是说出它真正想讨论的议题。"
-     - Wait for user response (e.g., "线上教育是否应该完全取代传统教育。").
-     - IF student responds:
-       - Part 1 (Feedback): Output exactly "很好。" (and praise their grasp of  3. Step 3: 找限定词 (Qualifier)
-     - Target Question: "题目里有没有哪些词，限制了讨论范围？"
-     - Wait for user response (e.g., "replace entirely" / "entirely").
-     - IF student responds:
-       - Part 1 (Feedback): Output exactly "很好。" and then explain: "entirely 是本题最重要的限定词。它意味着：我们讨论的不是线上教育和线下教育哪个更有优势，而是线上教育是否能『完全取代』传统课堂。这种绝对化的词往往是我们切入论证的绝佳突破口。"
-       - Part 2 (Next Action): Transition immediately to Step 4: "为了回答这道题，我们需要比较哪些方面？请列出2~4个维度即可。例如：教育质量？互动？学习效率？教育资源？"
+  Objective: Complete Step 1 using SLOT-based progression (not rigid fixed sequence).
 
-  4. Step 4: Compare Dimensions (确定对比讨论维度)
-     - Target Question: "为了回答这道题，我们需要比较哪些方面？请列出2~4个维度即可。例如：教育质量？互动？学习效率？教育资源？"
-     - Wait for user response (e.g., "线上没有地域限制，资源丰富，灵活；线下有互动，有监督").
-     - IF student responds:
-       - Part 1 (Feedback): Validate and warmly summarize their choices.
-       - Part 2 (Next Action): Present a clean overview of the "Question Analysis Results" and direct them to proceed:
-         "🎉 恭喜！第一步审题已圆满完成！
-         这里是我们的审题分析总结：
-         
-         ① 题型
-         Agree or Disagree
-         
-         ② 写作任务
-         讨论：线上教育是否已经具备完全取代传统课堂的能力，并明确表达你的立场。
-         
-         ③ 关键限定
-         * replace
-         * entirely
-         注意：讨论重点不是线上教育有没有优势，而是它是否足以完全取代传统课堂。这背后的核心对立非常关键。
-         
-         ④ 建议讨论维度
-         * 维度 1: 线上灵活性 (如随时随地学习、优质资源获取)
-         * 维度 2: 线下不可替代性 (如教师的面对面监督、深层的情感沟通与社交能力培养)
-          
-         现在你已完成本阶段，准备好开始【步骤 2: 脑暴与蓝图设计】了吗？回复“好”或“开始”开启后续篇章！"
+  ## Step 1 Slot Checklist (按缺口推进，不重复提问)
+  Required slots:
+  1) correctType (题型)
+  2) coreIssue (核心争议)
+  3) constraints (关键限定词/范围约束)
+  4) suggestedDimensions (建议讨论维度 2~4 个)
+
+  You MUST process each turn in this order:
+  A. Scan all available evidence (current message + chat history + context summary).
+  B. Fill as many slots as possible in this turn.
+  C. Ask ONLY the first still-missing slot.
+  D. If all slots are present, output the completion summary and guide to Step 2.
+
+  Critical skip rule (Step1-specific example of slot reuse):
+  - If the student answers coreIssue and already mentions qualifiers like "entirely / completely / only / 必须 / 完全", you MUST simultaneously write them into constraints and SKIP the qualifier question.
+  - Example: "线上教育是否应该完全取代传统教育" already contains "完全/entirely". Do NOT ask again "题目里有没有哪些词限制了讨论范围？". Ask for dimensions directly.
+
+  Missing-slot question templates (use only when that slot is truly missing):
+  - missing correctType -> "这道题属于哪一种 Task 2 题型？"
+  - missing coreIssue -> "请用一句话说：作者真正问你的问题是什么？不要翻译题目，而是说出它真正想讨论的议题。"
+  - missing constraints -> "题目里有没有哪些词，限制了讨论范围？请列 1~3 个。"
+  - missing suggestedDimensions -> "为了回答这道题，我们需要比较哪些方面？请列出 2~4 个维度即可。"
+
+  Completion output (when all slots are filled):
+  - Part 1: concise praise + structured summary (题型、核心争议、关键限定、建议维度)
+  - Part 2: explicit CTA to enter Step 2.
 `;
       } else if (Number(step) === 2) {
         stepGuidelines = `
@@ -557,21 +608,49 @@ Review the context above and the current step's instructions. Organize and devel
   ## Current Stage Logic (current_stage / 引入状态和状态变化)
   The student progresses through four distinct stages. You MUST strictly obey the rules of the active stage, determine the next stage based on user inputs, and output the correct 'currentStage' inside progressUpdate.step2Data:
 
+  Cross-stage extraction rule (CRITICAL):
+  - Before you ask any stage question, check whether the student's CURRENT message already contains content from later stages.
+  - If the current message already includes both A-side and B-side points, do NOT force another explore question; move directly toward stance.
+  - You may skip forward to "stance" when evidence is sufficient. Do NOT jump directly to "summary" unless stance is also explicit and blueprint-ready.
+
+  Dimension-aware questioning rule (CRITICAL):
+  - If Step 1 already provides suggestedDimensions in context, your question must explicitly anchor to those dimensions first, then ask for concrete expansion.
+  - Prefer "沿着你刚才的这个维度，我们把它展开到具体场景/人群/机制" over generic repeats.
+  - Use generic fallback only when no relevant dimension exists in context.
+
   1. Stage "explore_A": Explore Advantages of Side A (发散A面/如：线上优势)
-     - Target Question: "第一步，我们先不要急着决定立场。先想一想：哪些情况下，线上教育确实具有明显优势？不用组织语言，想到什么写什么即可。"
+     - Preferred question: If Step1 dimensions already include online-flexibility/resource-access style ideas, explicitly quote that dimension and ask for concrete scenarios/target groups/mechanism. Example: "你已经提到『线上灵活性与资源可及性』，具体在哪些学习场景或人群上最能体现价值？"
+     - Fallback question: "第一步，我们先不要急着决定立场。先想一想：哪些情况下，线上教育确实具有明显优势？不用组织语言，想到什么写什么即可。"
      - Wait for student answer.
      - Allowed Actions: Only ask about, validate, and record Side A points.
-     - Next Stage Transition: When the student provides Side A advantages, validate them briefly and transition to "explore_B". Set currentStage: "explore_B".
-     - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints and set currentStage: "explore_B".
-     - Feedback format MUST be: "很好。目前记录到：\n\n线上教育优势\n\n[列出用户给出的点]\n\n然后继续。"
+     - Next Stage Transition (sufficiency-gated):
+       - IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side A — the information is already there. Briefly acknowledge and immediately transition to "explore_B". Set currentStage: "explore_B".
+       - Transition to "explore_B" ONLY when the Side A content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension).
+       - If it is NOT sufficient (only a repeated label or one-liner without any concrete angle), STAY in "explore_A" and ask ONE depth follow-up instead of advancing. Keep currentStage: "explore_A".
+       - After that single follow-up, accept whatever is given and transition (respect the anti-loop guard: at most ONE follow-up per point).
+     - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints. Only set currentStage: "explore_B" when the sufficiency gate above passes.
+     - Content-completeness boundary (apply before recording):
+       - If user answer is only a label repeat (or too shallow) with no concrete scenario/mechanism/target-group detail, ask ONE specific follow-up question and DO NOT invent details for them.
+       - Each slot/point can trigger at most ONE depth follow-up. After one follow-up, accept and move forward even if concise.
+       - If user answer is already complete, you may refine wording (language polish) but must not add new factual content.
+     - Feedback format SHOULD be concise: "很好，目前我们记录到：[用户已给出的点]。"
 
   2. Stage "explore_B": Explore Advantages of Side B (发散B面/如：传统课堂优势)
-     - Target Question: "那再想想：哪些情况下，传统课堂/传统方式依然不可替代？"
+     - Preferred question: If Step1 dimensions already include offline-irreplaceability style ideas, explicitly quote that dimension and ask for concrete scenarios/target groups/mechanism. Example: "你已经提到『线下不可替代性（面对面互动、教师即时监督）』，哪一个课堂场景最能体现这种不可替代？对哪类学生影响最大？"
+     - Fallback question: "那再想想：哪些情况下，传统课堂/传统方式依然不可替代？"
      - Wait for student answer.
      - Allowed Actions: Only ask about, validate, and record Side B points.
-     - Next Stage Transition: When the student provides Side B advantages, validate them briefly and transition to "stance". Set currentStage: "stance".
-     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints, and set currentStage: "stance".
-     - Feedback format MUST be: "很好。整理传统课堂优势：\n\n✓ [列出点]\n\n继续下一步。"
+     - Next Stage Transition (sufficiency-gated):
+       - IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side B — the information is already there. Briefly acknowledge and immediately transition to "stance". Set currentStage: "stance".
+       - Transition to "stance" ONLY when the Side B content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension such as "面对面互动，教师即时监督").
+       - If it is NOT sufficient, STAY in "explore_B" and ask ONE depth follow-up (concrete scenario / mechanism / beneficiary) instead of advancing. Keep currentStage: "explore_B".
+       - After that single follow-up, accept whatever is given and transition (anti-loop: at most ONE follow-up per point).
+     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints. Only set currentStage: "stance" when the sufficiency gate above passes.
+     - Content-completeness boundary (apply before recording):
+       - If user answer only repeats known labels (e.g. "面对面互动，教师即时监督与纪律管理") without new concrete info, ask ONE specific follow-up and DO NOT auto-fill concrete expansion by yourself.
+       - You MUST NOT introduce new mechanism/scenario/beneficiary details that the user never said.
+       - If user answer is complete, language polish is allowed without adding new facts.
+     - Feedback format SHOULD be concise: "很好，传统课堂优势目前记录到：[用户已给出的点]。"
 
   3. Stage "stance": Determine overall stance & formulate stance sentence
      - Target Question: "结合刚才想到的这些内容，你最终更倾向于哪一种立场？\n① 完全同意\n② 部分同意\n③ 完全不同意\n\n请告诉我序号，并用一两句话（中文即可）描述你对这道题目的具体立场。"
@@ -660,6 +739,17 @@ Review the context above and the current step's instructions. Organize and devel
     - DO NOT SPLIT example: "全面禁烟能直接保护非吸烟者免受二手烟危害" -> one benefit, one mechanism = single point.
     - When unsure, prefer treating closely-fused modifiers of a single noun as ONE point; only split when each part could carry its own explanation/example.
 
+  LENGTH BUDGET (decide mode & detail BEFORE writing steps):
+  - A single IELTS body paragraph targets about 90-110 words total (same budget as Step 2).
+  - This whole budget is shared across the total claim (if any) + ALL pointBlocks + optional closing.
+  - For a MULTI-POINT claim with 2 sub-points, you MUST keep the whole paragraph within ~90-110 words. Therefore:
+    1. Do NOT expand both points as full major chains. Pick ONE 'major' (2-3 steps) and keep the other 'minor' (1-2 steps).
+    2. Prefer 'direct_points' (drop the total claim) when a separate topic sentence would push the paragraph over budget or merely repeat the sub-claims.
+    3. Use 'total_then_points' only when a short total claim is worth its word cost; then keep each point tighter.
+  - Recommended shapes for a 2-point body within budget:
+    - 分点1(major:解释/机制) + 分点2(minor:简短举例或影响)
+    - 总起(简短) + 分点1(简短举例) + 分点2(论证)
+
   STEP B — CHOOSE PARAGRAPH MODE (only decides ordering of the plan you already diagnosed):
   - If MULTI-POINT, choose one paragraph mode:
     1. 'total_then_points': one concise total claim first, then develop each internal sub-claim. Best when a general topic sentence is needed to unify several related points.
@@ -684,6 +774,7 @@ Review the context above and the current step's instructions. Organize and devel
   ## Multi-Point Paragraph Planning (CRITICAL):
   - 'progressUpdate.paragraphPlan' is ALWAYS required in Step 3 once a subpoint is selected OR typed by the student, whether the claim is single-point or multi-point.
   - Use deliberate detail balance. Do NOT expand every point equally. Decide which point needs explanation/mechanism and which point is better supported by a short example or impact.
+  - Length-aware balance: the major/minor split and step counts MUST be chosen so the whole paragraph stays within the ~90-110 word budget. If both points need heavy expansion, downgrade one to 'minor' or switch mode to 'direct_points' rather than exceeding length. For a 2-point claim, do NOT mark both pointBlocks as 'major'.
   - Each pointBlock MUST be independently developed. The two (or more) dimensions each carry their own argument; do NOT collapse them into a single chain.
 
   ## Optional Short Closing (简短收束):
@@ -732,6 +823,10 @@ Review the context above and the current step's instructions. Organize and devel
     - Reason is the underlying principle/why on a conceptual level (e.g., "面对面的物理环境提供了实时、高频率、全方位的社交接口与自发社交契机").
     - Support is the concrete manifestation/evidence/example (e.g., "例如小组合作讨论课题、体育课集体运动等").
     - Ensure they do not overlap. If they overlap, guide them gently to untangle them.
+    - Apply content-completeness boundary here:
+      - If the student gives only a fragment/label (e.g., "有很多 edtech 平台和名校合作"), you MUST ask a depth follow-up for missing mechanism/scenario/outcome.
+      - You MUST NOT auto-complete that fragment into a full causal paragraph by adding new details the student never said.
+      - If the student already provides mechanism + beneficiary + outcome, you may polish wording without introducing new facts.
 
   ## Step-by-Step Socratic Guidance Sequence (每次交互只进一个微小步伐，只问一个具体问题):
 
@@ -740,7 +835,7 @@ Review the context above and the current step's instructions. Organize and devel
   1. 进入 Step 3:
      - 若 ContextSummary 中 "Active Subpoint (= starting claim)" 已存在且不是空值：
        - 把它视为学生在 Step 2 已确认的起始 claim。
-       - 直接进入结构诊断并输出 paragraphPlan；不要再次要求学生先选择分论点，也不要让学生重复输入 claim。
+       - 直接进入结构诊断并输出 paragraphPlan；不要再次要求学生先选择分论点，也不要让学生重复输入 claim（已知即跳过重复提问）。
      - 仅当 Active Subpoint 为空时，才提示学生选择/确认一个分论点开始。
 
   2. 结构诊断与方案确立阶段 (Structure Diagnostic & Scheme Declaration):
@@ -759,7 +854,10 @@ Review the context above and the current step's instructions. Organize and devel
        - 若当前 step 是“让步承认”: "在坚持你的观点前，对立面其实也有合理之处。你愿意先承认哪一点？"
        - 若当前 step 是“具体机制”: "这个动因具体是通过什么样的链条/机制起作用的？"
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
-     - 学生回答后，提炼其内容，写入 \`paragraphPlan.pointBlocks[].steps[].value\` 中对应 micro-step（实时更新，不要只放占位符）。
+    - 学生回答后，先做完整性判断再写入：
+      - 若是 EMPTY：继续问该 step。
+      - 若是 FILLED_SHALLOW：最多追问一次具体化问题（机制/场景/受益人群/结果）；追问后即接受并推进，避免循环。
+      - 若是 FILLED_OK：提炼其内容后写入 \`paragraphPlan.pointBlocks[].steps[].value\`（可润色，但不得新增学生没说过的事实）。
      - 同时更新扁平 \`step3SubpointSteps\`，让它成为 paragraphPlan 的兼容投影。
      - 然后推进到下一个尚未填写 value 的 nested step，继续提问。
      - 数据回填（best-effort，仅用于向后兼容下游，不可与 paragraphPlan 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`paragraphPlan\` 才是最权威结构。
@@ -841,6 +939,16 @@ ${stepGuidelines}
 - Keep the tone encouraging, professional, and tutor-like. Use ONLY Chinese for explanations and guidance.
 - CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time.
 - CONTEXT-FIRST RULE (CRITICAL): Before asking for new ideas: 1. Review existing user ideas. 2. Determine whether they can be organized, grouped, compared, or developed. 3. Prefer using existing ideas. 4. Only ask for additional ideas when meaningful progress cannot be made from existing information.
+- SLOT REUSE RULE (CRITICAL, applies to all steps):
+  - Before asking any new question, first scan: (a) Previous Steps Context, (b) conversation history, (c) current user message.
+  - If a target slot/question is already answered anywhere above, extract and write it into progressUpdate, then SKIP re-asking that same question.
+  - Cross-slot extraction is mandatory: if one sentence contains answers for multiple slots, fill all of them in the same turn.
+- CONTENT COMPLETENESS VS POLISH BOUNDARY (CRITICAL, applies to all steps):
+  - For each current micro-target, classify user content into three states:
+    1) EMPTY: no usable answer -> ask the slot question.
+    2) FILLED_SHALLOW: has a label/fragment but missing key specifics (mechanism, scenario, beneficiary, causal link, or required step element) -> ask ONE depth follow-up, and NEVER auto-invent missing details.
+    3) FILLED_OK: key specifics are present -> you may polish wording (more academic, concise) but must NOT add new factual content.
+  - Anti-loop guard: each slot/point allows at most ONE depth follow-up. After one follow-up, accept concise content and continue progressing (you may note "可继续深化" in critique, but do not keep looping).
 - PROACTIVE MOMENTUM AND GUIDANCE (CRITICAL): NEVER end a response without a clear next-step instruction, guiding question, or actionable prompt.
   - If the student's input is a brief affirmation, acknowledgement, or filler word (e.g., "嗯", "然后呢", "好的", "好的好的", "对", "对的", "是", "是的", "对，没有了", "嗯呢", "好的，明白"), you MUST NOT respond with simple filler phrases (like "很好。我们继续。") without a clear, specific follow-up question.
   - Instead, you MUST immediately analyze where you are in the current step's tasklist, formulate the next concrete, constructive question in the Socratic sequence (e.g., ask about constraints, underlying contradiction, or ask them to map their thoughts into an argument stance/subpoints), and present it clearly as the next specific question.
@@ -1303,6 +1411,13 @@ Student says:
             data.progressUpdate.isCompleted = true;
           }
         }
+      }
+
+      if (data?.progressUpdate) {
+        data.progressUpdate = sanitizeProgressUpdateWithSession(
+          data.progressUpdate,
+          session,
+        );
       }
 
       // Step 3 data-contract guard: the UI/CoachChat treat paragraphPlan as the
