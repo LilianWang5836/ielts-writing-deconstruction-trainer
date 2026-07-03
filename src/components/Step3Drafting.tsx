@@ -14,6 +14,8 @@ import {
 import { Topic, PracticeSession } from "../types";
 import CoachChat from "./CoachChat";
 
+type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
+
 interface Step3DraftingProps {
   topic: Topic;
   session: PracticeSession;
@@ -40,32 +42,7 @@ export default function Step3Drafting({
   const clusters = session.step2.coachEvaluation?.clustering?.clusters;
   const fallbackBodies = session.step2.coachEvaluation?.blueprint?.bodies;
 
-  const parsedSubpoints: {
-    id: string;
-    content: string;
-    points?: string[];
-    targetBody?: string;
-    theme?: string;
-    draft?: string;
-    hint?: string;
-    isCompleted: boolean;
-    claim?: string;
-    mechanism?: string;
-    result?: string;
-    reason?: string;
-    supportType?: 'example' | 'mechanism' | 'scenario';
-    supportContent?: string;
-    impact?: string;
-    completenessChecks?: { label: string; passed: boolean; desc: string }[];
-    transitionChecks?: { label: string; passed: boolean; desc: string }[];
-    sufficiencyCheck?: { label: string; passed: boolean; desc: string };
-    structureSteps?: {
-      key: string;
-      label: string;
-      placeholder: string;
-      value?: string;
-    }[];
-  }[] = clusters && Array.isArray(clusters) && clusters.length > 0
+  const parsedSubpoints: Step3Subpoint[] = clusters && Array.isArray(clusters) && clusters.length > 0
     ? clusters.map((cluster: any, i: number) => ({
         id: `body-${i + 1}`,
         content: cluster.content || `${cluster.targetBody || `Body Paragraph ${i + 1}`}: ${cluster.theme || `主题 ${i + 1}`}`,
@@ -126,6 +103,25 @@ export default function Step3Drafting({
 
   const userStance = session.step2.userStance || session.step2.coachEvaluation?.userStance;
   const userPoints = session.step2.userPoints || session.step2.coachEvaluation?.userPoints;
+
+  const strategyLabel: Record<string, string> = {
+    explanation: "解释",
+    example: "举例",
+    mechanism: "机制",
+    impact: "影响",
+    contrast: "对比",
+    hybrid: "混合",
+  };
+
+  const modeLabel: Record<string, string> = {
+    total_then_points: "总分型",
+    direct_points: "分点直写型",
+  };
+
+  const isStepAvailable = (
+    steps: { value?: string }[],
+    idx: number,
+  ) => !!steps[idx]?.value || idx === 0 || !!steps[idx - 1]?.value;
 
   const welcomeMessage = userStance
     ? `【第三步：段落论证起草 ✍️】
@@ -340,59 +336,158 @@ ${userPoints ? `> *“${userPoints}”*` : `> *见右侧主体段落列表*`}
                 <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
                   🔗 论证链条构建状态（Logic Chain Flow）
                 </span>
-                <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
-                  {(activeSubpoint.structureSteps || [
-                    {
-                      key: "claim",
-                      label: "核心观点 (Claim)",
-                      placeholder: "思考并回答 Coach 的第一个问题以建立一句话核心观点...",
-                      value: activeSubpoint.claim
-                    },
-                    {
-                      key: "reason",
-                      label: "展开原因 (Reason)",
-                      placeholder: activeSubpoint.claim ? "为什么？思考并回答该观点是如何在逻辑上成立的..." : "等待核心观点建立后开启...",
-                      value: activeSubpoint.reason
-                    },
-                    {
-                      key: "support",
-                      label: `支撑展开 (${activeSubpoint.supportType ? (activeSubpoint.supportType === 'example' ? 'Example / 举例' : activeSubpoint.supportType === 'mechanism' ? 'Mechanism / 机制' : 'Scenario / 场景') : 'Support'})`,
-                      placeholder: activeSubpoint.reason ? "在 Coach 推荐的论证策略指导下，思考并回答具体佐证内容..." : "等待原因展开后开启...",
-                      value: activeSubpoint.supportContent
-                    },
-                    {
-                      key: "impact",
-                      label: "推导结果 (Impact)",
-                      placeholder: activeSubpoint.supportContent ? "思考并回答这种优势/佐证最终会产生什么重大影响或长远结果..." : "等待支撑展开后开启...",
-                      value: activeSubpoint.impact
-                    }
-                  ]).map((step, idx, arr) => {
-                    const iconChar = step.key.charAt(0).toUpperCase();
-                    const isAvailable = !!step.value || (idx === 0) || !!arr[idx - 1].value;
-                    return (
-                      <div key={step.key} className="flex gap-3">
-                        <div className="flex flex-col items-center shrink-0">
-                          <div className={`h-6 w-6 rounded-full flex items-center justify-center font-sans font-bold text-[10px] transition ${step.value ? 'bg-indigo-650 text-white' : 'bg-slate-100 text-slate-400'}`}>
-                            {iconChar}
-                          </div>
-                          {idx < arr.length - 1 && (
-                            <div className="w-0.5 flex-1 bg-slate-200 min-h-[16px]"></div>
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">Step {idx + 1}: {step.label}</span>
-                          {step.value ? (
-                            <p className="text-slate-800 font-bold text-xs mt-0.5 leading-relaxed bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs">{step.value}</p>
-                          ) : (
-                            <p className="text-slate-400 text-xs italic mt-0.5">
-                              {isAvailable ? step.placeholder : "等待上一步构建完成后开启..."}
-                            </p>
-                          )}
-                        </div>
+
+                {activeSubpoint.paragraphPlan ? (
+                  <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2 py-1 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                        {modeLabel[activeSubpoint.paragraphPlan.mode] || activeSubpoint.paragraphPlan.mode}
+                      </span>
+                      <span className="text-[11px] text-slate-500 leading-relaxed">
+                        {activeSubpoint.paragraphPlan.diagnosis}
+                      </span>
+                    </div>
+
+                    {activeSubpoint.paragraphPlan.totalClaim && (
+                      <div className="bg-white border border-indigo-150 rounded-xl p-3 shadow-3xs">
+                        <p className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider mb-1">总观点 (Total Claim)</p>
+                        <p className="text-xs text-slate-800 font-bold leading-relaxed">
+                          {activeSubpoint.paragraphPlan.totalClaim}
+                        </p>
                       </div>
-                    );
-                  })}
-                </div>
+                    )}
+
+                    <div className="space-y-3">
+                      {activeSubpoint.paragraphPlan.pointBlocks.map((block, blockIdx) => (
+                        <div key={block.id || blockIdx} className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-3xs space-y-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="h-5 w-5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-150 flex items-center justify-center text-[10px] font-bold">
+                              {blockIdx + 1}
+                            </span>
+                            <span className="font-sans text-xs font-bold text-slate-800">
+                              {block.label || `分点 ${blockIdx + 1}`}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                              block.role === "major"
+                                ? "bg-emerald-50 text-emerald-700 border-emerald-150"
+                                : "bg-slate-50 text-slate-600 border-slate-200"
+                            }`}>
+                              {block.role === "major" ? "详写" : "略写"}
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-150">
+                              {strategyLabel[block.expansionStrategy] || block.expansionStrategy}
+                            </span>
+                          </div>
+
+                          <div className="bg-slate-50 border border-slate-150 rounded-lg p-2.5">
+                            <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">子观点 (Sub-Claim)</p>
+                            <p className="text-xs text-slate-800 font-bold leading-relaxed">
+                              {block.subClaim}
+                            </p>
+                          </div>
+
+                          <div className="space-y-2">
+                            {block.steps.map((step, idx, arr) => {
+                              const iconChar = step.key.charAt(0).toUpperCase();
+                              const available = isStepAvailable(arr, idx);
+                              return (
+                                <div key={step.key} className="flex gap-2.5">
+                                  <div className="flex flex-col items-center shrink-0">
+                                    <div className={`h-5 w-5 rounded-full flex items-center justify-center font-sans font-bold text-[9px] transition ${
+                                      step.value ? "bg-indigo-650 text-white" : "bg-slate-100 text-slate-400"
+                                    }`}>
+                                      {iconChar}
+                                    </div>
+                                    {idx < arr.length - 1 && (
+                                      <div className="w-0.5 flex-1 bg-slate-200 min-h-[12px]"></div>
+                                    )}
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                    <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">
+                                      {step.label}
+                                    </span>
+                                    {step.value ? (
+                                      <p className="text-slate-700 font-semibold text-[11px] mt-0.5 leading-relaxed bg-slate-50 border border-slate-150 rounded-lg p-2">
+                                        {step.value}
+                                      </p>
+                                    ) : (
+                                      <p className="text-slate-400 text-[11px] italic mt-0.5">
+                                        {available ? step.placeholder : "等待上一步构建完成后开启..."}
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {activeSubpoint.paragraphPlan.optionalShortClosing && (
+                      <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-3xs">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">简短收束</p>
+                        <p className="text-xs text-slate-700 leading-relaxed italic">
+                          {activeSubpoint.paragraphPlan.optionalShortClosing}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
+                    {(activeSubpoint.structureSteps || [
+                      {
+                        key: "claim",
+                        label: "核心观点 (Claim)",
+                        placeholder: "思考并回答 Coach 的第一个问题以建立一句话核心观点...",
+                        value: activeSubpoint.claim
+                      },
+                      {
+                        key: "reason",
+                        label: "展开原因 (Reason)",
+                        placeholder: activeSubpoint.claim ? "为什么？思考并回答该观点是如何在逻辑上成立的..." : "等待核心观点建立后开启...",
+                        value: activeSubpoint.reason
+                      },
+                      {
+                        key: "support",
+                        label: `支撑展开 (${activeSubpoint.supportType ? (activeSubpoint.supportType === 'example' ? 'Example / 举例' : activeSubpoint.supportType === 'mechanism' ? 'Mechanism / 机制' : 'Scenario / 场景') : 'Support'})`,
+                        placeholder: activeSubpoint.reason ? "在 Coach 推荐的论证策略指导下，思考并回答具体佐证内容..." : "等待原因展开后开启...",
+                        value: activeSubpoint.supportContent
+                      },
+                      {
+                        key: "impact",
+                        label: "推导结果 (Impact)",
+                        placeholder: activeSubpoint.supportContent ? "思考并回答这种优势/佐证最终会产生什么重大影响或长远结果..." : "等待支撑展开后开启...",
+                        value: activeSubpoint.impact
+                      }
+                    ]).map((step, idx, arr) => {
+                      const iconChar = step.key.charAt(0).toUpperCase();
+                      const available = isStepAvailable(arr, idx);
+                      return (
+                        <div key={step.key} className="flex gap-3">
+                          <div className="flex flex-col items-center shrink-0">
+                            <div className={`h-6 w-6 rounded-full flex items-center justify-center font-sans font-bold text-[10px] transition ${step.value ? 'bg-indigo-650 text-white' : 'bg-slate-100 text-slate-400'}`}>
+                              {iconChar}
+                            </div>
+                            {idx < arr.length - 1 && (
+                              <div className="w-0.5 flex-1 bg-slate-200 min-h-[16px]"></div>
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">Step {idx + 1}: {step.label}</span>
+                            {step.value ? (
+                              <p className="text-slate-800 font-bold text-xs mt-0.5 leading-relaxed bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs">{step.value}</p>
+                            ) : (
+                              <p className="text-slate-400 text-xs italic mt-0.5">
+                                {available ? step.placeholder : "等待上一步构建完成后开启..."}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               {/* Three Evaluation Checklists */}

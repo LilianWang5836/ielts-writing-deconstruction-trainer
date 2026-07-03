@@ -133,6 +133,30 @@ export interface ChatMessage {
   isSplit?: boolean;
 }
 
+export interface LogicStep {
+  key: string;
+  label: string;
+  placeholder: string;
+  value?: string;
+}
+
+export interface ParagraphPointBlock {
+  id: string;
+  label: string;
+  subClaim: string;
+  role: 'major' | 'minor';
+  expansionStrategy: 'explanation' | 'example' | 'mechanism' | 'impact' | 'contrast' | 'hybrid';
+  steps: LogicStep[];
+}
+
+export interface ParagraphPlan {
+  mode: 'single_point' | 'total_then_points' | 'direct_points';
+  diagnosis: string;
+  totalClaim?: string;
+  pointBlocks: ParagraphPointBlock[];
+  optionalShortClosing?: string;
+}
+
 export interface PracticeSession {
   id: string;
   topic: Topic;
@@ -228,12 +252,8 @@ export interface PracticeSession {
       completenessChecks?: { label: string; passed: boolean; desc: string }[];
       transitionChecks?: { label: string; passed: boolean; desc: string }[];
       sufficiencyCheck?: { label: string; passed: boolean; desc: string };
-      structureSteps?: {
-        key: string;
-        label: string;
-        placeholder: string;
-        value?: string;
-      }[];
+      paragraphPlan?: ParagraphPlan;
+      structureSteps?: LogicStep[];
     }[];
     activeSubpointId?: string;
     isCompleted: boolean;

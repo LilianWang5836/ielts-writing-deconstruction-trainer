@@ -58,6 +58,93 @@ export default function CoachChat({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory, loading, children]);
 
+  const mergeLogicSteps = (prevSteps: any[] = [], nextSteps: any[] = []) => {
+    const prevByKey: Record<string, any> = {};
+    prevSteps.forEach((s: any) => {
+      if (s && s.key) prevByKey[s.key] = s;
+    });
+
+    return nextSteps.map((s: any) => {
+      const prev = s && s.key ? prevByKey[s.key] : undefined;
+      const newVal = s && typeof s.value === 'string' ? s.value : '';
+      const value =
+        newVal && newVal.trim()
+          ? newVal
+          : prev && prev.value
+          ? prev.value
+          : newVal;
+      return { ...prev, ...s, value };
+    });
+  };
+
+  const mergeParagraphPlan = (prevPlan: any, nextPlan: any) => {
+    if (!nextPlan || !Array.isArray(nextPlan.pointBlocks)) return prevPlan;
+
+    const prevBlocks = Array.isArray(prevPlan?.pointBlocks)
+      ? prevPlan.pointBlocks
+      : [];
+    const prevById: Record<string, any> = {};
+    prevBlocks.forEach((b: any) => {
+      if (b && b.id) prevById[b.id] = b;
+    });
+
+    const pointBlocks = nextPlan.pointBlocks.map((block: any) => {
+      const prev = block && block.id ? prevById[block.id] : undefined;
+      return {
+        ...prev,
+        ...block,
+        steps: mergeLogicSteps(prev?.steps || [], block.steps || []),
+      };
+    });
+
+    return {
+      ...prevPlan,
+      ...nextPlan,
+      totalClaim:
+        nextPlan.totalClaim && String(nextPlan.totalClaim).trim()
+          ? nextPlan.totalClaim
+          : prevPlan?.totalClaim || nextPlan.totalClaim,
+      // Preserve the closing from a prior turn when the new turn sends empty.
+      optionalShortClosing:
+        nextPlan.optionalShortClosing && String(nextPlan.optionalShortClosing).trim()
+          ? nextPlan.optionalShortClosing
+          : prevPlan?.optionalShortClosing || '',
+      pointBlocks,
+    };
+  };
+
+  const buildDraftFromParagraphPlan = (plan: any) => {
+    if (!plan || !Array.isArray(plan.pointBlocks)) return '';
+
+    const parts: string[] = [];
+    if (plan.totalClaim && String(plan.totalClaim).trim()) {
+      parts.push(`【总观点】\n${plan.totalClaim}`);
+    }
+
+    for (const block of plan.pointBlocks) {
+      const blockParts: string[] = [];
+      if (block.subClaim) {
+        blockParts.push(`【${block.label || '分点'}】\n${block.subClaim}`);
+      }
+      if (Array.isArray(block.steps)) {
+        for (const step of block.steps) {
+          if (step.value) {
+            blockParts.push(`【${step.label}】\n${step.value}`);
+          }
+        }
+      }
+      if (blockParts.length > 0) {
+        parts.push(blockParts.join('\n\n'));
+      }
+    }
+
+    if (plan.optionalShortClosing && String(plan.optionalShortClosing).trim()) {
+      parts.push(`【简短收束】\n${plan.optionalShortClosing}`);
+    }
+
+    return parts.join('\n\n');
+  };
+
   const sendUserMessage = async (textToSend: string) => {
     if (!textToSend.trim() || loading) return;
 
@@ -225,6 +312,12 @@ export default function CoachChat({
               if (data.progressUpdate.step3SubpointCompleted !== undefined) {
                 updatedSp.isCompleted = data.progressUpdate.step3SubpointCompleted;
               }
+              if (data.progressUpdate.paragraphPlan) {
+                updatedSp.paragraphPlan = mergeParagraphPlan(
+                  updatedSp.paragraphPlan,
+                  data.progressUpdate.paragraphPlan,
+                );
+              }
               if (
                 Array.isArray(data.progressUpdate.step3SubpointSteps) &&
                 data.progressUpdate.step3SubpointSteps.length > 0
@@ -233,26 +326,9 @@ export default function CoachChat({
                 // chosen logic chain. Preserve previously captured values (matched by key)
                 // when an incoming entry's value is empty, so a re-declaration turn does
                 // not wipe progress.
-                const prevSteps = Array.isArray(updatedSp.structureSteps)
-                  ? updatedSp.structureSteps
-                  : [];
-                const prevByKey: Record<string, any> = {};
-                prevSteps.forEach((s: any) => {
-                  if (s && s.key) prevByKey[s.key] = s;
-                });
-                updatedSp.structureSteps = data.progressUpdate.step3SubpointSteps.map(
-                  (s: any) => {
-                    const prev = s && s.key ? prevByKey[s.key] : undefined;
-                    const newVal =
-                      s && typeof s.value === 'string' ? s.value : '';
-                    const value =
-                      newVal && newVal.trim()
-                        ? newVal
-                        : prev && prev.value
-                        ? prev.value
-                        : newVal;
-                    return { ...prev, ...s, value };
-                  },
+                updatedSp.structureSteps = mergeLogicSteps(
+                  updatedSp.structureSteps || [],
+                  data.progressUpdate.step3SubpointSteps,
                 );
               }
               if (data.progressUpdate.step3SubpointCompletenessChecks) {
@@ -269,13 +345,14 @@ export default function CoachChat({
             return sp;
           });
 
-          // Construct the combined draft of the active subpoint. structureSteps (the
-          // model-chosen logic chain) is authoritative; the legacy claim/reason/support/
-          // impact fields are only used as a fallback for older sessions or turns where
-          // structureSteps is unavailable.
+          // Construct the combined draft of the active subpoint. paragraphPlan is
+          // authoritative for grouped multi-point claims; structureSteps and legacy
+          // claim/reason/support/impact fields are fallbacks.
           const activeSp = updatedSubpoints.find((sp: any) => sp.id === activeId);
           let subpointDraft = activeSp?.draft || '';
-          if (activeSp && activeSp.structureSteps && activeSp.structureSteps.length > 0) {
+          if (activeSp && activeSp.paragraphPlan) {
+            subpointDraft = buildDraftFromParagraphPlan(activeSp.paragraphPlan);
+          } else if (activeSp && activeSp.structureSteps && activeSp.structureSteps.length > 0) {
             const parts = [];
             for (const step of activeSp.structureSteps) {
               if (step.value) {

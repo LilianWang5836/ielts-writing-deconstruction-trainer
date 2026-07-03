@@ -17,11 +17,38 @@ const BASE = process.env.PROBE_BASE_URL || "http://localhost:3000";
 
 const cases = [
   {
+  name: "Teacher Feedback + Peer Competition",
+  question:
+    "Some people believe that online learning is highly beneficial and should replace traditional classroom education entirely. To what extent do you agree or disagree?",
+  userMessage:
+    "我想论证这个分论点：传统课堂不仅能提供教师即时反馈，也能通过同伴竞争激发学生的学习动力。",
+  subpointContent:
+    "传统课堂不仅能提供教师即时反馈，也能通过同伴竞争激发学生的学习动力。",
+
+  expectedPlanMode: "multi_point",
+  expectedPointCount: 2,
+  expectedPointKeywords: ["教师即时反馈", "同伴竞争"],
+  printFull: true,
+},
+  {
+    name: "Multi-Point Claim (School Supervision + Peer Interaction)",
+    question:
+      "Some people believe that online learning is highly beneficial and should replace traditional classroom education entirely. To what extent do you agree or disagree?",
+    userMessage:
+      "我想论证这个分论点：对于自律性差且处于社交发展关键期的儿童，实体学校提供必不可少的行为监管和同伴互动环境。",
+    subpointContent:
+      "对于自律性差且处于社交发展关键期的儿童，实体学校提供必不可少的行为监管和同伴互动环境。",
+    expectMultiPoint: true,
+    printFull: true,
+  },
+  {
     name: "Concession (Discuss Both Views)",
     question:
       "With the rapid development of Artificial Intelligence (AI), some think it will bring more benefits to workers, while others fear it will cause widespread unemployment. Discuss both views and give your opinion.",
     userMessage:
       "我想论证：虽然 AI 会取代部分重复性岗位，但总体上它为劳动者创造了更多新型的、更有价值的工作机会。",
+    subpointContent:
+      "虽然 AI 会取代部分重复性岗位，但总体上它为劳动者创造了更多新型的、更有价值的工作机会。",
   },
   {
     name: "Problem-Solution",
@@ -29,6 +56,8 @@ const cases = [
       "The increasing consumption of sugar-rich foods and drinks is leading to serious health problems worldwide. What are the causes of this issue, and what solutions can be implemented to solve it?",
     userMessage:
       "我想写其中一个主体段：高糖食品消费过量导致肥胖和糖尿病激增，应当通过征收糖税和强制营养标签来缓解。",
+    subpointContent:
+      "高糖食品消费过量导致肥胖和糖尿病激增，应当通过征收糖税和强制营养标签来缓解。",
   },
   {
     name: "Deductive (Agree/Disagree)",
@@ -36,18 +65,28 @@ const cases = [
       "Some people think that governments should ban smoking in all public places to protect non-smokers. To what extent do you agree or disagree?",
     userMessage:
       "我想论证：在公共场所全面禁烟能够直接保护非吸烟者免受二手烟的健康危害。",
+    subpointContent:
+      "在公共场所全面禁烟能够直接保护非吸烟者免受二手烟的健康危害。",
   },
 ];
 
 async function runCase(c) {
+  // Mimic the real UI flow: a subpoint has already been created and selected,
+  // so the Coach must treat it as the active subpoint (activeSubpointId set).
+  const subpointContent = c.subpointContent || c.userMessage;
+  const subpoint = {
+    id: "body-1",
+    content: subpointContent,
+    isCompleted: false,
+  };
   const body = {
     question: c.question,
     step: 3,
     userMessage: c.userMessage,
     messages: [],
-    stepContext: { subpoints: [] },
+    stepContext: { subpoints: [subpoint] },
     session: {
-      step3: { subpoints: [], activeSubpointId: null },
+      step3: { subpoints: [subpoint], activeSubpointId: "body-1" },
     },
   };
 
@@ -65,6 +104,42 @@ async function runCase(c) {
     return;
   }
   const steps = data?.progressUpdate?.step3SubpointSteps;
+  const plan = data?.progressUpdate?.paragraphPlan;
+
+  if (c.printFull && data?.text) {
+    console.log("  --- Coach text ---");
+    console.log(
+      data.text
+        .split("\n")
+        .map((l) => `  | ${l}`)
+        .join("\n"),
+    );
+    console.log("  ------------------");
+  }
+
+  if (plan) {
+    console.log("  paragraphPlan:");
+    console.log(`    mode=${plan.mode}`);
+    console.log(`    diagnosis=${plan.diagnosis}`);
+    if (plan.totalClaim) console.log(`    totalClaim=${plan.totalClaim}`);
+    if (Array.isArray(plan.pointBlocks)) {
+      plan.pointBlocks.forEach((block, i) => {
+        console.log(
+          `    point ${i + 1}: id=${block.id} | label=${block.label} | role=${block.role} | strategy=${block.expansionStrategy}`,
+        );
+        console.log(`      subClaim=${block.subClaim}`);
+        if (Array.isArray(block.steps)) {
+          block.steps.forEach((step, j) => {
+            console.log(
+              `      ${j + 1}. key=${step.key} | label=${step.label} | value=${step.value || "<empty>"}`,
+            );
+          });
+        }
+      });
+    }
+  } else {
+    console.log("  paragraphPlan: <missing>");
+  }
   if (Array.isArray(steps) && steps.length > 0) {
     console.log("  step3SubpointSteps:");
     steps.forEach((s, i) =>
@@ -78,6 +153,18 @@ async function runCase(c) {
     console.log(`  -> classified as: ${isDeductive ? "DEDUCTIVE" : "NON-DEDUCTIVE / CUSTOM"}`);
   } else {
     console.log("  step3SubpointSteps: <missing or empty>");
+  }
+
+  if (c.expectMultiPoint) {
+    const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+    const haystack = JSON.stringify(plan || {});
+    const hasSupervision = haystack.includes("监管");
+    const hasPeer = haystack.includes("同伴") || haystack.includes("社交");
+    const pass = blocks.length >= 2 && hasSupervision && hasPeer;
+    console.log(
+      `  -> MULTI-POINT ASSERTION: ${pass ? "PASS" : "FAIL"} ` +
+        `(pointBlocks=${blocks.length}, 监管=${hasSupervision}, 同伴/社交=${hasPeer})`,
+    );
   }
 }
 

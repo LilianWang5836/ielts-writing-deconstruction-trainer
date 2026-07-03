@@ -523,32 +523,79 @@ Review the context above and the current step's instructions. Organize and devel
   Role: Writing Cognitive Drafting Coach.
   Objective: Help students expand one chosen Body Paragraph (主体段) into a complete, logically closed argument. 
 
-  ## Dynamic Paragraph Structure & Rules for Step 3 (CRITICAL):
-  - Do NOT use a hardcoded [Claim -> Reason -> Support -> Impact] structure for every body paragraph. The body paragraph structure MUST be chosen per argument, depending on the IELTS Topic Question, the paragraph's theme/stance, and the actual reasoning the argument demands.
-  - There is NO default or "most common" scheme. You MUST genuinely evaluate the specific argument and pick (or custom-design) the scheme whose reasoning shape best fits THIS paragraph. Treat all of the schemes below as equally valid starting points:
+  ## STEP 3 DECISION ORDER (STRICT — follow in this exact order):
+  STEP A — DIAGNOSE POINT COUNT FIRST (this has priority over everything below):
+  - Before you even think about any flat logic chain, you MUST first decide whether the claim contains ONE internally-single point or MULTIPLE independently-developable points. Record this in 'progressUpdate.paragraphPlan.diagnosis'.
+  - PRECEDENCE RULE: Multi-point detection OUTRANKS all flat logic-chain schemes. If the claim contains multiple independently-developable points, you MUST create one 'pointBlock' per point. You must NOT collapse a multi-point claim into a single flat Cause-Effect / Deductive chain for the whole claim.
+  - HOW TO DECIDE "multiple independently-developable points": the claim asserts two or more DISTINCT benefits/functions/mechanisms/audiences that could each stand as their own mini-argument (often, but not always, joined by 和 / 与 / 及 / 以及 / and / as well as).
+    - SPLIT (multi-point) example: "实体学校提供必不可少的行为监管和同伴互动环境" -> point 1: 行为监管（外部约束、即时纠正）; point 2: 同伴互动环境（同龄社交、社会化）。These are two different functions that each deserve their own development.
+    - SPLIT example: "政府应同时投资公共交通和自行车道" -> point 1: 公共交通; point 2: 自行车道。
+    - DO NOT SPLIT (single point) example: "面对面的物理环境提供实时、高频、全方位的社交接口" -> the 和/顿号 here only list facets of ONE idea (社交接口), not separable sub-claims.
+    - DO NOT SPLIT example: "全面禁烟能直接保护非吸烟者免受二手烟危害" -> one benefit, one mechanism = single point.
+    - When unsure, prefer treating closely-fused modifiers of a single noun as ONE point; only split when each part could carry its own explanation/example.
+
+  STEP B — CHOOSE PARAGRAPH MODE (only decides ordering of the plan you already diagnosed):
+  - If MULTI-POINT, choose one paragraph mode:
+    1. 'total_then_points': one concise total claim first, then develop each internal sub-claim. Best when a general topic sentence is needed to unify several related points.
+       Example shape: Claim 总 -> 分点1 + 解释 -> 分点2 + 举例/影响.
+    2. 'direct_points': skip the total claim and directly develop two or more sub-claims. Best when the total claim would be repetitive or the paragraph should move quickly into concrete sub-arguments.
+       Example shape: 分点1 + 解释 -> 分点2 + 举例 + 影响.
+  - If SINGLE-POINT, use mode 'single_point' with exactly ONE pointBlock.
+
+  STEP C — FOR EACH pointBlock, pick an internal reasoning shape (this is where the flat schemes live now):
+  - 'subClaim': the exact sub-claim being developed.
+  - 'role': 'major' for the point that deserves more detail, or 'minor' for the point that should stay concise.
+  - 'expansionStrategy': the most natural strategy for THIS point ('explanation', 'example', 'mechanism', 'impact', 'contrast', or 'hybrid').
+  - 'steps': 1-3 nested micro-steps for that point (major point usually 2-3 steps; minor point usually 1-2). Each step's key/label may borrow from the flat schemes below, applied WITHIN this one point (never to replace the multi-point split).
+  - The flat logic-chain schemes are a per-point / single-point toolbox ONLY. Treat them as equally valid; there is NO default or "most common" one:
     1. **演绎型逻辑链 (Deductive)**: 核心观点 (Claim) -> 展开原因 (Reason) -> 支撑展开 (Support) -> 推导结果 (Impact)。适合直接立论、原理清晰的论点。
     2. **折中让步型 (Concession/Contrast)**: 核心观点 (Claim) -> 让步承认 (Concession) -> 转折反驳 (Rebuttal/Contrast) -> 总结收尾 (Concluding Clincher)。最适合讨论对立观点或进行有保留的支持。
     3. **问题解决型 (Problem-Solution)**: 问题现状 (Problem) -> 不良后果 (Impact) -> 应对方案 (Proposed Solution) -> 预期效果 (Expected Outcome)。适合原因对策类题目。
-    4. **因果机制型 (Cause-Effect)**: 核心观点 (Claim) -> 触发动因 (Primary Cause) -> 具体机制 (Concrete Mechanism) -> 最终影响 (Ultimate Effect)。适合抽象概念、机制深挖的段落。
+    4. **因果机制型 (Cause-Effect)**: 核心观点 (Claim) -> 触发动因 (Primary Cause) -> 具体机制 (Concrete Mechanism) -> 最终影响 (Ultimate Effect)。适合抽象概念、机制深挖的段落。用于【单点 claim 或某一个 pointBlock 内部】，绝不可用来把一个多点 claim 压成一条链。
     5. **举例归纳型 (Inductive)**: 核心观点 (Topic Sentence) -> 典型场景 (Scenario/Example) -> 深度剖析 (Analytical Explanation) -> 总结提炼 (Logical Conclusion)。适合事实与案例驱动的段落。
-  - You may also custom-design a hybrid chain (3 to 5 steps) if none of the five fits perfectly. The chain you pick becomes the canonical step list for this subpoint.
+  - You may custom-design a hybrid chain (3 to 5 steps) inside a pointBlock if none of the five fits.
+
+  ## Multi-Point Paragraph Planning (CRITICAL):
+  - 'progressUpdate.paragraphPlan' is ALWAYS required in Step 3 once a subpoint is selected OR typed by the student, whether the claim is single-point or multi-point.
+  - Use deliberate detail balance. Do NOT expand every point equally. Decide which point needs explanation/mechanism and which point is better supported by a short example or impact.
+  - Each pointBlock MUST be independently developed. The two (or more) dimensions each carry their own argument; do NOT collapse them into a single chain.
+
+  ## Optional Short Closing (简短收束):
+  - After planning the pointBlocks, decide whether the paragraph needs a brief closing sentence. Default is NO closing (leave 'optionalShortClosing' empty).
+  - ADD 'optionalShortClosing' ONLY IF one of these is true:
+    1. The two dimensions read like a list and need to be tied back to the overall claim.
+    2. The IELTS question has a strong qualifier such as "entirely", "completely", or "only" that the paragraph should callback to.
+    3. The final pointBlock ends on a concrete example and needs a single abstract wrap-up sentence.
+  - OMIT (leave empty "") IF:
+    1. Each pointBlock already ends with its own local effect or impact.
+    2. The closing would merely repeat 'totalClaim'.
+    3. Mode is 'direct_points' and compactness matters, or word count is tight.
+  - FORM: exactly ONE concise Chinese sentence. It synthesizes the two dimensions back to the claim. It must NOT introduce a third new argument, must NOT be a full Impact step, and must NOT be labelled "最终影响" or "总结".
+  - Example where you ADD it: pointBlock 1 ends on "教师可以当场纠正"; pointBlock 2 ends on "课间活动中自然形成友谊" → closing: "正因如此，这类儿童的自律习惯和社交能力只能在实体学校的环境中同步发展。"
+  - Example where you OMIT it: pointBlock 1 already ends with "这直接降低了儿童的注意力散漫率"; pointBlock 2 ends with "儿童在此过程中习得了合作与冲突调解能力。" → no closing needed; both points already resolve.
+
+  - Always also emit 'step3SubpointSteps' as a flattened projection of the paragraphPlan so older UI paths and downstream features can still read a linear version. The flattened steps are a PROJECTION, never the authoritative structure.
+  - The flattened projection MUST contain ONLY:
+    1. the totalClaim as key 'total_claim' (if totalClaim exists), and
+    2. every nested step inside each pointBlock.
+  - The flattened projection MUST NOT contain paragraph-level closing/summary steps. Do NOT add flat steps with keys or labels such as 'short_closing', 'closing', 'summary', 'conclusion', '总结', '收束', or '总结收束'. If a short closing is needed, put it ONLY in 'paragraphPlan.optionalShortClosing'.
+  - IMPORTANT: pointBlock-internal impact/result steps are still valid. For example, 'pb1_impact' / '分点1：行为监管 - 最终影响' is allowed because it belongs to a specific pointBlock. Only paragraph-level closing/summary steps are excluded from 'step3SubpointSteps'.
 
   - When a student selects or inputs their starting subpoint, you MUST, ON YOUR VERY FIRST RESPONSE for that subpoint:
-    1. Evaluate whether it contains multiple separate points (Structure Diagnostic). If it is multi-point, guide them to choose an organization scheme (多点组合/单点深挖) before starting.
-    2. Explicitly DECLARE which scheme you selected and WHY it fits this specific argument better than the others (1-2 sentences, in Chinese, in Part 1). Name the scheme and list its exact ordered steps (e.g., "我为这一段选择【折中让步型】：核心观点 -> 让步承认 -> 转折反驳 -> 总结收尾，因为本段需要先承认对立面再反驳").
-    3. IMMEDIATELY emit the chosen chain into 'progressUpdate.step3SubpointSteps' as an ordered array, one entry per step, each with a 'key' (short slug of the step, e.g. "concession"), a 'label' (the Chinese step name matching the scheme you declared), a 'placeholder' (a guiding hint), and 'value' as an empty string for now. The keys/labels MUST reflect the scheme you actually chose, NOT a fixed claim/reason/support/impact set (unless you genuinely chose the deductive scheme).
-    4. Different subpoints in the same essay may use different schemes. Decide each independently.
+    1. Evaluate how many internal points it contains and state the diagnosis briefly in Chinese.
+    2. If it is multi-point, decide 'total_then_points' vs 'direct_points' yourself. Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; recommend the best mode and proceed.
+    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (explanation, example, mechanism, impact, contrast, or hybrid).
+    4. Explicitly DECLARE the paragraphPlan mode, the pointBlocks, and why this distribution of detail is chosen (1-2 concise Chinese sentences in Part 1).
+    5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "总观点", "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
+    6. Different subpoints in the same essay may use different paragraph modes and expansion strategies. Decide each independently.
 
   - Do NOT let students blindly fill templates. Socratic guidance must feel like natural, conversational reasoning.
   - STRICT COMPACTNESS RULE: Keep AI responses extremely concise and punchy. Bold key takeaways. Always ask exactly ONE clear question at a time.
   - MINIMIZE robotic labels in all dialogue text. Instead, use the custom step labels of the chosen scheme (e.g., "让步承认", "转折反驳", etc.).
   - CRITICAL: Evaluate Paragraph Structure FIRST before formulating any logic chain.
     - When a student selects or inputs their starting subpoint (e.g., "传统课堂在提供教师监督、促进 student 互动与社交发展方面具有独特优势"), analyze whether this subpoint contains multiple separate supporting points (e.g., Point 1: 教师监督, Point 2: 社交发展).
-    - If it is multi-point, pause and guide them to choose an organization scheme:
-      - **方案 A（推荐 - 多点组合型）**: 写一个概括性的 Topic Sentence (即核心观点)，然后一方面展开讨论[点1]，另一方面讨论[点2]，两者并列或递进，使内容极其充实。
-      - **方案 B（单点深入型）**: 如果任何一个点本身就已经足够支撑写满一个 100 字左右的高质量主体段，也可以直接缩小范围，只聚焦于这一个点（例如只深挖“社交发展”）进行极度深入的论证。
-      - Ask them: "你更倾向于采用哪一种组织方式？" (Which organization scheme do you prefer?)
-    - If they choose B (or if the original subpoint is already single-point), narrow the focus to that specific angle (e.g., "社交发展").
+    - If it is multi-point, identify each internal point, choose 'total_then_points' or 'direct_points', and assign role/strategy for each point. Proceed with your recommended plan instead of asking the student to choose unless the decision is truly unclear.
+    - If the original subpoint is single-point, use a normal single-chain plan and still emit paragraphPlan with one pointBlock.
 
   - Recommend reasoning strategies rather than let users pick.
     - Instead of asking students to abstractly choose "Example", "Mechanism", or "Scenario", the AI Coach MUST analyze the claim and **proactively recommend** the best, most natural reasoning strategy for it, explaining why.
@@ -562,7 +609,7 @@ Review the context above and the current step's instructions. Organize and devel
 
   ## Step-by-Step Socratic Guidance Sequence (每次交互只进一个微小步伐，只问一个具体问题):
 
-  This sequence is SCHEME-AGNOSTIC. You walk the student through whatever ordered steps you declared in 'step3SubpointSteps' for the current subpoint, ONE step per turn, in order.
+  This sequence is PLAN-AGNOSTIC. If 'paragraphPlan' exists, walk through its optional totalClaim and each pointBlock's nested steps, ONE micro-step per turn, in order. If no paragraphPlan exists, fall back to the flattened 'step3SubpointSteps'.
 
   1. 进入 Step 3 / 尚未选择或确认分论点:
      - 提示语: "你已经确定了两个核心分论点。请选择一个分论点开始构建论证。
@@ -571,34 +618,35 @@ Review the context above and the current step's instructions. Organize and devel
        （可以直接在右侧卡片选择或在下方告诉我）"
 
   2. 结构诊断与方案确立阶段 (Structure Diagnostic & Scheme Declaration):
-     - 一旦选定或输入分论点，AI先进行单点/多点识别。
-     - 若包含多个概念（例如：教师监督 + 促进社交）：
-       - 识别并指出这几个支撑方向。
-       - 给出方案A（多点并列组合）与方案B（精简深挖单点）的优劣与建议。
-       - 提问学生喜欢哪种组织方式，或是否想先挑选其中一个点（如“社交发展”）开始。
-     - 然后，按上文规则【声明你为本段选择的逻辑链 scheme 及理由】，并立即把该 scheme 的有序步骤写入 \`step3SubpointSteps\`（每一步含 key/label/placeholder，value 暂为空）。
-     - *数据同步*: 把提炼后的第一步内容（通常是核心观点/问题现状）写入对应 step 的 \`value\`。
+     - 一旦选定或输入分论点，AI 先按【STEP 3 DECISION ORDER】做单点/多点识别。
+     - 若包含多个可独立展开的支撑点（例如：行为监管 + 同伴互动 / 教师监督 + 促进社交）：
+       - 明确指出这几个支撑点分别是什么（每个点将成为一个 pointBlock）。
+       - 你自己决定用 'total_then_points' 还是 'direct_points'，并说明为什么这样分配详略，直接推进。不要让学生在方案 A/B 之间做选择。
+       - 仅当 claim 本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
+     - 然后，按上文规则【声明 paragraphPlan mode、分点、详略权重、展开策略】，并立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`。
+     - *数据同步*: 把已确认的总观点或第一个子观点写入对应 plan field/step value。
 
-  3. 逐步推进阶段 (Step-by-Step Progression — repeat for EACH declared step):
-     - 每一轮只针对【当前未完成的那一个 step】提出一个具体的苏格拉底式问题，使用该 step 的【中文 label】而非冰冷的 Claim/Reason 等通用标签。
+  3. 逐步推进阶段 (Step-by-Step Progression — repeat for EACH planned micro-step):
+     - 每一轮只针对【当前未完成的那一个 pointBlock step】提出一个具体的苏格拉底式问题，使用该 pointBlock 和 nested step 的中文 label。
      - 引导话术随 step 含义自然变化，例如：
        - 若当前 step 是“让步承认”: "在坚持你的观点前，对立面其实也有合理之处。你愿意先承认哪一点？"
        - 若当前 step 是“具体机制”: "这个动因具体是通过什么样的链条/机制起作用的？"
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
-     - 学生回答后，提炼其内容，写入 \`step3SubpointSteps\` 中对应那一步的 \`value\`（实时更新，不要只放占位符）。
-     - 然后推进到下一个尚未填写 value 的 step，继续提问。
-     - 数据回填（best-effort，仅用于向后兼容下游，不可与上面的 step value 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`step3SubpointSteps\` 才是唯一权威结构。
+     - 学生回答后，提炼其内容，写入 \`paragraphPlan.pointBlocks[].steps[].value\` 中对应 micro-step（实时更新，不要只放占位符）。
+     - 同时更新扁平 \`step3SubpointSteps\`，让它成为 paragraphPlan 的兼容投影。
+     - 然后推进到下一个尚未填写 value 的 nested step，继续提问。
+     - 数据回填（best-effort，仅用于向后兼容下游，不可与 paragraphPlan 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`paragraphPlan\` 才是最权威结构。
 
   4. 论证策略建议 (Strategy Recommendation, 在涉及“支撑/举例/机制”类步骤时):
      - 不要让学生抽象地三选一（Example/Mechanism/Scenario）。AI 应分析论点，主动推荐最自然的支撑方式并说明理由，再引导学生给出。
      - 注意区分概念层面的“原理/为什么”与具体层面的“证据/例子”，避免两步内容重叠；若重叠，温和地引导学生拆开。
 
   5. 逻辑闭环展示与诊断报告 (Closure & Diagnostic Report):
-     - 当 \`step3SubpointSteps\` 中所有步骤的 \`value\` 均已填写完毕，将 \`step3SubpointCompleted\` 设为 true。
+     - 当 \`paragraphPlan.pointBlocks[].steps[]\` 中所有必要步骤的 \`value\` 均已填写完毕（或没有 paragraphPlan 时 \`step3SubpointSteps\` 全部填写完毕），将 \`step3SubpointCompleted\` 设为 true。
      - 生成三项具体的诊断检查（JSON properties: 'step3SubpointCompletenessChecks', 'step3SubpointTransitionChecks', 'step3SubpointSufficiencyCheck'）：
-       - completenessChecks: 逻辑要素诊断卡——逐项对应你所选 scheme 的每一个步骤，检查其是否齐备且合格（label 用该 scheme 的步骤名）。
-       - transitionChecks: 衔接流畅度诊断——逐项检查相邻步骤之间的因果/逻辑过渡（label 形如 "步骤A → 步骤B"，使用所选 scheme 的步骤名）。
-       - sufficiencyCheck: 字数与内容充实度诊断（预估最终段落的长度与品质，并给出针对性建议）。
+       - completenessChecks: 逻辑要素诊断卡——检查 totalClaim（若有）、每个 subClaim、每个 pointBlock 的必要展开是否齐备。
+       - transitionChecks: 衔接流畅度诊断——检查 totalClaim -> point1、point1 -> point2，以及每个 pointBlock 内部 nested steps 的过渡。
+       - sufficiencyCheck: 字数与内容充实度诊断，必须评价详略搭配是否合理（例如是否一个点过度展开、另一个点太薄）。
      - 提示语: 摆脱冷冰冰的标签，用极具温度、学术感和鼓励性的中文展示完整的推导链条，逐条列出你所选 scheme 的每个步骤及其提炼内容，例如：
        "你太棒了！我们现在已经完成了这个分论点的完整逻辑链：
        - **[步骤1 label]**: [该步骤 value]
@@ -680,11 +728,11 @@ JSON Output Schema rules:
 - You MUST populate "step1Data" / "step2Data" inside "progressUpdate" IN REAL-TIME as the Socratic dialogue progresses.
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "suggestedStance", "suggestedPoints", "blueprint", "onlinePros", "offlinePros", and the three checks (positionCheckPassed, coverageCheckPassed, structureCheckPassed) with descriptions.
-  - For Step 3: The dynamic steps array "step3SubpointSteps" is the SINGLE SOURCE OF TRUTH for the paragraph structure and MUST be present on every Step 3 turn once a subpoint is chosen. Each turn, update the relevant entry's "value" with the student's refined content for that step (live, never just placeholders). The "key" and "label" of each entry MUST reflect the scheme you actually declared for this subpoint. The legacy fields ("step3SubpointClaim", "step3SubpointReason", "step3SubpointSupportType", "step3SubpointSupportContent", "step3SubpointImpact", "step3SubpointMechanism", "step3SubpointResult") are OPTIONAL best-effort mirrors for backward-compatibility only; fill them only when a step cleanly maps, and NEVER at the expense of "step3SubpointSteps". Also keep "step3SubpointCompleted" and "currentSubpointHint" updated. If the student provides multiple parts or the full chain at once, extract all of them into the corresponding step values immediately. If they have completed all subpoints, set overall "isCompleted: true".
+  - For Step 3: "paragraphPlan" is the SINGLE SOURCE OF TRUTH when present. It MUST include mode, diagnosis, optional totalClaim, and pointBlocks with role, expansionStrategy, and nested steps. Each turn, update the relevant nested step's "value" with the student's refined content (live, never just placeholders). Also always emit "step3SubpointSteps" as a flattened compatibility projection of paragraphPlan. The legacy fields ("step3SubpointClaim", "step3SubpointReason", "step3SubpointSupportType", "step3SubpointSupportContent", "step3SubpointImpact", "step3SubpointMechanism", "step3SubpointResult") are OPTIONAL best-effort mirrors for backward-compatibility only; fill them only when a step cleanly maps, and NEVER at the expense of "paragraphPlan". Also keep "step3SubpointCompleted" and "currentSubpointHint" updated. If the student provides multiple parts or the full chain at once, extract all of them into the corresponding pointBlock step values immediately. If they have completed all subpoints, set overall "isCompleted: true".
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, if you want to provide a suggested logical chain to the right side panel, populate the "currentSubpointHint" field inside "progressUpdate".
-- For Step 3, you MUST always output the array "step3SubpointSteps" under "progressUpdate" to reflect the latest state of the active subpoint's chosen logic chain (keyed/labelled to the scheme you declared, with each step's "value" kept current). The legacy scalar fields are optional mirrors only. The custom steps array "step3SubpointSteps" is what renders the dynamic paragraph structure on the user board in real-time, so it must never be omitted on a Step 3 turn.
+- For Step 3, you MUST always output "paragraphPlan" when the active subpoint has been selected, and MUST always output the array "step3SubpointSteps" as a flattened projection. The grouped paragraphPlan is what renders the multi-point board; the flat steps preserve older logic-chain display and downstream compatibility.
 
 ## Previous Steps Context:
 ${contextStr}
@@ -699,7 +747,7 @@ Student says:
       const response = await generateContentWithFallback({
         contents: prompt,
         config: {
-          maxOutputTokens: 6144,
+          maxOutputTokens: 8192,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -722,6 +770,72 @@ Student says:
                   step3SubpointMechanism: { type: Type.STRING },
                   step3SubpointResult: { type: Type.STRING },
                   step3SubpointCompleted: { type: Type.BOOLEAN },
+                  paragraphPlan: {
+                    type: Type.OBJECT,
+                    properties: {
+                      mode: {
+                        type: Type.STRING,
+                        enum: ["single_point", "total_then_points", "direct_points"],
+                        description:
+                          "'single_point' for a single-point claim (exactly one pointBlock), 'total_then_points' or 'direct_points' for multi-point claims.",
+                      },
+                      diagnosis: { type: Type.STRING },
+                      totalClaim: { type: Type.STRING },
+                      optionalShortClosing: {
+                        type: Type.STRING,
+                        description:
+                          "OPTIONAL. Default is empty (\"\"). Only fill this when the paragraph genuinely needs a single closing sentence that ties the pointBlocks back to the overall claim. This is NOT a required Impact step and NOT a third argument. Omit (leave \"\") when each pointBlock already ends with a local effect, or when this would merely repeat totalClaim.",
+                      },
+                      pointBlocks: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            id: { type: Type.STRING },
+                            label: { type: Type.STRING },
+                            subClaim: { type: Type.STRING },
+                            role: {
+                              type: Type.STRING,
+                              enum: ["major", "minor"],
+                            },
+                            expansionStrategy: {
+                              type: Type.STRING,
+                              enum: [
+                                "explanation",
+                                "example",
+                                "mechanism",
+                                "impact",
+                                "contrast",
+                                "hybrid",
+                              ],
+                            },
+                            steps: {
+                              type: Type.ARRAY,
+                              items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                  key: { type: Type.STRING },
+                                  label: { type: Type.STRING },
+                                  placeholder: { type: Type.STRING },
+                                  value: { type: Type.STRING },
+                                },
+                                required: ["key", "label", "placeholder", "value"],
+                              },
+                            },
+                          },
+                          required: [
+                            "id",
+                            "label",
+                            "subClaim",
+                            "role",
+                            "expansionStrategy",
+                            "steps",
+                          ],
+                        },
+                      },
+                    },
+                    required: ["mode", "diagnosis", "pointBlocks"],
+                  },
                   step3SubpointSteps: {
                     type: Type.ARRAY,
                     items: {
@@ -986,6 +1100,122 @@ Student says:
             data.progressUpdate.isCompleted = true;
           }
         }
+      }
+
+      // Step 3 data-contract guard: the UI/CoachChat treat paragraphPlan as the
+      // authoritative grouped structure. The model is instructed to always emit it,
+      // but Gemini can still omit it. If it does, wrap the flat step3SubpointSteps
+      // into a single-point paragraphPlan so downstream never lacks the contract.
+      // NOTE: this only guarantees the shape exists; it does NOT invent a multi-point
+      // split. Genuine point-splitting is driven by the prompt, not this fallback.
+      if (
+        Number(step) === 3 &&
+        data?.progressUpdate &&
+        !data.progressUpdate.paragraphPlan &&
+        Array.isArray(data.progressUpdate.step3SubpointSteps) &&
+        data.progressUpdate.step3SubpointSteps.length > 0
+      ) {
+        const flatSteps = data.progressUpdate.step3SubpointSteps.map((s: any) => ({
+          key: s.key || "",
+          label: s.label || "",
+          placeholder: s.placeholder || "",
+          value: s.value || "",
+        }));
+        const activeSubpoint = (session?.step3?.subpoints || []).find(
+          (sp: any) => sp.id === session?.step3?.activeSubpointId,
+        );
+        const subClaim =
+          data.progressUpdate.step3SubpointClaim ||
+          activeSubpoint?.content ||
+          flatSteps[0]?.value ||
+          "";
+        data.progressUpdate.paragraphPlan = {
+          mode: "single_point",
+          diagnosis:
+            "Auto-normalized: model returned a flat chain without a paragraphPlan; wrapped as a single point for the data contract.",
+          totalClaim: "",
+          pointBlocks: [
+            {
+              id: "point-1",
+              label: "分点1",
+              subClaim,
+              role: "major",
+              expansionStrategy: "explanation",
+              steps: flatSteps,
+            },
+          ],
+        };
+      }
+
+      // Step 3 projection guard: paragraphPlan is the source of truth. Rebuild
+      // the flat compatibility list from totalClaim + pointBlock.steps so model
+      // drift cannot leak paragraph-level closing/summary as a fake required step.
+      if (
+        Number(step) === 3 &&
+        data?.progressUpdate?.paragraphPlan &&
+        Array.isArray(data.progressUpdate.paragraphPlan.pointBlocks)
+      ) {
+        const paragraphPlan = data.progressUpdate.paragraphPlan;
+        const isParagraphClosing = (key: string, label: string) => {
+          const k = (key || "").toLowerCase();
+          const l = label || "";
+          return (
+            k === "short_closing" ||
+            k === "closing" ||
+            k === "summary" ||
+            k === "conclusion" ||
+            k.includes("short_closing") ||
+            l.includes("收束") ||
+            l.includes("总结")
+          );
+        };
+
+        const derivedSteps: any[] = [];
+        if (paragraphPlan.totalClaim && String(paragraphPlan.totalClaim).trim()) {
+          derivedSteps.push({
+            key: "total_claim",
+            label: "总观点",
+            placeholder: "",
+            value: paragraphPlan.totalClaim,
+          });
+        }
+
+        paragraphPlan.pointBlocks = paragraphPlan.pointBlocks.map((block: any, index: number) => {
+          const blockLabel = block?.label || `分点${index + 1}`;
+          const cleanSteps = Array.isArray(block?.steps)
+            ? block.steps.filter((step: any) => {
+                const key = step?.key || "";
+                const label = step?.label || "";
+                if (isParagraphClosing(key, label)) {
+                  if (
+                    !paragraphPlan.optionalShortClosing ||
+                    !String(paragraphPlan.optionalShortClosing).trim()
+                  ) {
+                    paragraphPlan.optionalShortClosing =
+                      step?.value && String(step.value).trim()
+                        ? step.value
+                        : label;
+                  }
+                  return false;
+                }
+
+                derivedSteps.push({
+                  key,
+                  label: `${blockLabel} - ${label}`,
+                  placeholder: step?.placeholder || "",
+                  value: step?.value || "",
+                });
+                return true;
+              })
+            : [];
+
+          return {
+            ...block,
+            steps: cleanSteps,
+          };
+        });
+
+        data.progressUpdate.step3SubpointSteps = derivedSteps;
       }
 
       res.json(data);
