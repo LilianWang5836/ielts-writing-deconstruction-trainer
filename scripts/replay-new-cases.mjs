@@ -123,6 +123,7 @@ async function main() {
   console.log(
     `Check: contains forbidden autofill phrase => ${hasForbiddenAutofill(case1.text) ? "YES (BAD)" : "NO (GOOD)"}`,
   );
+  printJargonCheck("case1 step2 explore_B", case1.text);
 
   // Case 2: Step3 bad-case replay (fragment should trigger follow-up, not auto-complete causal chain)
   const case2User = "User 现在有很多edtech的平台，会和知名学校";
@@ -456,6 +457,49 @@ async function main() {
     }`,
   );
   printJargonCheck("case5 turn2c", case5Turn2c.text);
+
+  // Case 6: Step1 completion — chat text must not leak internal JSON field names
+  const case6User =
+    "可以从线上学习的灵活性与资源可及性、以及线下课堂在互动与监管上的不可替代性这几个维度来讨论。";
+  const case6 = await postCoach({
+    question,
+    step: 1,
+    userMessage: case6User,
+    messages: [
+      {
+        sender: "ai",
+        text:
+          "很好！你已经抓住了核心争议。\n\n---\n\n题目里有没有哪些词，限制了讨论范围？请列 1~3 个。",
+      },
+      { sender: "user", text: "entirely，也就是完全取代，不能部分替代" },
+      {
+        sender: "ai",
+        text:
+          "关键限定记下了。\n\n---\n\n为了回答这道题，我们需要比较哪些方面？请列出 2~4 个维度即可。",
+      },
+      { sender: "user", text: case6User },
+    ],
+    stepContext: {},
+    session: {
+      step1: {
+        coachEvaluation: {
+          correctType: "Agree or Disagree",
+          coreIssue: "线上教育是否应完全取代传统课堂",
+          constraints: ["entirely (完全取代)"],
+          critique: "",
+          score: 7,
+          suggestedDimensions: [],
+        },
+      },
+    },
+  });
+  printCase("Step1 completion summary (dimensions filled)", case6User, case6);
+  console.log(
+    `Check: Step1 completion sets isCompleted => ${
+      case6?.progressUpdate?.isCompleted ? "YES (GOOD)" : "NO (review manually)"
+    }`,
+  );
+  printJargonCheck("case6 step1 completion", case6.text);
 
   console.log("\nDone.");
 }

@@ -374,12 +374,24 @@ mustContain(
   "global jargon guard: wired for all steps in coach handler",
 );
 mustNotContain(
+  "if (step === 3 && typeof data?.text",
+  "global jargon guard: not limited to step 3 only",
+);
+mustNotContain(
   "Explicitly DECLARE the paragraphPlan mode",
   "step3 prompt: old DECLARE instruction removed",
 );
 mustContain(
   "give the student a short plain-language summary",
   "step3 prompt: user-facing summary instead of DECLARE",
+);
+mustContain(
+  'When speaking to the student, say "关键限定"',
+  "step1 prompt: use Chinese labels not raw field names",
+);
+mustContain(
+  "Never say explore_A/B, currentStage, or recommendation enum names in chat text",
+  "step2 prompt: forbids stage/enum names in chat text",
 );
 assert.ok(
   step3DraftingSource.includes("结构细节写入系统即可，不要在对话里提字段名"),
