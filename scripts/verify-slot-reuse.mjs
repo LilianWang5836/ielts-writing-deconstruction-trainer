@@ -4,7 +4,9 @@ import assert from "node:assert/strict";
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const serverPath = path.join(repoRoot, "server.ts");
+const step3DraftingPath = path.join(repoRoot, "src/components/Step3Drafting.tsx");
 const source = fs.readFileSync(serverPath, "utf8");
+const step3DraftingSource = fs.readFileSync(step3DraftingPath, "utf8");
 
 function mustContain(snippet, label) {
   assert.ok(source.includes(snippet), `Missing: ${label}`);
@@ -30,7 +32,7 @@ mustContain(
 // Step 1 slot checklist + cross-slot example
 mustContain("## Step 1 Slot Checklist (按缺口推进，不重复提问)", "step1 slot checklist");
 mustContain("Cross-slot extraction is mandatory", "step1 cross-slot extraction instruction");
-mustContain("already contains \"完全/entirely\"", "step1 entirely skip example");
+mustContain("线上教育是否会完全替代传统课堂", "step1 entirely skip example (mirrors real case)");
 
 // Step 2 dynamic dimension and anti-autofill
 mustContain("Dimension-aware questioning rule (CRITICAL):", "step2 dimension-aware rule");
@@ -64,12 +66,135 @@ mustContain(
 mustContain('STAY in "explore_A" and ask ONE depth follow-up', "explore_A not-sufficient branch");
 mustContain('STAY in "explore_B" and ask ONE depth follow-up', "explore_B not-sufficient branch");
 mustContain(
-  'IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side A',
+  'IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side A',
   "explore_A sufficient no-reask branch",
 );
 mustContain(
-  'IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side B',
+  'IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side B',
   "explore_B sufficient no-reask branch",
+);
+
+// Step 2 Dimension Coverage & Retention Rule (prevents silently dropping sibling dimensions)
+mustContain(
+  "Dimension Coverage & Retention Rule (CRITICAL — prevents silently dropping sibling dimensions):",
+  "step2 retention rule header",
+);
+mustContain(
+  "MANDATORY FIRST STEP before you decide anything else about transitioning",
+  "step2 retention rule is a mandatory pre-transition check",
+);
+mustContain(
+  "plus the student's own current/prior message on this side",
+  "step2 retention trigger covers user-introduced dimensions",
+);
+mustContain(
+  "not a mere synonym/rephrasing of it — a substantively different angle",
+  "step2 retention rule excludes synonym repeats",
+);
+mustContain(
+  "ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn",
+  "step2 retention rule mutually exclusive with depth follow-up",
+);
+mustContain(
+  "anti-loop: at most ONE retention question per side",
+  "step2 retention rule anti-loop",
+);
+mustContain(
+  "Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B",
+  "step2 retention rule userPoints is the real-time carrier, not outliers",
+);
+mustContain(
+  'FIRST apply the Dimension Coverage & Retention Rule\'s mandatory first step above. If it triggers, keep currentStage: "explore_A" this turn',
+  "step2 explore_A transition wired to retention rule",
+);
+mustContain(
+  'FIRST apply the Dimension Coverage & Retention Rule\'s mandatory first step above. If it triggers, keep currentStage: "explore_B" this turn',
+  "step2 explore_B transition wired to retention rule",
+);
+mustContain(
+  "Retention-aware clustering (CRITICAL)",
+  "step2 summary stage reads retention tags",
+);
+mustContain(
+  'Do NOT ask an open-ended "which do you prefer" question — you must EVALUATE first and state ONE default recommendation with a reason',
+  "step2 main prompt: retention rule mirrors guard's evaluate-then-recommend behavior (not just the code fallback)",
+);
+mustContain(
+  "evaluate whether the uncovered dimension directly answers a core qualifier/contrast in the essay question",
+  "step2 main prompt: relevance-to-question evaluation described for solid branch",
+);
+mustContain(
+  "interpret the student's reply RELATIVE TO the specific default recommendation you proposed",
+  "step2 main prompt: resolves ambiguous replies relative to the proposed recommendation, not a fixed default",
+);
+
+// Step 2 Dimension Coverage & Retention Guard (deterministic verification-call fallback,
+// since the prompt-only rule was verified to be diluted inside the huge Step2 prompt).
+mustContain(
+  "function checkStep2DimensionCoverage(",
+  "step2 retention guard: verification-call function exists",
+);
+mustContain(
+  "function applyStep2RetentionGuard(",
+  "step2 retention guard: orchestration function exists",
+);
+mustContain(
+  "function extractPendingRetention(",
+  "step2 retention guard: pending-marker extractor exists",
+);
+mustContain(
+  "function resolvePendingRetentionChoice(",
+  "step2 retention guard: pending-choice resolver exists",
+);
+mustContain(
+  "function extractLastCoachQuestion(",
+  "step2 retention guard: last-question extractor exists",
+);
+mustContain(
+  "await applyStep2RetentionGuard(data, session, userMessage, messages, question);",
+  "step2 retention guard: wired into coach handler",
+);
+mustContain(
+  "fail-open, no correction applied",
+  "step2 retention guard: fails open on verification-call error",
+);
+
+// Step 2 Retention Recommendation (evaluate-then-recommend, not open-ended A/B)
+mustContain(
+  "function decideStep2Retention(",
+  "step2 retention: pure decision-table function exists",
+);
+mustContain(
+  "uncoveredRelevantToQuestion",
+  "step2 retention: relevance-to-question signal exists",
+);
+mustContain(
+  '"EXPAND_BOTH" | "KEEP_MINOR" | "DROP"',
+  "step2 retention: recommendation enum defined",
+);
+mustContain(
+  "Recommendation was to drop; an explicit",
+  "step2 retention: resolver interprets reply relative to proposed recommendation",
+);
+mustContain(
+  "建议把『${uncovered}』保留下来作为一个略写的补充点",
+  "step2 retention: KEEP_MINOR template gives default recommendation with reason",
+);
+mustContain(
+  "建议专注写这一点就好",
+  "step2 retention: DROP template gives default recommendation with reason",
+);
+mustContain(
+  "［待裁决：${uncovered}｜${recommendation}］",
+  "step2 retention: pending marker embeds the recommendation for later resolution",
+);
+mustContain(
+  'A point tagged "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point',
+  "step2 summary maps retained dimension to minor point",
+);
+mustContain(
+  'A point tagged "用户放弃" MUST be listed in clustering.outliers',
+  "step2 summary maps dropped dimension to outliers",
 );
 
 // Step 3 length budget
@@ -100,6 +225,29 @@ mustNotContain(
   "old more-academic polish rule removed",
 );
 mustNotContain("用极具温度、学术感和鼓励性的中文", "step3 closing academic tone removed");
+
+// Step 1 constraint re-ask fix: strengthened skip rule (B)
+mustContain(
+  "Recognizing it verbally in your feedback is NOT enough.",
+  "step1 skip rule: recognition != slot fill",
+);
+mustContain(
+  "VIOLATION (do NOT do this): filing the qualifier only into coreIssue",
+  "step1 skip rule: violation example",
+);
+
+// Step 1 constraint re-ask fix: deterministic backfill safety net (A)
+mustContain("function detectEchoedQualifiers(", "step1 backfill: qualifier detector exists");
+mustContain("function backfillStep1Constraints(", "step1 backfill: backfill function exists");
+mustContain("function looksLikeConstraintQuestion(", "step1 backfill: constraint-question detector exists");
+mustContain("function isStep1SlotsComplete(", "step1 completion: slot checker exists");
+mustContain("function enforceStep1SlotCompletion(", "step1 completion: enforce function exists");
+mustContain("function applyStepCompletionHeuristic(", "step completion: heuristic function exists");
+mustContain("function textSuggestsStep1Complete(", "step1 completion: text heuristic exists");
+mustContain("Step 1 deterministic safety net (A):", "step1 backfill: wired in coach handler");
+mustContain("progressUpdate.isCompleted: true", "step1 prompt: requires isCompleted on completion");
+mustContain("Do NOT populate progressUpdate.step2Data while step=1", "step1 prompt: anti-drift rule");
+mustContain("applyStepCompletionHeuristic(data, currentStepNum)", "step completion: heuristic wired after backfill");
 
 // Merge guard functions and wiring
 mustContain("function sanitizeProgressUpdateWithSession(", "merge guard function exists");
@@ -207,5 +355,36 @@ function sanitizeProgressUpdateWithSession(progressUpdate, session) {
   assert.equal(progress.step2Data.userPoints, "新增：偏远地区学生受益明显", "Non-empty new value must be kept");
   console.log("OK: non-empty values are preserved");
 }
+
+// Cross-step NO INTERNAL JARGON IN CHAT TEXT
+mustContain(
+  "NO INTERNAL JARGON IN CHAT TEXT (CRITICAL, applies to ALL steps 1–5):",
+  "global jargon rule: cross-step header exists",
+);
+mustContain(
+  'Do NOT narrate your decision process',
+  "global jargon rule: forbids decision-process narration",
+);
+mustContain(
+  "function stripInternalJargonFromChatText(",
+  "global jargon guard: strip function exists",
+);
+mustContain(
+  "[JargonGuard] Stripped internal terms from step",
+  "global jargon guard: wired for all steps in coach handler",
+);
+mustNotContain(
+  "Explicitly DECLARE the paragraphPlan mode",
+  "step3 prompt: old DECLARE instruction removed",
+);
+mustContain(
+  "give the student a short plain-language summary",
+  "step3 prompt: user-facing summary instead of DECLARE",
+);
+assert.ok(
+  step3DraftingSource.includes("结构细节写入系统即可，不要在对话里提字段名"),
+  "Missing: step3 kickoff: no internal field names in kickoff prompt",
+);
+console.log("OK: step3 kickoff: no internal field names in kickoff prompt");
 
 console.log("\nAll slot-reuse/static-guard assertions passed.");

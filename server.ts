@@ -248,6 +248,208 @@ function sanitizeProgressUpdateWithSession(
   return progressUpdate;
 }
 
+// Deterministic Step 1 constraint backfill (safety net for the slot-reuse skip rule).
+// The "关键限定词" is a property of the essay QUESTION. When the student's answer
+// echoes a scope qualifier that also exists in the question (e.g. answers coreIssue
+// with "完全替代" while the prompt says "replace ... entirely"), we credit it into the
+// constraints slot deterministically so the Coach never re-asks the qualifier question.
+const STEP1_QUALIFIER_GROUPS: { label: string; zh: RegExp; en: RegExp }[] = [
+  { label: "完全 (entirely)", zh: /完全|彻底|完整/, en: /\bentirely\b|\bcompletely\b|\bwholly\b/i },
+  { label: "只/仅 (only)", zh: /仅|唯一/, en: /\bonly\b|\bsolely\b|\bexclusively\b/i },
+  { label: "必须 (must)", zh: /必须|一定要/, en: /\bmust\b/i },
+  { label: "始终 (always)", zh: /始终|一直|永远/, en: /\balways\b/i },
+  { label: "所有 (all)", zh: /所有|全部|一切/, en: /\ball\b/i },
+  { label: "从不 (never)", zh: /从不|绝不/, en: /\bnever\b/i },
+];
+
+function detectEchoedQualifiers(question: string, userText: string): string[] {
+  const q = String(question || "");
+  const u = String(userText || "");
+  const labels: string[] = [];
+  for (const group of STEP1_QUALIFIER_GROUPS) {
+    const inQuestion = group.zh.test(q) || group.en.test(q);
+    const inUser = group.zh.test(u) || group.en.test(u);
+    if (inQuestion && inUser) labels.push(group.label);
+  }
+  return labels;
+}
+
+// Returns the labels backfilled (empty if nothing was filled).
+function backfillStep1Constraints(
+  question: string,
+  userMessage: string,
+  progressUpdate: any,
+  session: any,
+): string[] {
+  if (!progressUpdate || typeof progressUpdate !== "object") return [];
+  const step1New =
+    progressUpdate.step1Data && typeof progressUpdate.step1Data === "object"
+      ? progressUpdate.step1Data
+      : null;
+  const step1Old = session?.step1?.coachEvaluation || {};
+
+  const newConstraints = step1New?.constraints;
+  const oldConstraints = step1Old?.constraints;
+  const alreadyFilled =
+    (Array.isArray(newConstraints) && newConstraints.some((c) => String(c || "").trim())) ||
+    (Array.isArray(oldConstraints) && oldConstraints.some((c) => String(c || "").trim()));
+  if (alreadyFilled) return [];
+
+  const effectiveCoreIssue = String(
+    step1New?.coreIssue || step1Old?.coreIssue || "",
+  );
+  const scanText = `${userMessage} ${effectiveCoreIssue}`;
+  const labels = detectEchoedQualifiers(question, scanText);
+  if (labels.length === 0) return [];
+
+  const target = step1New || {};
+  target.constraints = labels;
+  if (isBlankString(target.keyQualifier) || target.keyQualifier === undefined) {
+    if (!String(step1Old?.keyQualifier || "").trim()) {
+      target.keyQualifier = labels[0];
+    }
+  }
+  progressUpdate.step1Data = target;
+  return labels;
+}
+
+function looksLikeConstraintQuestion(part2: string): boolean {
+  const t = String(part2 || "");
+  return (
+    /限制了讨论范围/.test(t) ||
+    /限定词/.test(t) ||
+    /(哪些词)[^。？?]{0,8}(限制|限定)/.test(t) ||
+    /(限制|限定)[^。？?]{0,8}(讨论范围|范围)/.test(t)
+  );
+}
+
+function mergeStep1Evaluation(progressUpdate: any, session: any): Record<string, any> {
+  const newS1 =
+    progressUpdate?.step1Data && typeof progressUpdate.step1Data === "object"
+      ? progressUpdate.step1Data
+      : {};
+  const oldS1 = session?.step1?.coachEvaluation || {};
+  return { ...oldS1, ...newS1 };
+}
+
+function isStep1SlotsComplete(step1Eval: Record<string, any>): boolean {
+  const hasType = String(step1Eval.correctType || "").trim().length > 0;
+  const hasIssue = String(step1Eval.coreIssue || "").trim().length > 0;
+  const constraints = step1Eval.constraints;
+  const hasConstraints =
+    Array.isArray(constraints) &&
+    constraints.some((c: any) => String(c || "").trim().length > 0);
+  const dims = step1Eval.suggestedDimensions;
+  const filledDims = Array.isArray(dims)
+    ? dims.filter((d: any) => String(d || "").trim().length > 0)
+    : [];
+  return hasType && hasIssue && hasConstraints && filledDims.length >= 2;
+}
+
+function textSuggestsStep1Complete(text: string): boolean {
+  const t = String(text || "");
+  return (
+    t.includes("进入第二步") ||
+    t.includes("进入第二阶段") ||
+    t.includes("脑暴与蓝图设计") ||
+    /进入\s*Step\s*2/i.test(t) ||
+    /Step\s*2\s*[:：]/i.test(t) ||
+    t.includes("观点形成") ||
+    t.includes("观点生成") ||
+    t.includes("恭喜通关审题") ||
+    (t.includes("审题") && t.includes("通关")) ||
+    t.includes("四个审题要素都齐了") ||
+    (t.includes("已完成") && t.includes("审题")) ||
+    /Argument Formation/i.test(t)
+  );
+}
+
+function textSuggestsStep2Complete(text: string): boolean {
+  const t = String(text || "");
+  return (
+    t.includes("进入第三步") ||
+    t.includes("进入第三阶段") ||
+    t.includes("段落逻辑链构建") ||
+    /进入\s*Step\s*3/i.test(t) ||
+    t.includes("段落论证训练") ||
+    t.includes("段落写作训练") ||
+    (t.includes("下一步") && t.includes("第三步"))
+  );
+}
+
+function applyStepCompletionHeuristic(data: any, stepNum: number): void {
+  if (!data) return;
+
+  let shouldForceComplete = false;
+
+  if (stepNum === 1) {
+    if (data.text && textSuggestsStep1Complete(data.text)) {
+      shouldForceComplete = true;
+    }
+    // Anti-drift: Step 2 payload must not appear while Step 1 is active.
+    if (
+      data.progressUpdate?.step2Data &&
+      typeof data.progressUpdate.step2Data === "object"
+    ) {
+      shouldForceComplete = true;
+    }
+  } else if (stepNum === 2) {
+    if (data.text && textSuggestsStep2Complete(data.text)) {
+      shouldForceComplete = true;
+    }
+    if (
+      data.progressUpdate?.paragraphPlan ||
+      (Array.isArray(data.progressUpdate?.step3SubpointSteps) &&
+        data.progressUpdate.step3SubpointSteps.length > 0)
+    ) {
+      shouldForceComplete = true;
+    }
+  } else if (stepNum === 3) {
+    const t = String(data.text || "");
+    if (
+      t.includes("第三步段落逻辑链构建已全部完成") ||
+      t.includes("进入第四步：逐句写作练习") ||
+      t.includes("进入第四阶段") ||
+      t.includes("进入逐句写作") ||
+      t.includes("进入逐句写作练习")
+    ) {
+      shouldForceComplete = true;
+    }
+  } else if (data.text) {
+    const t = data.text;
+    if (
+      t.includes("进入第二步") ||
+      t.includes("进入第三步") ||
+      t.includes("进入第四步") ||
+      t.includes("进入下一阶")
+    ) {
+      shouldForceComplete = true;
+    }
+  }
+
+  if (!shouldForceComplete) return;
+
+  if (!data.progressUpdate) {
+    data.progressUpdate = { isCompleted: true };
+  } else {
+    data.progressUpdate.isCompleted = true;
+  }
+}
+
+function enforceStep1SlotCompletion(data: any, session: any): void {
+  if (!data?.progressUpdate) return;
+
+  const merged = mergeStep1Evaluation(data.progressUpdate, session);
+  if (!isStep1SlotsComplete(merged)) return;
+
+  data.progressUpdate.isCompleted = true;
+
+  // Step 2 fields leaked into a Step 1 response are ignored by the client; strip them.
+  if (data.progressUpdate.step2Data) {
+    delete data.progressUpdate.step2Data;
+  }
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
@@ -326,6 +528,301 @@ async function generateContentWithFallback(params: {
   }
 
   throw lastError || new Error("All fallback models failed.");
+}
+
+// Step 2 Dimension Coverage & Retention Guard.
+//
+// The prompt-only "Dimension Coverage & Retention Rule" is diluted by the huge
+// multi-thousand-line Step 2 prompt and gets silently ignored by the model in
+// practice (verified via isolated testing: the same check succeeds reliably in a
+// small, narrow-scope prompt but fails inside the full prompt). This guard runs a
+// SEPARATE, narrow-scope verification call only at the moment a Step 2 explore
+// stage is about to transition, and corrects the response deterministically if an
+// uncovered sibling dimension is found. State is persisted purely in
+// progressUpdate.step2Data.userPoints (the only Layer-1 field available in real
+// time during explore_A/explore_B) using a "［待裁决：...］" marker.
+
+// Marker format: ［待裁决：<dimension>｜<recommendation>］ — the recommendation is
+// embedded so that a short, ambiguous user reply (e.g. "好的"/"都行") can be resolved
+// relative to what was actually recommended, instead of always defaulting to one
+// fixed outcome regardless of which recommendation was proposed.
+const PENDING_RETENTION_MARKER_RE = /［待裁决：([^｜］]+)(?:｜([^］]+))?］/;
+
+type RetentionRecommendation = "EXPAND_BOTH" | "KEEP_MINOR" | "DROP";
+
+function extractPendingRetention(
+  userPointsText: string,
+): { dimension: string; recommendation: RetentionRecommendation | null } | null {
+  const match = PENDING_RETENTION_MARKER_RE.exec(String(userPointsText || ""));
+  if (!match) return null;
+  const recommendation = match[2] as RetentionRecommendation | undefined;
+  return {
+    dimension: match[1].trim(),
+    recommendation:
+      recommendation === "KEEP_MINOR" || recommendation === "DROP"
+        ? recommendation
+        : null,
+  };
+}
+
+// Pure, testable decision table: turns two LLM-judged signals into ONE default
+// recommendation + a short Chinese reason. Kept deterministic (not another LLM
+// call) so behavior is stable and unit-testable without network access.
+function decideStep2Retention(
+  developedIsSolid: boolean,
+  uncoveredRelevantToQuestion: boolean,
+): { recommendation: RetentionRecommendation; reasonZh: string } {
+  if (!developedIsSolid) {
+    return {
+      recommendation: "EXPAND_BOTH",
+      reasonZh: "已展开的点还不够具体，两个维度都需要先补充内容",
+    };
+  }
+  if (uncoveredRelevantToQuestion) {
+    return {
+      recommendation: "KEEP_MINOR",
+      reasonZh: "这一点和题目直接相关，建议保留下来作为略写的补充点",
+    };
+  }
+  return {
+    recommendation: "DROP",
+    reasonZh: "这一点和已展开的点比较重复或次要，建议专注写已展开的这一点",
+  };
+}
+
+// Resolves the student's short reply to a pending retention question relative to
+// the recommendation that was actually proposed. An explicit contradiction of the
+// recommendation flips the outcome; anything else (including vague agreement like
+// "好的"/"都行"/"随便") is treated as accepting the recommendation.
+function resolvePendingRetentionChoice(
+  userMessage: string,
+  recommendation: RetentionRecommendation | null,
+): string {
+  const t = String(userMessage || "");
+  const wantsDrop = /放弃|算了|不用了|不需要|只写|不要|drop|skip/i.test(t);
+  const wantsKeep = /保留|都写|都要|都展开|两个都/i.test(t);
+
+  if (recommendation === "DROP") {
+    // Recommendation was to drop; an explicit "keep" contradicts it.
+    return wantsKeep && !wantsDrop ? "保留-略写" : "用户放弃";
+  }
+  // Recommendation was KEEP_MINOR (or unknown/legacy marker without a recommendation);
+  // an explicit "drop" contradicts it.
+  return wantsDrop ? "用户放弃" : "保留-略写";
+}
+
+function extractLastCoachQuestion(messages: any[]): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.sender === "ai" && String(m.text || "").trim()) {
+      return String(m.text).trim();
+    }
+  }
+  return "";
+}
+
+async function checkStep2DimensionCoverage(params: {
+  question: string;
+  lastCoachQuestion: string;
+  studentAnswer: string;
+}): Promise<{
+  hasMultipleDimensions: boolean;
+  uncoveredDimension: string;
+  developedIsSolid: boolean;
+  uncoveredRelevantToQuestion: boolean;
+} | null> {
+  const essayQuestion = String(params.question || "").trim();
+  const lastCoachQuestion = String(params.lastCoachQuestion || "").trim();
+  const studentAnswer = String(params.studentAnswer || "").trim();
+  if (!lastCoachQuestion || !studentAnswer) return null;
+
+  try {
+    const prompt = `
+You are checking ONE narrow fact about a single turn of an IELTS coaching dialogue. Do not do anything else, do not evaluate writing quality, do not generate coaching feedback.
+
+The IELTS essay question being discussed:
+"${essayQuestion}"
+
+The coach's most recent question was:
+"${lastCoachQuestion}"
+
+The student's answer was:
+"${studentAnswer}"
+
+Task:
+1. Does the coach's question name TWO OR MORE distinct sub-dimensions/sub-angles/scenarios for the same side of the argument (e.g. joined by 与/和/、, or listed as 『A』『B』, or "A以及B")? If it only names ONE (or none), set hasMultipleDimensions=false, uncoveredDimension="", developedIsSolid=false, uncoveredRelevantToQuestion=false, and stop.
+2. If it names 2+, does the student's answer substantively develop ONLY ONE of them (the other is not mentioned at all, or only trivially/synonymously restated)? If the student's answer already substantively covers ALL named sub-dimensions, set hasMultipleDimensions=true but uncoveredDimension="".
+3. If exactly one sub-dimension is left uncovered, copy it EXACTLY as a short phrase from the coach's question (in Chinese) into "uncoveredDimension".
+4. Judge whether the student's answer for the DEVELOPED dimension is already "solid" (includes a concrete scenario/beneficiary/mechanism, could support a full IELTS body paragraph alone) vs "thin" (still vague/generic, one-liner). Set developedIsSolid accordingly.
+5. Judge whether the UNCOVERED dimension directly responds to a core qualifier/contrast in the essay question (e.g. "entirely", "highly beneficial", an explicit comparison) — set uncoveredRelevantToQuestion=true. If it is more of a repetition/overlap with the developed dimension, or a peripheral/minor detail that doesn't add a distinct angle to the essay's core argument, set uncoveredRelevantToQuestion=false.
+
+Respond with JSON only, matching the schema.
+`;
+    const response = await generateContentWithFallback({
+      contents: prompt,
+      config: {
+        maxOutputTokens: 512,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            hasMultipleDimensions: { type: Type.BOOLEAN },
+            uncoveredDimension: { type: Type.STRING },
+            developedIsSolid: { type: Type.BOOLEAN },
+            uncoveredRelevantToQuestion: { type: Type.BOOLEAN },
+          },
+          required: [
+            "hasMultipleDimensions",
+            "uncoveredDimension",
+            "developedIsSolid",
+            "uncoveredRelevantToQuestion",
+          ],
+        },
+      },
+    });
+    const parsed = parseAIResponse(response?.text, null);
+    if (!parsed) return null;
+    return {
+      hasMultipleDimensions: !!parsed.hasMultipleDimensions,
+      uncoveredDimension: String(parsed.uncoveredDimension || "").trim(),
+      developedIsSolid: !!parsed.developedIsSolid,
+      uncoveredRelevantToQuestion: !!parsed.uncoveredRelevantToQuestion,
+    };
+  } catch (e: any) {
+    console.warn(
+      "[Step2RetentionGuard] verification call failed (fail-open, no correction applied):",
+      e.message || e,
+    );
+    return null;
+  }
+}
+
+// Applies the retention guard in-place on `data`. Fails open on any error so a
+// verification-call failure never blocks the primary coaching response.
+async function applyStep2RetentionGuard(
+  data: any,
+  session: any,
+  userMessage: string,
+  messages: any[],
+  question: string,
+): Promise<void> {
+  if (!data?.progressUpdate?.step2Data) return;
+
+  const oldStage = session?.step2?.coachEvaluation?.currentStage || "explore_A";
+  const newStage = data.progressUpdate.step2Data.currentStage;
+  const oldUserPoints = session?.step2?.coachEvaluation?.userPoints || "";
+
+  const pending = extractPendingRetention(oldUserPoints);
+  if (pending) {
+    // This turn is the student's answer to a retention question asked last turn.
+    const choice = resolvePendingRetentionChoice(userMessage, pending.recommendation);
+    const basePoints = String(
+      data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+    ).replace(PENDING_RETENTION_MARKER_RE, "").trim();
+    data.progressUpdate.step2Data.userPoints =
+      `${basePoints}；${pending.dimension}（${choice}）`.trim();
+    return;
+  }
+
+  const isExploreTransition =
+    (oldStage === "explore_A" && newStage && newStage !== "explore_A") ||
+    (oldStage === "explore_B" && newStage && newStage !== "explore_B");
+  if (!isExploreTransition) return;
+
+  const lastCoachQuestion = extractLastCoachQuestion(messages);
+  if (!lastCoachQuestion) return;
+
+  const check = await checkStep2DimensionCoverage({
+    question,
+    lastCoachQuestion,
+    studentAnswer: userMessage,
+  });
+  if (!check?.hasMultipleDimensions || !check.uncoveredDimension) return;
+
+  const { recommendation, reasonZh } = decideStep2Retention(
+    check.developedIsSolid,
+    check.uncoveredRelevantToQuestion,
+  );
+
+  // Revert the transition and fold a recommendation-driven retention question
+  // into this same turn, instead of an open-ended "which do you prefer" ask.
+  data.progressUpdate.step2Data.currentStage = oldStage;
+  const split = splitTwoParts(data.text, 1);
+  const part1 = (split.part1 || data.text || "").trim();
+  const uncovered = check.uncoveredDimension;
+
+  let retentionQuestion: string;
+  if (recommendation === "EXPAND_BOTH") {
+    retentionQuestion = `我们先记录下这一点（${reasonZh}）。你之前还提到『${uncovered}』——能否也补充 1-2 句，让这一维度也有具体内容？`;
+  } else if (recommendation === "KEEP_MINOR") {
+    retentionQuestion = `这一点已经足够扎实，可以独立支撑一段。${reasonZh}——建议把『${uncovered}』保留下来作为一个略写的补充点（Step 3 会详写这一点、略写『${uncovered}』，控制在 90-110 词内）。如果你想专注只写这一点，回复"放弃${uncovered}"即可。`;
+  } else {
+    retentionQuestion = `这一点已经足够扎实，可以独立支撑一段。${reasonZh}——建议专注写这一点就好。如果你还是想把『${uncovered}』也简单提一句，回复"保留${uncovered}"即可。`;
+  }
+  data.text = `${part1}\n\n---\n\n${retentionQuestion}`;
+
+  const basePoints = String(
+    data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+  ).trim();
+  data.progressUpdate.step2Data.userPoints =
+    `${basePoints} ［待裁决：${uncovered}｜${recommendation}］`.trim();
+
+  console.warn(
+    `[Step2RetentionGuard] Reverted transition ${oldStage}->${newStage}; uncovered="${uncovered}"; recommendation=${recommendation}`,
+  );
+}
+
+// Cross-step safety net: strip internal JSON field/enum names from user-facing chat
+// text. The UI panels already render localized versions of progressUpdate; chat
+// text should never echo raw implementation vocabulary (see NO INTERNAL JARGON rule).
+const INTERNAL_JARGON_REPLACEMENTS: [RegExp, string][] = [
+  // Step 3 paragraph-plan enums & fields
+  [/['"“‘]?total_then_points['"”’]?\s*(模式|mode)?/gi, "先总起再分点的写法"],
+  [/['"“‘]?direct_points['"”’]?\s*(模式|mode)?/gi, "直接分点展开的写法"],
+  [/['"“‘]?single_point['"”’]?\s*(模式|mode)?/gi, "单点展开的写法"],
+  [/\bparagraphPlan\b/gi, ""],
+  [/\bpointBlock[s]?\b/gi, "分点"],
+  [/\bstep3SubpointSteps\b/gi, ""],
+  [/\bexpansionStrategy\b/gi, ""],
+  [/\b(?:Multi-?point|multi-?point)\b/gi, "多点"],
+  // Step 2 stage & retention enums
+  [/\bexplore_[AB]\b/gi, ""],
+  [/\bcurrentStage\b/gi, ""],
+  [/\bKEEP_MINOR\b/g, "保留为略写"],
+  [/\bEXPAND_BOTH\b/g, ""],
+  [/\bDROP\b/g, ""],
+  [/\bclustering\b/gi, ""],
+  [/\boutliers\b/gi, ""],
+  // Step 1 slot & data fields
+  [/\bcorrectType\b/gi, "题型"],
+  [/\bcoreIssue\b/gi, "核心争议"],
+  [/\bconstraints\b/gi, "关键限定"],
+  [/\bsuggestedDimensions\b/gi, "讨论维度"],
+  [/\bstep1Data\b/gi, ""],
+  [/\bstep2Data\b/gi, ""],
+  // Global implementation vocabulary
+  [/\bprogressUpdate\b/gi, ""],
+  [/\bisCompleted\b/gi, ""],
+  [/\buserPoints\b/gi, ""],
+  [/\bblueprint\b/gi, "文章蓝图"],
+  // English role names -> Chinese (when leaked as raw words)
+  [/\bmajor\b/gi, "详写"],
+  [/\bminor\b/gi, "略写"],
+];
+
+function stripInternalJargonFromChatText(text: string): string {
+  let cleaned = String(text || "");
+  for (const [pattern, replacement] of INTERNAL_JARGON_REPLACEMENTS) {
+    cleaned = cleaned.replace(pattern, replacement);
+  }
+  // Collapse whitespace left by stripped tokens; preserve paragraph breaks.
+  cleaned = cleaned
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^\s+|\s+$/gm, (m) => (m.includes("\n") ? m : m.trim()))
+    .trim();
+  return cleaned;
 }
 
 async function startServer() {
@@ -585,8 +1082,12 @@ Review the context above and the current step's instructions. Organize and devel
   D. If all slots are present, output the completion summary and guide to Step 2.
 
   Critical skip rule (Step1-specific example of slot reuse):
-  - If the student answers coreIssue and already mentions qualifiers like "entirely / completely / only / 必须 / 完全", you MUST simultaneously write them into constraints and SKIP the qualifier question.
-  - Example: "线上教育是否应该完全取代传统教育" already contains "完全/entirely". Do NOT ask again "题目里有没有哪些词限制了讨论范围？". Ask for dimensions directly.
+  - A scope qualifier (entirely / completely / only / always / 完全 / 彻底 / 只 / 仅 / 必须 / 始终) that appears in the coreIssue answer IS the constraint. Recognizing it verbally in your feedback is NOT enough.
+  - If the student's coreIssue answer (or current message) contains such a qualifier, you MUST in the SAME turn copy that qualifier into progressUpdate.step1Data.constraints AND skip the constraints question, moving directly to suggestedDimensions.
+  - VIOLATION (do NOT do this): filing the qualifier only into coreIssue, leaving constraints empty, and then asking "题目里有没有哪些词，限制了讨论范围？". That is a redundant re-ask of information the student already gave.
+  - Example (mirrors a real case): student answers coreIssue with "线上教育是否会完全替代传统课堂". "完全" is a qualifier already present in the question ("replace ... entirely"). You MUST set constraints=["完全 (entirely)"] this turn and ask the dimensions question next, NOT the constraints question.
+  - Note: the server also backfills constraints from question-echoed qualifiers as a safety net, but you must not rely on it — do the copy-and-skip yourself.
+  - When speaking to the student, say "关键限定" / "讨论维度" / "题型" — never quote raw slot/field names like "constraints" or "correctType", and never mention progressUpdate paths.
 
   Missing-slot question templates (use only when that slot is truly missing):
   - missing correctType -> "这道题属于哪一种 Task 2 题型？"
@@ -596,7 +1097,10 @@ Review the context above and the current step's instructions. Organize and devel
 
   Completion output (when all slots are filled):
   - Part 1: concise praise + structured summary (题型、核心争议、关键限定、建议维度)
-  - Part 2: explicit CTA to enter Step 2.
+  - Part 2: explicit CTA telling the student to click the 【下一步】 button to enter Step 2. Part 2 MUST include the phrase "进入第二步".
+  - CRITICAL: In the SAME response when all 4 slots are filled, you MUST set progressUpdate.isCompleted: true.
+  - FORBIDDEN after Step 1 completion: Do NOT ask Step 2 questions (stance, blueprint, body paragraphs, thesis) while still in Step 1. Those belong only in Step 2.
+  - Do NOT populate progressUpdate.step2Data while step=1.
 `;
       } else if (Number(step) === 2) {
         stepGuidelines = `
@@ -618,17 +1122,33 @@ Review the context above and the current step's instructions. Organize and devel
   - Prefer "沿着你刚才的这个维度，我们把它展开到具体场景/人群/机制" over generic repeats.
   - Use generic fallback only when no relevant dimension exists in context.
 
+  Dimension Coverage & Retention Rule (CRITICAL — prevents silently dropping sibling dimensions):
+  - MANDATORY FIRST STEP before you decide anything else about transitioning: re-read the text of your OWN immediately preceding question in "Previous Conversation Logs" above (the last "IELTS AI Coach:" line for this side), plus the student's own current/prior message on this side. Explicitly ask yourself: "Did that question (or the student's own words) name TWO OR MORE distinct sub-angles/scenarios/sub-dimensions for this side (e.g. joined by 与/和/、, or listed as 『A』『B』, or 'A以及B')?"
+  - If YES to that question, and the student's current answer only develops ONE of those named sub-dimensions (not a mere synonym/rephrasing of it — a substantively different angle), this is an "uncovered dimension" case. This check runs BEFORE the sufficiency gate below and BEFORE any depth follow-up decision.
+  - If NO (only one dimension was ever named, or the "other" one is just a synonym of the developed one), skip this rule entirely and proceed with the normal sufficiency-gated transition below.
+  - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient.
+  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED (stay in the current explore stage) and fold exactly ONE retention question into your reply. Do NOT ask an open-ended "which do you prefer" question — you must EVALUATE first and state ONE default recommendation with a reason, then give the student a single override phrase:
+    - Developed point still thin (missing concrete scenario/beneficiary/mechanism) -> default recommendation is to keep BOTH; ask for 1-2 sentences on the uncovered dimension too. (No override phrase needed here — this is just a request for more content.)
+    - Developed point already solid enough alone to carry a full 90-110 word paragraph -> evaluate whether the uncovered dimension directly answers a core qualifier/contrast in the essay question (e.g. "entirely", "highly beneficial") or is more of a repetition/peripheral detail of the developed point:
+      - If it directly answers a core qualifier/contrast -> default recommendation is KEEP as a brief ("略写"/minor) supporting point. State the reason (e.g. "这一点和题目直接相关"), then add: "如果你想专注只写[已展开点]，回复'放弃[未展开点]'即可。"
+      - If it is repetitive/peripheral -> default recommendation is DROP it and focus on the developed point. State the reason (e.g. "这一点和已展开的点比较重复"), then add: "如果你还是想把[未展开点]也简单提一句，回复'保留[未展开点]'即可。"
+    - Both dimensions already have enough material -> default recommendation is to keep BOTH; tell the student Step 3 will assign one point as 详写 and the other as 略写 to stay within the 90-110 word budget.
+    - Example (mirrors a real case, KEEP branch): your own question named both "面对面互动" and "教师监督"; the student only develops "教师监督" (with a concrete beneficiary: young/low-self-control kids). This point alone is solid, and "面对面互动" also directly answers the essay's "entirely/replace" contrast, so your reply should read like: "『教师监督』这一点已经足够扎实，可以独立支撑一段。『面对面互动』和题目直接相关，建议保留下来作为一个略写的补充点。如果你想专注只写监管，回复'放弃面对面互动'即可。" and currentStage stays on the current explore stage this turn.
+  - On the NEXT turn, interpret the student's reply RELATIVE TO the specific default recommendation you proposed (do not always assume the same fixed outcome): a vague agreement ("好的"/"随便"/"都行") means ACCEPT the recommendation you gave; an explicit contradiction (e.g. saying "放弃" when you recommended keeping, or "保留"/"都要" when you recommended dropping) means the OPPOSITE of your recommendation. Then immediately record the decision and advance currentStage per the normal transition rule — do not ask about the same uncovered dimension again (anti-loop: at most ONE retention question per side).
+  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "B面：教师监督（已展开，作为主论点）；面对面互动（保留-略写）" or "...（用户放弃）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+
   1. Stage "explore_A": Explore Advantages of Side A (发散A面/如：线上优势)
      - Preferred question: If Step1 dimensions already include online-flexibility/resource-access style ideas, explicitly quote that dimension and ask for concrete scenarios/target groups/mechanism. Example: "你已经提到『线上灵活性与资源可及性』，具体在哪些学习场景或人群上最能体现价值？"
      - Fallback question: "第一步，我们先不要急着决定立场。先想一想：哪些情况下，线上教育确实具有明显优势？不用组织语言，想到什么写什么即可。"
      - Wait for student answer.
      - Allowed Actions: Only ask about, validate, and record Side A points.
      - Next Stage Transition (sufficiency-gated):
-       - IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side A — the information is already there. Briefly acknowledge and immediately transition to "explore_B". Set currentStage: "explore_B".
+       - FIRST apply the Dimension Coverage & Retention Rule's mandatory first step above. If it triggers, keep currentStage: "explore_A" this turn and ask the retention question instead of transitioning; only transition on the following turn after the student answers.
+       - IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side A — the information is already there. Briefly acknowledge and transition. Set currentStage: "explore_B".
        - Transition to "explore_B" ONLY when the Side A content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension).
        - If it is NOT sufficient (only a repeated label or one-liner without any concrete angle), STAY in "explore_A" and ask ONE depth follow-up instead of advancing. Keep currentStage: "explore_A".
        - After that single follow-up, accept whatever is given and transition (respect the anti-loop guard: at most ONE follow-up per point).
-     - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints. Only set currentStage: "explore_B" when the sufficiency gate above passes.
+     - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "explore_B" when the sufficiency gate above passes.
      - Content-completeness boundary (apply before recording):
        - If user answer is only a label repeat (or too shallow) with no concrete scenario/mechanism/target-group detail, ask ONE specific follow-up question and DO NOT invent details for them.
        - Each slot/point can trigger at most ONE depth follow-up. After one follow-up, accept and move forward even if concise.
@@ -641,11 +1161,12 @@ Review the context above and the current step's instructions. Organize and devel
      - Wait for student answer.
      - Allowed Actions: Only ask about, validate, and record Side B points.
      - Next Stage Transition (sufficiency-gated):
-       - IF SUFFICIENT (already enough to illustrate as a claim): do NOT re-ask or repeat any depth question about Side B — the information is already there. Briefly acknowledge and immediately transition to "stance". Set currentStage: "stance".
+       - FIRST apply the Dimension Coverage & Retention Rule's mandatory first step above. If it triggers, keep currentStage: "explore_B" this turn and ask the retention question instead of transitioning; only transition on the following turn after the student answers.
+       - IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side B — the information is already there. Briefly acknowledge and transition. Set currentStage: "stance".
        - Transition to "stance" ONLY when the Side B content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension such as "面对面互动，教师即时监督").
        - If it is NOT sufficient, STAY in "explore_B" and ask ONE depth follow-up (concrete scenario / mechanism / beneficiary) instead of advancing. Keep currentStage: "explore_B".
        - After that single follow-up, accept whatever is given and transition (anti-loop: at most ONE follow-up per point).
-     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints. Only set currentStage: "stance" when the sufficiency gate above passes.
+     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "stance" when the sufficiency gate above passes.
      - Content-completeness boundary (apply before recording):
        - If user answer only repeats known labels (e.g. "面对面互动，教师即时监督与纪律管理") without new concrete info, ask ONE specific follow-up and DO NOT auto-fill concrete expansion by yourself.
        - You MUST NOT introduce new mechanism/scenario/beneficiary details that the user never said.
@@ -663,6 +1184,9 @@ Review the context above and the current step's instructions. Organize and devel
      - Allowed Actions: Once in "summary", you must evaluate the layout and structure of the planned Body paragraphs based on the brainstormed points.
        - **Strict Constraint**: Do NOT generate 4+ body paragraphs. In IELTS Task 2, an essay should strictly contain **only 2 or 3 Body Paragraphs (主体段)**.
        - You must analyze the brainstormed points (Side A and Side B) and determine how they should be mapped into these 2-3 body paragraphs. Specifically, decide whether certain points should be combined into a single paragraph (e.g. combined under a unified theme), kept separate (e.g. Side A in Body 1, Side B in Body 2), or dropped entirely if they are weak or redundant.
+       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "保留-略写", "用户放弃"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
+         - A point tagged "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point (not promoted to its own body paragraph, not silently dropped).
+         - A point tagged "用户放弃" MUST be listed in clustering.outliers with a suggestion noting the student already chose to drop it during brainstorming.
        - **AI Paragraph Layout Evaluation**:
          - In your final Socratic text response in Stage "summary", you MUST explicitly present this layout to the student.
          - For each proposed Body Paragraph (Body 1, Body 2, etc.), provide a clear evaluation assessing three dimensions:
@@ -720,6 +1244,8 @@ Review the context above and the current step's instructions. Organize and devel
   DECIDING COMPLETION:
   - If currentStage is "summary", the user has finalized their stance/points, and your internal evaluation confirms EVERY planned Body paragraph has enough material to support a complete 90-110 word paragraph, set isCompleted: true in progressUpdate.
   - If any planned Body paragraph lacks sufficient material, you MUST NOT set isCompleted: true, and must instead ask the user for more ideas/clarification.
+  - When setting isCompleted: true, Part 2 MUST tell the student to click 【下一步】 and include the phrase "进入第三步". Do NOT start Step 3 drafting questions (mechanism, paragraphPlan, logic chain) in Step 2.
+  - Do NOT populate paragraphPlan or step3SubpointSteps while step=2.
 `;
       } else if (Number(step) === 3) {
         stepGuidelines = `
@@ -813,10 +1339,10 @@ Review the context above and the current step's instructions. Organize and devel
   - IMPORTANT: pointBlock-internal impact/result steps are still valid. For example, 'pb1_impact' / '分点1：行为监管 - 最终影响' is allowed because it belongs to a specific pointBlock. Only paragraph-level closing/summary steps are excluded from 'step3SubpointSteps'.
 
   - When a student selects or inputs their starting subpoint, you MUST, ON YOUR VERY FIRST RESPONSE for that subpoint:
-    1. Evaluate how many internal points it contains and state the diagnosis briefly in Chinese.
-    2. If it is multi-point, decide 'total_then_points' vs 'direct_points' yourself. Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; recommend the best mode and proceed.
-    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (explanation, example, mechanism, impact, contrast, or hybrid).
-    4. Explicitly DECLARE the paragraphPlan mode, the pointBlocks, and why this distribution of detail is chosen (1-2 concise Chinese sentences in Part 1).
+    1. Evaluate how many internal points it contains (write the technical diagnosis to progressUpdate.paragraphPlan.diagnosis only — do NOT echo raw field names in chat text).
+    2. If it is multi-point, decide 'total_then_points' vs 'direct_points' yourself (JSON only). Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; proceed with your recommended plan.
+    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (JSON only).
+    4. In Part 1, give the student a short plain-language summary (1–2 Chinese sentences) of the plan — e.g. "这句话其实包含两个方向：A和B，我们打算详细展开A，再简单带一下B" or "我们先给一个总起句，再分别展开这两个方向". Do NOT literally say mode names, field names, or English enum values (see NO INTERNAL JARGON rule).
     5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "总观点", "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
     6. Different subpoints in the same essay may use different paragraph modes and expansion strategies. Decide each independently.
 
@@ -856,10 +1382,11 @@ Review the context above and the current step's instructions. Organize and devel
      - 若已有 Active Subpoint：先复述一句你接收到的起始 claim，然后直接推进诊断与方案，不要反问“你想选哪一个分论点”。
      - 一旦选定或输入分论点，AI 先按【STEP 3 DECISION ORDER】做单点/多点识别。
      - 若包含多个可独立展开的支撑点（例如：行为监管 + 同伴互动 / 教师监督 + 促进社交）：
-       - 明确指出这几个支撑点分别是什么（每个点将成为一个 pointBlock）。
-       - 你自己决定用 'total_then_points' 还是 'direct_points'，并说明为什么这样分配详略，直接推进。不要让学生在方案 A/B 之间做选择。
+       - 在 Part 1 用大白话指出这几个支撑点分别是什么（例如“监管”和“社交互动”两个方向）。
+       - 在 progressUpdate 中写入完整 paragraphPlan（含 mode、详略分配）；聊天区只说人话摘要，不点名 total_then_points / direct_points 等内部模式名。
+       - 不要让学生在方案 A/B 之间做选择。
       - 仅当 claim 为空、过短、或本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
-     - 然后，按上文规则【声明 paragraphPlan mode、分点、详略权重、展开策略】，并立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`。
+     - 然后立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`（JSON），Part 1 最多 1–2 句用户向摘要。
      - *数据同步*: 把已确认的总观点或第一个子观点写入对应 plan field/step value。
 
   3. 逐步推进阶段 (Step-by-Step Progression — repeat for EACH planned micro-step):
@@ -963,6 +1490,16 @@ ${stepGuidelines}
     2) FILLED_SHALLOW: has a label/fragment but missing key specifics (mechanism, scenario, beneficiary, causal link, or required step element) -> ask ONE depth follow-up, and NEVER auto-invent missing details.
     3) FILLED_OK: key specifics are present -> you may polish wording to be CLEARER and SIMPLER (NOT more academic or fancy), keeping it easy to translate into simple English, but must NOT add new factual content.
   - Anti-loop guard: each slot/point allows at most ONE depth follow-up. After one follow-up, accept concise content and continue progressing (you may note "可继续深化" in critique, but do not keep looping).
+- NO INTERNAL JARGON IN CHAT TEXT (CRITICAL, applies to ALL steps 1–5):
+  - The "text" field is ONLY for the student. "progressUpdate" is ONLY for the system/UI. Never mix them.
+  - FORBIDDEN in Part 1 or Part 2: raw JSON field names, English enum/stage values, or implementation vocabulary, including:
+    - Step 1: correctType, coreIssue, constraints, suggestedDimensions, step1Data, slot
+    - Step 2: currentStage, explore_A, explore_B, stance, summary, userPoints, clustering, outliers, blueprint, KEEP_MINOR, DROP, EXPAND_BOTH
+    - Step 3: paragraphPlan, pointBlock, total_then_points, direct_points, single_point, step3SubpointSteps, expansionStrategy, major, minor
+    - Global: progressUpdate, isCompleted, JSON, schema, enum
+  - ALLOWED: natural Chinese that conveys the SAME meaning (题型、关键限定、A面/B面、详写/略写、先总起再分点、两个方向…).
+  - When you make an internal decision, write it to progressUpdate silently; in text, give at most 1–2 sentences of user-facing summary, then immediately ask the next concrete question.
+  - Do NOT narrate your decision process (e.g. "我决定采用…模式", "经过诊断这是 Multi-point", "我为你选择了 total_then_points").
 - PROACTIVE MOMENTUM AND GUIDANCE (CRITICAL): NEVER end a response without a clear next-step instruction, guiding question, or actionable prompt.
   - If the student's input is a brief affirmation, acknowledgement, or filler word (e.g., "嗯", "然后呢", "好的", "好的好的", "对", "对的", "是", "是的", "对，没有了", "嗯呢", "好的，明白"), you MUST NOT respond with simple filler phrases (like "很好。我们继续。") without a clear, specific follow-up question.
   - Instead, you MUST immediately analyze where you are in the current step's tasklist, formulate the next concrete, constructive question in the Socratic sequence (e.g., ask about constraints, underlying contradiction, or ask them to map their thoughts into an argument stance/subpoints), and present it clearly as the next specific question.
@@ -1390,49 +1927,58 @@ Student says:
         data = retryData;
       }
 
-      // Heuristic fallback: if AI explicitly tells the user to enter the next step, force isCompleted to true
-      if (data && data.text) {
-        const t = data.text;
-        let shouldForceComplete = false;
-
-        if (currentStepNum === 1) {
-          if (t.includes("进入第二步") || t.includes("进入第二阶段") || t.includes("脑暴与蓝图设计")) {
-            shouldForceComplete = true;
-          }
-        } else if (currentStepNum === 2) {
-          if (t.includes("进入第三步") || t.includes("进入第三阶段") || t.includes("段落逻辑链构建")) {
-            shouldForceComplete = true;
-          }
-        } else if (currentStepNum === 3) {
-          if (t.includes("第三步段落逻辑链构建已全部完成") || t.includes("进入第四步：逐句写作练习") || t.includes("进入第四阶段") || t.includes("进入逐句写作") || t.includes("进入逐句写作练习")) {
-            shouldForceComplete = true;
-          }
-        } else {
-          if (
-            t.includes("进入第二步") ||
-            t.includes("进入第三步") ||
-            t.includes("进入第四步") ||
-            t.includes("进入下一阶")
-          ) {
-            shouldForceComplete = true;
-          }
-        }
-
-        if (shouldForceComplete) {
-          if (!data.progressUpdate) {
-            data.progressUpdate = { isCompleted: true };
-          } else {
-            data.progressUpdate.isCompleted = true;
-          }
-        }
-      }
-
       if (data?.progressUpdate) {
         data.progressUpdate = sanitizeProgressUpdateWithSession(
           data.progressUpdate,
           session,
         );
       }
+
+      // Step 1 deterministic safety net (A): if the student already echoed a scope
+      // qualifier that exists in the essay question, credit it into constraints even
+      // when the model left the slot empty, and repair a redundant "限定词" question.
+      if (currentStepNum === 1 && data?.progressUpdate) {
+        const backfilled = backfillStep1Constraints(
+          question,
+          userMessage,
+          data.progressUpdate,
+          session,
+        );
+        if (backfilled.length > 0 && data?.text) {
+          const split = splitTwoParts(data.text, 1);
+          if (split.part1 && looksLikeConstraintQuestion(split.part2)) {
+            const s1 = data.progressUpdate.step1Data || {};
+            const oldS1 = session?.step1?.coachEvaluation || {};
+            const dims = s1.suggestedDimensions;
+            const oldDims = oldS1.suggestedDimensions;
+            const dimsFilled =
+              (Array.isArray(dims) && dims.some((d: any) => String(d || "").trim())) ||
+              (Array.isArray(oldDims) && oldDims.some((d: any) => String(d || "").trim()));
+            const nextPart2 = dimsFilled
+              ? "关键限定我已经帮你记下了。四个审题要素都齐了，请点击下方【下一步】按钮，我们进入第二步：确定立场与论点。"
+              : `关键限定我已经帮你记下了（你提到的「${backfilled.join("、")}」）。那我们直接看下一步：为了回答这道题，需要从哪些方面来比较或展开？请列出 2~4 个讨论维度。`;
+            data.text = `${split.part1.trim()}\n\n---\n\n${nextPart2}`;
+            if (dimsFilled) {
+              data.progressUpdate.isCompleted = true;
+            }
+            console.warn(
+              `[Step1Guard] Backfilled constraints=${JSON.stringify(backfilled)} and repaired redundant qualifier question.`,
+            );
+          }
+        }
+
+        enforceStep1SlotCompletion(data, session);
+      }
+
+      // Step 2 Dimension Coverage & Retention Guard: a narrow, separate verification
+      // call that catches cases where the prompt-only rule gets diluted by the large
+      // Step 2 prompt and the model silently drops an uncovered sibling dimension.
+      if (currentStepNum === 2 && data?.progressUpdate) {
+        await applyStep2RetentionGuard(data, session, userMessage, messages, question);
+      }
+
+      // Heuristic + anti-drift completion (runs AFTER backfill text repair & slot check)
+      applyStepCompletionHeuristic(data, currentStepNum);
 
       // Step 3 data-contract guard: the UI/CoachChat treat paragraphPlan as the
       // authoritative grouped structure. The model is instructed to always emit it,
@@ -1548,6 +2094,16 @@ Student says:
         });
 
         data.progressUpdate.step3SubpointSteps = derivedSteps;
+      }
+
+      if (typeof data?.text === "string") {
+        const cleanedText = stripInternalJargonFromChatText(data.text);
+        if (cleanedText !== data.text) {
+          console.warn(
+            `[JargonGuard] Stripped internal terms from step ${step} chat text.`,
+          );
+          data.text = cleanedText;
+        }
       }
 
       res.json(data);

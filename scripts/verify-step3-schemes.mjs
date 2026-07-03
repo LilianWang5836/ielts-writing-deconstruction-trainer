@@ -15,6 +15,31 @@
 
 const BASE = process.env.PROBE_BASE_URL || "http://localhost:3000";
 
+const FORBIDDEN_CHAT_JARGON = [
+  "total_then_points",
+  "direct_points",
+  "single_point",
+  "paragraphPlan",
+  "pointBlock",
+  "step3SubpointSteps",
+  "expansionStrategy",
+  "progressUpdate",
+  "explore_A",
+  "explore_B",
+  "currentStage",
+  "KEEP_MINOR",
+  "EXPAND_BOTH",
+  "correctType",
+  "suggestedDimensions",
+];
+
+function chatTextHasForbiddenJargon(text = "") {
+  const lower = String(text).toLowerCase();
+  return FORBIDDEN_CHAT_JARGON.filter((term) =>
+    lower.includes(term.toLowerCase()),
+  );
+}
+
 const cases = [
   {
   name: "Teacher Feedback + Peer Competition",
@@ -116,6 +141,13 @@ async function runCase(c) {
     );
     console.log("  ------------------");
   }
+
+  const jargonHits = chatTextHasForbiddenJargon(data?.text);
+  console.log(
+    `  -> JARGON CHECK (chat text): ${
+      jargonHits.length === 0 ? "PASS (no forbidden terms)" : `FAIL (${jargonHits.join(", ")})`
+    }`,
+  );
 
   if (plan) {
     console.log("  paragraphPlan:");

@@ -146,7 +146,7 @@ export default function Step3Drafting({
     (s) => s.id === session.step3.activeSubpointId,
   );
   const kickoffPrompt = activeSubpoint?.content
-    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先完成单点/多点诊断，再直接给出 paragraphPlan 与 step3SubpointSteps；不要再次要求我先选择或重述 claim。`
+    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先判断这是单点还是多点论点，用大白话简要说明结构安排，然后直接开始第一个具体问题；结构细节写入系统即可，不要在对话里提字段名。`
     : "";
 
   const isStep3Finished = session.step3.isCompleted || (subpoints.length > 0 && subpoints.every((s) => s.isCompleted));
@@ -186,7 +186,7 @@ export default function Step3Drafting({
           onUpdateSession={onUpdateSession}
           stepContext={{ subpoints }}
           welcomeMessage={welcomeMessage}
-          autoKickoff={!!activeSubpoint}
+          autoKickoff={true}
           kickoffPrompt={kickoffPrompt}
           kickoffContextKey={activeSubpoint?.id || ''}
         >

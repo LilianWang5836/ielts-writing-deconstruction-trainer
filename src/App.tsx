@@ -42,13 +42,15 @@ export default function App() {
         setActiveTopic(parsed.topic);
         setSession(parsed);
         
-        // Pre-populate completed steps so we don't auto-redirect them if they manually visit them later
+        // Only skip auto-redirect for steps the user already advanced past (manual back-nav).
+        // If step1.isCompleted but currentStep is still 1, we must allow auto-redirect.
         const completed: number[] = [];
-        if (parsed.step1?.isCompleted) completed.push(1);
-        if (parsed.step2?.isCompleted) completed.push(2);
+        const cur = parsed.currentStep || 1;
+        if (parsed.step1?.isCompleted && cur > 1) completed.push(1);
+        if (parsed.step2?.isCompleted && cur > 2) completed.push(2);
         const step3Completed = parsed.step3?.isCompleted || (parsed.step3?.subpoints?.length > 0 && parsed.step3.subpoints.every((s: any) => s.isCompleted));
-        if (step3Completed) completed.push(3);
-        if (parsed.step4?.isCompleted) completed.push(4);
+        if (step3Completed && cur > 3) completed.push(3);
+        if (parsed.step4?.isCompleted && cur > 4) completed.push(4);
         setAutoRedirectedSteps(completed);
       } catch (e) {
         console.error('Failed to restore session:', e);

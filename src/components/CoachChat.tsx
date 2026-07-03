@@ -43,8 +43,9 @@ export default function CoachChat({
   useEffect(() => {
     setShowResetConfirm(false); // Reset confirmation state on step change
     kickoffRef.current = null;
-    if (chatHistory.length === 0) {
-      // Initialize with welcome message
+    // When autoKickoff is on (step2/step3), the LLM-generated opener is the first
+    // message; do NOT seed a templated welcome bubble (it duplicates the opener).
+    if (chatHistory.length === 0 && !autoKickoff) {
       const initialMessage: ChatMessage = {
         id: `msg-welcome-${Date.now()}`,
         sender: 'ai',
@@ -431,11 +432,13 @@ export default function CoachChat({
 
   useEffect(() => {
     if (!autoKickoff || !kickoffPrompt.trim() || loading) return;
-    if (!chatHistory.length) return;
-    const firstMsg = chatHistory[0];
-    const hasUserMessage = chatHistory.some((m) => m.sender === 'user');
-    if (!firstMsg || firstMsg.sender !== 'ai' || hasUserMessage) return;
-    const kickoffKey = `${stepKey}:${kickoffContextKey}:${firstMsg.id}`;
+    // Fire the opener only when the step chat is still empty (no welcome bubble is
+    // seeded for autoKickoff steps). Once any message exists, never re-fire.
+    const hasAnyMessage = chatHistory.some(
+      (m) => m.sender === 'ai' || m.sender === 'user',
+    );
+    if (hasAnyMessage) return;
+    const kickoffKey = `${stepKey}:${kickoffContextKey}`;
     if (kickoffRef.current === kickoffKey) return;
     kickoffRef.current = kickoffKey;
     sendUserMessage(kickoffPrompt, { hiddenUserMessage: true });
@@ -457,16 +460,22 @@ export default function CoachChat({
   };
 
   const handleResetChat = () => {
-    const initialMessage: ChatMessage = {
-      id: `msg-welcome-${Date.now()}`,
-      sender: 'ai',
-      text: welcomeMessage,
-      timestamp: new Date().toISOString(),
-    };
+    // autoKickoff steps (step2/step3) have no welcome bubble; clear to empty so the
+    // opener effect regenerates the first message. Other steps keep the welcome.
+    const initialHistory: ChatMessage[] = autoKickoff
+      ? []
+      : [
+          {
+            id: `msg-welcome-${Date.now()}`,
+            sender: 'ai',
+            text: welcomeMessage,
+            timestamp: new Date().toISOString(),
+          },
+        ];
 
     const updatedStepState: any = {
       ...session[stepKey],
-      chatHistory: [initialMessage],
+      chatHistory: initialHistory,
       isCompleted: false,
       coachEvaluation: null,
     };
