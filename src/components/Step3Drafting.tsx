@@ -151,9 +151,6 @@ export default function Step3Drafting({
 
   const isStep3Finished = session.step3.isCompleted || (subpoints.length > 0 && subpoints.every((s) => s.isCompleted));
 
-  const userStance = session.step2.userStance || session.step2.coachEvaluation?.userStance;
-  const userPoints = session.step2.userPoints || session.step2.coachEvaluation?.userPoints;
-
   const strategyLabel: Record<string, string> = {
     explanation: "解释",
     example: "举例",
@@ -173,20 +170,9 @@ export default function Step3Drafting({
     idx: number,
   ) => !!steps[idx]?.value || idx === 0 || !!steps[idx - 1]?.value;
 
-  const welcomeMessage = userStance
-    ? `【第三步：段落论证起草 ✍️】
-欢迎进入第三步！我们要为每一个主体段落 (Body Paragraph) 构建一个具有强说服力的【逻辑闭环】。
-
-在第二步中，你确立的整体立场是：
-> *“${userStance}”*
-
-已规划的主体段落核心内容为：
-${userPoints ? `> *“${userPoints}”*` : `> *见右侧主体段落列表*`}
-
-我会默认从第一个主体段落开始诊断并构建论证链。你也可以随时在右侧顶部切换到其他主体段落。`
-    : `【第三步：段落论证起 scratch ✍️】
-欢迎进入第三步！我们要为每一个主体段落 (Body Paragraph) 构建一个具有强说服力的【逻辑闭环】。
-我会先从第一个主体段落开始，随后你可以切换到其他段落继续完善。`;
+  const welcomeMessage = `【第三步：段落论证起草 ✍️】
+欢迎进入第三步！我们来为每一个主体段落 (Body Paragraph) 构建一个逻辑闭环。
+我会从第一个主体段落开始，你可以随时在右侧顶部切换到其他主体段落。`;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">

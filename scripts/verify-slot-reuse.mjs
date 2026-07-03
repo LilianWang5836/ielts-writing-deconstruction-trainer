@@ -11,6 +11,11 @@ function mustContain(snippet, label) {
   console.log(`OK: ${label}`);
 }
 
+function mustNotContain(snippet, label) {
+  assert.ok(!source.includes(snippet), `Should be absent but found: ${label}`);
+  console.log(`OK: ${label}`);
+}
+
 // Global rules
 mustContain("SLOT REUSE RULE (CRITICAL, applies to all steps):", "global slot reuse rule");
 mustContain(
@@ -72,6 +77,29 @@ mustContain("LENGTH BUDGET (decide mode & detail BEFORE writing steps):", "step3
 mustContain("targets about 90-110 words total", "step3 90-110 word budget");
 mustContain("For a 2-point claim, do NOT mark both pointBlocks as 'major'.", "step3 no-two-major rule");
 mustContain("Length-aware balance:", "step3 length-aware balance rule");
+
+// Step 3 plain-language / writability standard
+mustContain(
+  "## STEP 3 PLAIN-LANGUAGE / WRITABILITY STANDARD (CRITICAL, governs all Chinese you generate here):",
+  "step3 writability standard header",
+);
+mustContain(
+  'Could a band 5-5.5 student translate this into ONE simple English sentence?',
+  "step3 writability test",
+);
+mustContain(
+  'Do NOT provide a second "higher-band" Chinese version.',
+  "step3 no dual-version rule",
+);
+mustContain(
+  "you may polish wording to be CLEARER and SIMPLER (NOT more academic or fancy)",
+  "global polish rule simplified",
+);
+mustNotContain(
+  "you may polish wording (more academic, concise)",
+  "old more-academic polish rule removed",
+);
+mustNotContain("用极具温度、学术感和鼓励性的中文", "step3 closing academic tone removed");
 
 // Merge guard functions and wiring
 mustContain("function sanitizeProgressUpdateWithSession(", "merge guard function exists");
