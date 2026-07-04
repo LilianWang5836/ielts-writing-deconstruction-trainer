@@ -199,9 +199,9 @@ async function main() {
   );
   printJargonCheck("case3 step3 complete logic", case3.text);
 
-  // Case 4: Step3 two-point claim -> length budget should avoid two 'major' points
+  // Case 4: Step3 two-point claim -> symmetric points may both be major when concise
   const case4User =
-    "传统课堂所提供的即时人际互动与必不可少的教学监管，是线上教育无法企及且不可替代的。";
+    "线上学习既能打破地理限制帮助偏远地区学生，也能给在职人员提供灵活学习时间。";
   const case4 = await postCoach({
     question,
     step: 3,
@@ -217,7 +217,7 @@ async function main() {
       },
     },
   });
-  printCase("Step3 two-point claim (length budget)", case4User, case4);
+  printCase("Step3 two-point claim (dual-major allowed)", case4User, case4);
   const plan4 = case4?.progressUpdate?.paragraphPlan;
   if (plan4 && Array.isArray(plan4.pointBlocks)) {
     const roles = plan4.pointBlocks.map((b) => b.role);
@@ -225,14 +225,76 @@ async function main() {
     console.log(`paragraphPlan.mode => ${plan4.mode}`);
     console.log(`pointBlock roles => ${JSON.stringify(roles)}`);
     console.log(
-      `Check: not both 'major' (length budget respected) => ${
-        plan4.pointBlocks.length >= 2 && majorCount >= 2 ? "NO (BAD)" : "YES (GOOD)"
+      `Check: can use both 'major' for symmetric two-point claim => ${
+        plan4.pointBlocks.length >= 2 && majorCount >= 2 ? "YES (GOOD)" : "NO (REVIEW)"
+      }`,
+    );
+    const point2Text = JSON.stringify(plan4.pointBlocks[1] || {});
+    console.log(
+      `Check: point2 has bridge/cohesion language => ${
+        /同时|也|此外|另外|同样|并且|而且|这也|另一方面/.test(point2Text)
+          ? "YES (GOOD)"
+          : "NO (REVIEW)"
       }`,
     );
   } else {
     console.log("paragraphPlan missing or has no pointBlocks");
   }
   printJargonCheck("case4 step3 two-point", case4.text);
+
+  // Case 4b: Step3 user override should update recommended plan (non-blocking)
+  const case4bUser =
+    "我想两个点都详细展开，不要一个主一个次，而且第二点先讲场景再讲结果。";
+  const case4b = await postCoach({
+    question,
+    step: 3,
+    userMessage: case4bUser,
+    messages: [
+      { sender: "user", text: case4User },
+      { sender: "ai", text: case4.text },
+      { sender: "user", text: case4bUser },
+    ],
+    stepContext: {
+      subpoints: [{ id: "body-1", content: case4User, isCompleted: false }],
+    },
+    session: {
+      step3: {
+        subpoints: [{ id: "body-1", content: case4User, isCompleted: false }],
+        activeSubpointId: "body-1",
+      },
+    },
+  });
+  printCase("Step3 override recommendation -> plan updated", case4bUser, case4b);
+  const plan4b = case4b?.progressUpdate?.paragraphPlan;
+  if (plan4b && Array.isArray(plan4b.pointBlocks)) {
+    const roles = plan4b.pointBlocks.map((b) => b.role);
+    const point2 = plan4b.pointBlocks[1] || {};
+    const point2StepKeys = Array.isArray(point2.steps)
+      ? point2.steps.map((s) => String(s?.key || "").toLowerCase())
+      : [];
+    const scenarioBeforeImpact =
+      point2StepKeys.some((k) => k.includes("scenario") || k.includes("example")) &&
+      point2StepKeys.some((k) => k.includes("impact") || k.includes("result"));
+    const dualMajor = roles.filter((r) => r === "major").length >= 2;
+    const overrideAdopted = dualMajor || scenarioBeforeImpact;
+    console.log(
+      `Check: override accepted (both points detailed) => ${
+        overrideAdopted ? "YES (GOOD)" : "NO (REVIEW)"
+      }`,
+    );
+  } else {
+    console.log("Check: override accepted => NO (paragraphPlan missing)");
+  }
+  console.log(
+    `Check: coach acknowledges switch in chat text => ${
+      /没问题|按你|按你说|按照你|尊重你的想法|改成|调整|换成|可以/.test(
+        String(case4b?.text || ""),
+      )
+        ? "YES (GOOD)"
+        : "NO (REVIEW)"
+    }`,
+  );
+  printJargonCheck("case4b step3 override", case4b.text);
 
   // Case 5: Step2 Dimension Coverage & Retention (real case replay) — the coach's own
   // question named two sub-dimensions ("面对面互动" + "老师监管"), but the student only

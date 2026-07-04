@@ -1282,8 +1282,10 @@ Review the context above and the current step's instructions. Organize and devel
   LENGTH BUDGET (decide mode & detail BEFORE writing steps):
   - A single IELTS body paragraph targets about 90-110 words total (same budget as Step 2).
   - This whole budget is shared across the total claim (if any) + ALL pointBlocks + optional closing.
-  - For a MULTI-POINT claim with 2 sub-points, you MUST keep the whole paragraph within ~90-110 words. Therefore:
-    1. Do NOT expand both points as full major chains. Pick ONE 'major' (2-3 steps) and keep the other 'minor' (1-2 steps).
+  - For a MULTI-POINT claim with 2 sub-points, you should usually keep the whole paragraph within ~90-110 words. Therefore:
+    1. Prefer ONE 'major' (2-3 steps) + ONE 'minor' (1-2 steps) only when one point is genuinely secondary.
+       If both points are clearly co-equal (e.g., two parallel beneficiary groups / two parallel functions) and still controllable in length, you SHOULD keep BOTH as 'major' with concise steps.
+       Do NOT mechanically force major+minor for symmetric two-point claims.
     2. Prefer 'direct_points' (drop the total claim) when a separate topic sentence would push the paragraph over budget or merely repeat the sub-claims.
     3. Use 'total_then_points' only when a short total claim is worth its word cost; then keep each point tighter.
   - Recommended shapes for a 2-point body within budget:
@@ -1313,8 +1315,10 @@ Review the context above and the current step's instructions. Organize and devel
 
   ## Multi-Point Paragraph Planning (CRITICAL):
   - 'progressUpdate.paragraphPlan' is ALWAYS required in Step 3 once a subpoint is selected OR typed by the student, whether the claim is single-point or multi-point.
-  - Use deliberate detail balance. Do NOT expand every point equally. Decide which point needs explanation/mechanism and which point is better supported by a short example or impact.
-  - Length-aware balance: the major/minor split and step counts MUST be chosen so the whole paragraph stays within the ~90-110 word budget. If both points need heavy expansion, downgrade one to 'minor' or switch mode to 'direct_points' rather than exceeding length. For a 2-point claim, do NOT mark both pointBlocks as 'major'.
+  - Use deliberate detail balance. Do NOT expand every point equally by default; decide from claim structure.
+  - For symmetric two-point claims with co-equal importance, allow balanced expansion (both can be 'major' with concise steps) instead of auto-downgrading one point.
+  - Length-aware balance: choose role split and step counts to keep the whole paragraph near ~90-110 words. If both points need heavy expansion beyond budget, then downgrade one to 'minor' or switch mode to 'direct_points'.
+  - Coherence floor for minor points: even when one point is marked 'minor', it must still connect back to the paragraph context (totalClaim or previous point). Do NOT leave a minor point as an isolated one-off example with no bridge.
   - Each pointBlock MUST be independently developed. The two (or more) dimensions each carry their own argument; do NOT collapse them into a single chain.
 
   ## Optional Short Closing (简短收束):
@@ -1341,10 +1345,11 @@ Review the context above and the current step's instructions. Organize and devel
   - When a student selects or inputs their starting subpoint, you MUST, ON YOUR VERY FIRST RESPONSE for that subpoint:
     1. Evaluate how many internal points it contains (write the technical diagnosis to progressUpdate.paragraphPlan.diagnosis only — do NOT echo raw field names in chat text).
     2. If it is multi-point, decide 'total_then_points' vs 'direct_points' yourself (JSON only). Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; proceed with your recommended plan.
-    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (JSON only).
+    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (JSON only). For symmetric co-equal two-point claims, default to dual-major unless budget pressure is obvious.
     4. In Part 1, give the student a short plain-language summary (1–2 Chinese sentences) of the plan — e.g. "这句话其实包含两个方向：A和B，我们打算详细展开A，再简单带一下B" or "我们先给一个总起句，再分别展开这两个方向". Do NOT literally say mode names, field names, or English enum values (see NO INTERNAL JARGON rule).
     5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "总观点", "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
     6. Different subpoints in the same essay may use different paragraph modes and expansion strategies. Decide each independently.
+    7. End Part 1 with a low-friction override invitation in natural Chinese (e.g. "如果你想换一种展开顺序/角度，直接说，我马上按你的版本改"). Keep it short and non-technical.
 
   - Do NOT let students blindly fill templates. Socratic guidance must feel like natural, conversational reasoning.
   - STRICT COMPACTNESS RULE: Keep AI responses extremely concise and punchy. Bold key takeaways. Always ask exactly ONE clear question at a time.
@@ -1358,6 +1363,12 @@ Review the context above and the current step's instructions. Organize and devel
     - Instead of asking students to abstractly choose "Example", "Mechanism", or "Scenario", the AI Coach MUST analyze the claim and **proactively recommend** the best, most natural reasoning strategy for it, explaining why.
     - E.g., "在社交能力/课堂氛围/教师监督这个话题上，我建议采用‘典型场景或具体实例’来展开，因为这类软技能最容易通过真实的日常学校课堂互动或集体活动来体现和证明。那么在日常学校中，最典型的能促进师生或生生社交互动的活动/场景是什么？你可以举个例子吗？"
     - Then guide them to provide it directly.
+
+  - OVERRIDE HANDLING (CRITICAL):
+    - If the student explicitly requests a different structure/order/strategy after your recommendation (e.g., "两个点都展开", "先举例再讲原因", "换成问题-解决"), you MUST adopt that preference unless it would clearly break core constraints (especially severe word-budget overflow).
+    - After adopting, you MUST immediately update 'progressUpdate.paragraphPlan' and the compatible flattened 'progressUpdate.step3SubpointSteps' to reflect the new structure.
+    - In chat text, acknowledge the switch in one plain sentence, then continue guidance. Do NOT silently keep the old plan.
+    - If you cannot fully satisfy the requested override due to constraints, explain the constraint briefly in plain Chinese and provide the closest feasible variant, then proceed.
 
   - Reason vs. Support Crisp Boundary:
     - Reason is the underlying principle/why on a conceptual level (e.g., "在教室里，学生每天都能和同学面对面说话，所以更容易交上朋友").
@@ -1418,10 +1429,17 @@ Review the context above and the current step's instructions. Organize and devel
        - **[步骤1 label]**: [该步骤 value]
        - **[步骤2 label]**: [该步骤 value]
        - ...（按所选 scheme 的实际步骤逐条列出）
-       已为你放置【逻辑闭环诊断报告】，展现在右侧。这个分论点已经大功告成！我们接下来继续讨论另一个分论点，或者你可以点击下一步进入写作练习。"
+       已为你放置【逻辑闭环诊断报告】，展现在右侧。这个分论点已经大功告成！你可以在右侧顶部切换到下一个主体段继续构建，或者点击下一步进入写作练习。"
+
+  SINGLE-SUBPOINT SCOPE (CRITICAL — 每轮只服务当前 Active Subpoint):
+  - 每一次回复都只围绕【当前 Active Subpoint】这一个主体段展开，绝不要在同一段对话里主动开始或续写"下一个主体段/另一个分论点"。
+  - 完成当前分论点后，只做收尾提示（见上），把是否进入下一个主体段的控制权交给界面（用户在右侧切换 tab，会自动为新主体段开启独立对话）。
+  - 因此：不要在当前对话里问"我们接着写第二个分论点吧"这类推进问题，也不要把下一个主体段的内容写进当前 \`paragraphPlan\`。当前 \`paragraphPlan\` 只能属于当前 Active Subpoint。
 
   DECIDING COMPLETION:
-  - 只有当所有主体段（subpoints中的每一项）的 \`step3SubpointCompleted\` 均已为 true，即所有主体段都锁定了全套逻辑链，才可以整体将 'isCompleted' 设为 true。
+  - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段 \`paragraphPlan.pointBlocks[].steps[]\` 的所有必要 \`value\` 均已填满时，才可将其设为 true；只要还有空步骤就必须保持 false。
+  - 不要仅凭"方案已规划好/刚开场"就把 \`step3SubpointCompleted\` 或 'isCompleted' 设为 true。规划完成 ≠ 逻辑链填写完成。
+  - 'isCompleted'（整个 Step 3 完成）只在你确认所有主体段都各自完成后才可设为 true；否则一律为 false。界面会依据每个主体段的实际填写情况把控整体解锁，不要提前解锁。
   - 如果所有主体段都完成了，在回复最后明确引导：“第三步段落逻辑链构建已全部完成！请点击下方按钮进入第四步：逐句写作练习。”并设 isCompleted = true。
         `;
       } else if (Number(step) === 5) {
@@ -3007,11 +3025,111 @@ Student says:
   // 9. API - Generate Sentence Practice Tasks (Step 4)
   app.post("/api/generate-sentence-tasks", async (req, res) => {
     try {
-      const { question, questionType, selectedThesis, subpoints } = req.body;
+      const { question, selectedThesis, subpoints } = req.body;
       if (!question) {
         res.status(400).json({ error: "Missing topic question" });
         return;
       }
+
+      const normalizeText = (value: unknown): string =>
+        typeof value === "string" ? value.trim() : "";
+
+      const dedupeOrdered = (items: string[]) => {
+        const seen = new Set<string>();
+        const result: string[] = [];
+        for (const item of items) {
+          const normalized = item.trim();
+          if (!normalized) continue;
+          if (seen.has(normalized)) continue;
+          seen.add(normalized);
+          result.push(normalized);
+        }
+        return result;
+      };
+
+      const inferSection = (taskId: string): "intro" | "body1" | "body2" | "conclusion" => {
+        if (taskId.startsWith("intro-")) return "intro";
+        if (taskId.startsWith("body1-")) return "body1";
+        if (taskId.startsWith("body2-")) return "body2";
+        return "conclusion";
+      };
+
+      const claimRegex = /(?:^|_)(subclaim|claim)$/i;
+      const extractBodySentences = (plan: any): string[] => {
+        if (!plan || typeof plan !== "object") return [];
+
+        const sentences: string[] = [];
+        const totalClaim = normalizeText(plan.totalClaim);
+        if (totalClaim) sentences.push(totalClaim);
+
+        const pointBlocks = Array.isArray(plan.pointBlocks) ? plan.pointBlocks : [];
+        pointBlocks.forEach((block: any) => {
+          const blockSubClaim = normalizeText(block?.subClaim);
+          const steps = Array.isArray(block?.steps) ? block.steps : [];
+
+          let claimStepIndex = -1;
+          for (let i = 0; i < steps.length; i += 1) {
+            const key = normalizeText(steps[i]?.key);
+            const value = normalizeText(steps[i]?.value);
+            if (value && claimRegex.test(key)) {
+              claimStepIndex = i;
+              break;
+            }
+          }
+
+          if (claimStepIndex >= 0) {
+            sentences.push(normalizeText(steps[claimStepIndex]?.value));
+          } else if (blockSubClaim) {
+            sentences.push(blockSubClaim);
+          }
+
+          steps.forEach((step: any, index: number) => {
+            if (index === claimStepIndex) return;
+            const value = normalizeText(step?.value);
+            if (value) sentences.push(value);
+          });
+        });
+
+        const shortClosing = normalizeText(plan.optionalShortClosing);
+        if (shortClosing) sentences.push(shortClosing);
+
+        return dedupeOrdered(sentences);
+      };
+
+      const extractBodyClaimContext = (plan: any): string => {
+        if (!plan || typeof plan !== "object") return "";
+        const totalClaim = normalizeText(plan.totalClaim);
+        if (totalClaim) return totalClaim;
+
+        const pointBlocks = Array.isArray(plan.pointBlocks) ? plan.pointBlocks : [];
+        const subClaims = dedupeOrdered(
+          pointBlocks.map((block: any) => normalizeText(block?.subClaim)).filter(Boolean),
+        );
+        return subClaims.join("；");
+      };
+
+      const allSubpoints = Array.isArray(subpoints) ? subpoints : [];
+      const body1Subpoint =
+        allSubpoints.find((sp) =>
+          normalizeText(sp?.targetBody).toLowerCase().includes("1"),
+        ) || allSubpoints[0];
+
+      let body2Subpoint =
+        allSubpoints.find((sp) =>
+          normalizeText(sp?.targetBody).toLowerCase().includes("2"),
+        ) || allSubpoints[1];
+      if (body1Subpoint && body2Subpoint && body1Subpoint.id === body2Subpoint.id) {
+        body2Subpoint = undefined;
+      }
+
+      const body1Plan = body1Subpoint?.paragraphPlan;
+      const body2Plan = body2Subpoint?.paragraphPlan;
+      const body1Sentences = extractBodySentences(body1Plan);
+      const body2Sentences = extractBodySentences(body2Plan);
+
+      const body1ClaimContext = extractBodyClaimContext(body1Plan);
+      const body2ClaimContext = extractBodyClaimContext(body2Plan);
+      const stance = normalizeText(selectedThesis) || "需要结合题干进行立场表达";
 
       const inputElements: {
         id: string;
@@ -3019,126 +3137,156 @@ Student says:
         chineseText: string;
         label: string;
       }[] = [];
-      if (Array.isArray(subpoints) && subpoints.length > 0) {
-        subpoints.forEach((sp, i) => {
-          if (sp.claim && sp.claim.trim()) {
-            inputElements.push({
-              id: `sp${i}-claim`,
-              type: "claim",
-              chineseText: sp.claim.trim(),
-              label: `分论点 ${i + 1} 的核心论点 (Claim)`,
-            });
-          }
-          if (sp.mechanism && sp.mechanism.trim()) {
-            inputElements.push({
-              id: `sp${i}-mech`,
-              type: "mechanism",
-              chineseText: sp.mechanism.trim(),
-              label: `分论点 ${i + 1} 的论证机制 (Mechanism)`,
-            });
-          }
-          if (sp.result && sp.result.trim()) {
-            inputElements.push({
-              id: `sp${i}-res`,
-              type: "result",
-              chineseText: sp.result.trim(),
-              label: `分论点 ${i + 1} 的影响结果 (Result)`,
-            });
-          }
+      const introConclusionPrompt = `
+You are an IELTS Writing coach creating Chinese sentence-level semantic targets for translation practice.
+
+Topic question:
+"${question}"
+
+Stance:
+"${stance}"
+
+Body 1 core claim context:
+"${body1ClaimContext || "（缺失）"}"
+
+Body 2 core claim context:
+"${body2ClaimContext || "（缺失）"}"
+
+Generate exactly three Chinese outputs:
+1) introParaphrase: A concise paraphrase of the original topic sentence. It should be a topic restatement only.
+2) introStance: One sentence that states the overall stance while naturally foreshadowing the two body directions.
+3) conclusion: One sentence that summarizes the final stance with concise reference to the two body directions. Must not copy introStance wording.
+
+Rules:
+- All three fields MUST be Chinese only.
+- Keep each field as one sentence.
+- Do NOT include bullets, numbering, or explanation text.
+      `;
+
+      const introConclusionResponse = await generateContentWithFallback({
+        contents: introConclusionPrompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              introParaphrase: { type: Type.STRING },
+              introStance: { type: Type.STRING },
+              conclusion: { type: Type.STRING },
+            },
+            required: ["introParaphrase", "introStance", "conclusion"],
+          },
+        },
+      });
+
+      const introConclusionData = parseAIResponse(introConclusionResponse.text);
+      const introParaphrase =
+        normalizeText(introConclusionData?.introParaphrase) ||
+        "该题围绕一个公共议题展开讨论，需要比较不同路径并作出判断。";
+      const introStance =
+        normalizeText(introConclusionData?.introStance) ||
+        `${stance}，并将结合两个主体段展开论证。`;
+      const conclusion =
+        normalizeText(introConclusionData?.conclusion) ||
+        `综上所述，${stance}这一立场更具说服力。`;
+
+      inputElements.push({
+        id: "intro-1",
+        type: "intro_paraphrase",
+        chineseText: introParaphrase,
+        label: "第一段：题干改写",
+      });
+      inputElements.push({
+        id: "intro-2",
+        type: "intro_stance",
+        chineseText: introStance,
+        label: "第一段：总立场句",
+      });
+
+      body1Sentences.forEach((sentence, index) => {
+        inputElements.push({
+          id: `body1-${index + 1}`,
+          type: "body1_sentence",
+          chineseText: sentence,
+          label: `Body 1 句子 ${index + 1}`,
         });
+      });
+      body2Sentences.forEach((sentence, index) => {
+        inputElements.push({
+          id: `body2-${index + 1}`,
+          type: "body2_sentence",
+          chineseText: sentence,
+          label: `Body 2 句子 ${index + 1}`,
+        });
+      });
+
+      inputElements.push({
+        id: "conclusion-1",
+        type: "conclusion_summary",
+        chineseText: conclusion,
+        label: "结尾：总结立场",
+      });
+
+      if (inputElements.length === 0) {
+        res.status(400).json({ error: "Missing step4 task source sentences" });
+        return;
       }
 
-      const ai = getAI();
-      let prompt = "";
+      const elementsList = inputElements
+        .map((el, idx) => {
+          return `${idx + 1}. [Task ID: ${el.id}] [Category: ${el.label}] Target Chinese Sentence: "${el.chineseText}"`;
+        })
+        .join("\n");
 
-      if (inputElements.length > 0) {
-        const elementsList = inputElements
-          .map((el, idx) => {
-            return `${idx + 1}. [Task ID: ${el.id}] [Category: ${el.label}] Target Chinese Sentence: "${el.chineseText}"`;
-          })
-          .join("\n");
+      const prompt = `
+      You are an expert IELTS Lexical Resource Tutor.
+      For this IELTS topic: "${question}"
+      Chosen position/thesis: "${selectedThesis || ""}"
 
-        prompt = `
-        You are an expert IELTS Lexical Resource Tutor.
-        For this IELTS topic: "${question}"
-        Chosen position/thesis: "${selectedThesis || ""}"
+      The user has completed structured drafting and we have segmented the writing flow sentence-by-sentence.
+      
+      YOUR TASK:
+      You MUST generate exactly ${inputElements.length} sentence-level expression exercises (tasks) in the output.
+      Each task corresponds directly and sequentially to one of the target Chinese sentences provided below.
+      
+      Here are the target Chinese sentences to translate:
+      ${elementsList}
 
-        The user has completed Step 3 (Drafting) and has established a robust Chinese argumentation chain.
-        We have broken down this chain sentence-by-sentence.
-        
-        YOUR TASK:
-        You MUST generate exactly ${inputElements.length} sentence-level expression exercises (tasks) in the output.
-        Each task corresponds directly and sequentially to one of the target Chinese sentences provided below.
-        
-        Here are the target Chinese sentences to translate:
-        ${elementsList}
+      CRITICAL RULES:
+      1. For each task, set the "id" to the respective "Task ID" provided.
+      2. Set the "concept" to the EXACT "Target Chinese Sentence" text provided in the input. Do NOT change any character and do NOT output English in "concept".
+      3. For each task, provide exactly 3 different prompts. Each prompt teaches ONE structural dimension only:
+         - Prompt 1: subject-verb / clause skeleton (where the main subject and predicate go)
+         - Prompt 2: modifier placement (adverbials, prepositional phrases, non-finite clauses)
+         - Prompt 3: logical connector (cause/result/contrast linking)
+      4. ANTI-SPOILER RULE (MUST OBEY):
+         - The English side MUST use ONLY "..." as placeholders. NEVER use square brackets like [Online learning] or [convenience].
+         - NEVER fill in nouns, verbs, or adjectives from the Chinese concept on the English side.
+         - Do NOT output a near-complete English translation. The student must supply all content words.
+         BAD: "[Online learning] is characterized by [its high level of convenience], thereby catering to the needs of [diverse demographic groups]"
+         BAD: "Online learning is characterized by convenience -> ..."
+         GOOD: "... is characterized by ..., thereby catering to the needs of ... -> 主语放论述对象；characterized by 后接抽象名词短语；thereby 引出结果"
+         GOOD: "It is widely acknowledged that... -> 形式主语 It 引出客观陈述，主语从句放真正主语"
+      5. Each prompt MUST strictly follow this single-line format:
+         "English academic pattern with ... only -> Chinese explanation of structure (主谓/修饰/连接，不要写具体译词)"
 
-        CRITICAL RULES:
-        1. For each task, set the "id" to the respective "Task ID" provided (e.g. "sp0-claim").
-        2. Set the "concept" of the task to the EXACT "Target Chinese Sentence" text provided in the input. Do NOT change a single character of the Chinese text, and do NOT provide any English text in the "concept" field. This is critical because the student is practicing translating this exact Chinese sentence into English!
-        3. For each task, you MUST provide a set of exactly 3 different high-scoring, abstract academic English patterns/prompts (prompts) to help the student construct their sentence.
-        4. CRITICAL ANTI-SPOILER RULE (MUST OBEY): The English patterns/prompts MUST be abstract, key academic structures/templates (e.g., "The unique value of... lies in...", "It is widely acknowledged that...", "... is/are irreplaceable in terms of...") rather than highly specific, context-filled sentences. You are STRICTLY FORBIDDEN from including the actual translated nouns, verbs, or specific vocabulary from the user's Chinese sentence inside the English pattern itself! If you write the full specific sentence, the student has nothing left to translate, which ruins the learning effect. Keep the pattern 100% abstract, general, and filled with ellipsis ("...") or generic placeholders!
-        5. To help the student understand how the English structures map to their target Chinese sentence, each prompt MUST strictly follow this format:
-           "English academic pattern/starter -> Chinese mapping explanation (Explain how to use the structure, what it corresponds to in Chinese, and how to build the sentence around it)"
-           
-           Example formatting (Abstract patterns with ellipsis, NO specific translation leaks!):
-           - "The unique value of... lies in... -> ...的独特价值在于...：'The unique value of... lies in...' 对应 '...的独特价值在于...'，'lies in' 后面接具体名词/动名词短语表达独特价值所处的方面"
-           - "It is widely acknowledged that... -> 人们普遍认为...：形式主语 'It' 引导主语从句，用于引出大众共识或客观常理，使论述更客观正式"
-           - "... is/are irreplaceable in terms of... -> ...在...方面是不可替代的：'... is irreplaceable' 对应 '具有不可替代的作用'，'in terms of...' 引入具体限定维度"
-           - "... provides... with... -> ...为...提供...：'provide sb. with sth.' 对应 '为...提供'，以此构建核心主谓宾结构，后续可接分词短语"
-
-        Format output as JSON:
-        {
-          "tasks": [
-            {
-              "id": "string (the matching Task ID)",
-              "concept": "string (the EXACT matching Target Chinese Sentence)",
-              "prompts": ["string (pattern 1 with -> explanation)", "string (pattern 2 with -> explanation)", "string (pattern 3 with -> explanation)"]
-            }
-          ]
-        }
-        `;
-      } else {
-        prompt = `
-        You are an expert IELTS Lexical Resource Tutor.
-        For this IELTS topic: "${question}"
-        Chosen position/thesis: "${selectedThesis || ""}"
-
-        The user has not provided fully segmented Chinese drafting elements from the previous step.
-        Generate exactly 3 "Sentence-Level Expression Exercises" (逐句写作练习) based on the topic and thesis that train students on precision, grammar, and formal academic collocations.
-        
-        CRITICAL RULES:
-        1. The target idea ("concept") MUST be written STRICTLY and ONLY in Chinese.
-        2. Do NOT provide English sentences in the "concept" field under any circumstances. It must be written entirely in Chinese so that the user can practice converting this Chinese semantic goal into an elegant English sentence.
-        3. For each exercise task, you MUST provide a set of exactly 3 different high-scoring academic patterns/prompts (prompts).
-        4. CRITICAL ANTI-SPOILER RULE (MUST OBEY): The English patterns/prompts MUST be abstract, key academic structures/templates (e.g., "The unique value of... lies in...", "It is widely acknowledged that...", "... is/are irreplaceable in terms of...") rather than highly specific, context-filled sentences. You are STRICTLY FORBIDDEN from including the actual translated nouns, verbs, or specific vocabulary from the user's Chinese sentence inside the English pattern itself! If you write the full specific sentence, the student has nothing left to translate, which ruins the learning effect. Keep the pattern 100% abstract, general, and filled with ellipsis ("...") or generic placeholders!
-        5. To help the student understand how the English structures map to the Chinese semantic goals, each prompt MUST strictly follow this format:
-           "English academic pattern/starter -> Chinese mapping explanation (Explain how to use the structure, what it corresponds to in Chinese, and how to build the sentence around it)"
-           
-           Example formatting (Abstract patterns with ellipsis, NO specific translation leaks!):
-           - "The unique value of... lies in... -> ...的独特价值在于...：'The unique value of... lies in...' 对应 '...的独特价值在于...'，'lies in' 后面接具体名词/动名词短语表达独特价值所处的方面"
-           - "It is widely acknowledged that... -> 人们普遍认为...：形式主语 'It' 引导主语从句，用于引出大众共识或客观常理，使论述更客观正式"
-           - "... is/are irreplaceable in terms of... -> ...在...方面是不可替代的：'... is irreplaceable' 对应 '具有不可替代的作用'，'in terms of...' 引入具体限定维度"
-           - "... provides... with... -> ...为...提供...：'provide sb. with sth.' 对应 '为...提供'，以此构建核心主谓宾 structure，后续可接分词短语"
-
-        Format output as JSON:
-        {
-          "tasks": [
-            {
-              "id": "string (e.g. st1, st2, st3)",
-              "concept": "string (strictly Chinese conceptual target idea)",
-              "prompts": ["string (pattern 1 with -> explanation)", "string (pattern 2 with -> explanation)", "string (pattern 3 with -> explanation)"]
-            }
-          ]
-        }
-        `;
+      Format output as JSON:
+      {
+        "tasks": [
+          {
+            "id": "string (matching Task ID)",
+            "concept": "string (EXACT matching Target Chinese Sentence)",
+            "prompts": ["string", "string", "string"]
+          }
+        ]
       }
+      `;
 
       const response = await generateContentWithFallback({
         contents: prompt,
         config: {
           systemInstruction:
-            "You are an expert IELTS Lexical Resource Tutor. All output properties called 'concept' MUST be written strictly and entirely in Chinese. Under no circumstances should you output an English sentence in the 'concept' property. Always translate any English core ideas into natural academic Chinese for the 'concept' property.",
+            "You are an expert IELTS Lexical Resource Tutor. All output properties called 'concept' MUST be written strictly and entirely in Chinese. For 'prompts', English patterns must use ONLY '...' placeholders—never square brackets, never filled-in content words from the concept. Each prompt must contain '->' followed by Chinese structural guidance (主谓/修饰/连接).",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -3164,45 +3312,91 @@ Student says:
         },
       });
 
-      const data = parseAIResponse(response.text);
+      const llmData = parseAIResponse(response.text);
+      const llmTasks = Array.isArray(llmData?.tasks) ? llmData.tasks : [];
 
-      // Safety Fallback: If any task has a concept with no Chinese characters, translate it to Chinese immediately
-      if (data && Array.isArray(data.tasks)) {
-        for (const task of data.tasks) {
-          const hasChinese = /[\u4e00-\u9fa5]/.test(task.concept || "");
-          if (!hasChinese && task.concept) {
-            console.log(
-              "[Safety Fallback] Concept has no Chinese characters. Translating: " +
-                task.concept,
-            );
-            try {
-              const translationResponse = await generateContentWithFallback({
-                contents: `You are a professional English-to-Chinese translator specializing in IELTS academic writing. Translate this English IELTS essay sentence into natural, fluent, and formal academic Chinese. 
+      const DEFAULT_PROMPTS = [
+        "... is characterized by ... -> 主谓框架：主语位置放核心论述对象，系表结构 + by 后接抽象名词短语表达特征",
+        "..., thereby ... / ..., which ... -> 修饰与扩展：逗号后用 thereby/which 等非谓语或从句补充结果，注意修饰成分挂靠位置",
+        "This is largely because ... / As a result, ... -> 逻辑连接：用因果或结果连接词组织句间逻辑，避免按中文语序硬译",
+      ];
 
-Do NOT output any explanations, introduction, markdown tags, or English. Output ONLY the clean Chinese translation itself.
+      const isValidPromptLine = (line: string): boolean => {
+        const trimmed = normalizeText(line);
+        if (!trimmed) return false;
+        if (!trimmed.includes("->")) return false;
+        if (!trimmed.includes("...")) return false;
+        if (/\[[^\]]+\]/.test(trimmed)) return false;
 
-Sentence: "${task.concept}"`,
-              });
-              if (translationResponse?.text) {
-                const cleanTranslation = translationResponse.text.trim();
-                if (
-                  cleanTranslation &&
-                  /[\u4e00-\u9fa5]/.test(cleanTranslation)
-                ) {
-                  task.concept = cleanTranslation;
-                }
-              }
-            } catch (translateErr) {
-              console.error(
-                "Failed to translate fallback concept:",
-                translateErr,
-              );
-            }
-          }
+        const englishPart = trimmed.split("->")[0]?.trim() || "";
+        const englishWords = englishPart
+          .replace(/\.\.\./g, " ")
+          .split(/\s+/)
+          .map((w) => w.replace(/[^a-zA-Z'-]/g, ""))
+          .filter((w) => w.length > 2);
+        // Reject near-complete sentences: too many content words outside placeholders
+        if (englishWords.length > 10) return false;
+
+        return true;
+      };
+
+      const sanitizePrompts = (rawPrompts: string[]): string[] => {
+        const valid = rawPrompts.filter(isValidPromptLine);
+        const result = [...valid];
+        for (let i = 0; result.length < 3; i += 1) {
+          result.push(DEFAULT_PROMPTS[i % DEFAULT_PROMPTS.length]);
         }
-      }
+        return result.slice(0, 3);
+      };
 
-      res.json(data);
+      const promptsById = new Map<string, string[]>();
+      llmTasks.forEach((task: any, index: number) => {
+        const id = normalizeText(task?.id);
+        const prompts = Array.isArray(task?.prompts)
+          ? task.prompts.map((p: unknown) => normalizeText(p)).filter(Boolean)
+          : [];
+        if (id && prompts.length > 0) {
+          promptsById.set(id, prompts);
+        }
+        if (prompts.length > 0 && !promptsById.has(`__index_${index}`)) {
+          promptsById.set(`__index_${index}`, prompts);
+        }
+      });
+
+      const mergedTasks = inputElements.map((el, index) => {
+        const matchedPrompts =
+          promptsById.get(el.id) ||
+          promptsById.get(`__index_${index}`) ||
+          [];
+        const prompts = sanitizePrompts(matchedPrompts);
+
+        return {
+          id: el.id,
+          concept: el.chineseText,
+          section: inferSection(el.id),
+          prompts,
+          confirmed: false,
+          confirmedSentence: "",
+        };
+      });
+
+      const rejectedPromptCount = llmTasks.reduce((count: number, task: any) => {
+        const raw = Array.isArray(task?.prompts) ? task.prompts : [];
+        const valid = raw.filter((p: unknown) => isValidPromptLine(normalizeText(p)));
+        return count + Math.max(0, raw.length - valid.length);
+      }, 0);
+
+      console.log("[generate-sentence-tasks]", {
+        subpointsCount: allSubpoints.length,
+        body1SentenceCount: body1Sentences.length,
+        body2SentenceCount: body2Sentences.length,
+        inputElementIds: inputElements.map((el) => el.id),
+        mergedTaskIds: mergedTasks.map((task) => `${task.id}:${task.section}`),
+        llmTaskCount: llmTasks.length,
+        rejectedPromptCount,
+      });
+
+      res.json({ tasks: mergedTasks });
     } catch (error: any) {
       console.error("Error in /api/generate-sentence-tasks:", error);
       res
@@ -3280,118 +3474,6 @@ Sentence: "${task.concept}"`,
       res
         .status(500)
         .json({ error: error.message || "Failed to evaluate sentence" });
-    }
-  });
-
-  // 11. API - Step 5 Overall Feedback
-  app.post("/api/overall-feedback", async (req, res) => {
-    try {
-      const { question, thesis, paragraphDraft, sentenceDrafts } = req.body;
-      if (!paragraphDraft) {
-        res.status(400).json({ error: "Missing paragraph draft" });
-        return;
-      }
-
-      const ai = getAI();
-      const sentenceDraftsStr = sentenceDrafts
-        ? JSON.stringify(sentenceDrafts)
-        : "None";
-      const prompt = `
-        You are a Chief IELTS Writing Examiner.
-        Provide a comprehensive assessment of the user's completed writing outputs.
-
-        Inputs:
-        - IELTS Topic Question: "${question}"
-        - Induced Thesis/Stance: "${thesis}"
-        - Main Body Paragraph Draft: "${paragraphDraft}"
-        - Supporting sentence tasks completed: ${sentenceDraftsStr}
-
-        Evaluate the logic, vocabulary, grammar, and task completion of the body paragraph and overall work.
-        Estimate IELTS Band Scores (1.0 - 9.0) for:
-        - Overall Band Score
-        - Task Achievement (TA)
-        - Coherence & Cohesion (CC)
-        - Lexical Resource (LR)
-        - Grammatical Range & Accuracy (GRA)
-
-        Structure Feedback to include:
-        1. "Structure Diagnosis" (highlighting which parts of the claim-reason-mechanism logic worked, or what got lost).
-        2. "Logic Critique" (evaluating argument strength, assumptions, gaps).
-        3. "Detailed Feedback" (comprehensive tutoring explanation).
-        4. "Revisions": A list of 2 specific Before/After sentence optimizations with deep logical explanations.
-
-        Format output as a JSON object:
-        {
-          "bandScore": number (overall estimated band, e.g. 7.0),
-          "taScore": number (TA band, e.g. 7.5),
-          "ccScore": number (CC band, e.g. 6.5),
-          "lrScore": number (LR band, e.g. 7.0),
-          "graScore": number (GRA band, e.g. 7.0),
-          "structureDiagnosis": "string",
-          "logicCritique": "string",
-          "detailedFeedback": "string",
-          "revisions": [
-            {
-              "before": "string (the user's draft sentence)",
-              "after": "string (the polished exam-ready version)",
-              "explanation": "string (why the rewrite achieves a higher band)"
-            }
-          ]
-        }
-      `;
-
-      const response = await generateContentWithFallback({
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              bandScore: { type: Type.NUMBER },
-              taScore: { type: Type.NUMBER },
-              ccScore: { type: Type.NUMBER },
-              lrScore: { type: Type.NUMBER },
-              graScore: { type: Type.NUMBER },
-              structureDiagnosis: { type: Type.STRING },
-              logicCritique: { type: Type.STRING },
-              detailedFeedback: { type: Type.STRING },
-              revisions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    before: { type: Type.STRING },
-                    after: { type: Type.STRING },
-                    explanation: { type: Type.STRING },
-                  },
-                  required: ["before", "after", "explanation"],
-                },
-              },
-            },
-            required: [
-              "bandScore",
-              "taScore",
-              "ccScore",
-              "lrScore",
-              "graScore",
-              "structureDiagnosis",
-              "logicCritique",
-              "detailedFeedback",
-              "revisions",
-            ],
-          },
-        },
-      });
-
-      const data = parseAIResponse(response.text);
-      res.json(data);
-    } catch (error: any) {
-      console.error("Error in /api/overall-feedback:", error);
-      res
-        .status(500)
-        .json({
-          error: error.message || "Failed to generate overall feedback",
-        });
     }
   });
 

@@ -67,6 +67,20 @@ const cases = [
     printFull: true,
   },
   {
+    name: "Symmetric Two-Benefit Claim (allow dual major)",
+    question:
+      "Some people believe that online learning is highly beneficial and should replace traditional classroom education entirely. To what extent do you agree or disagree?",
+    userMessage:
+      "我想论证这个分论点：线上学习既能打破地理限制帮助偏远地区学生，也能给在职人员提供灵活学习时间。",
+    subpointContent:
+      "线上学习既能打破地理限制帮助偏远地区学生，也能给在职人员提供灵活学习时间。",
+    expectMultiPoint: true,
+    expectedAllowDualMajor: true,
+    expectedPointKeywords: ["偏远", "在职"],
+    expectedBridgeLanguage: true,
+    printFull: true,
+  },
+  {
     name: "Concession (Discuss Both Views)",
     question:
       "With the rapid development of Artificial Intelligence (AI), some think it will bring more benefits to workers, while others fear it will cause widespread unemployment. Discuss both views and give your opinion.",
@@ -190,12 +204,44 @@ async function runCase(c) {
   if (c.expectMultiPoint) {
     const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
     const haystack = JSON.stringify(plan || {});
-    const hasSupervision = haystack.includes("监管");
-    const hasPeer = haystack.includes("同伴") || haystack.includes("社交");
-    const pass = blocks.length >= 2 && hasSupervision && hasPeer;
+    const keywordChecks =
+      Array.isArray(c.expectedPointKeywords) && c.expectedPointKeywords.length > 0
+        ? c.expectedPointKeywords.map((kw) => ({
+            kw,
+            hit: haystack.includes(kw),
+          }))
+        : [
+            { kw: "监管", hit: haystack.includes("监管") },
+            { kw: "同伴/社交", hit: haystack.includes("同伴") || haystack.includes("社交") },
+          ];
+    const pass =
+      blocks.length >= 2 && keywordChecks.every((item) => item.hit);
     console.log(
       `  -> MULTI-POINT ASSERTION: ${pass ? "PASS" : "FAIL"} ` +
-        `(pointBlocks=${blocks.length}, 监管=${hasSupervision}, 同伴/社交=${hasPeer})`,
+        `(pointBlocks=${blocks.length}, ${keywordChecks
+          .map((item) => `${item.kw}=${item.hit}`)
+          .join(", ")})`,
+    );
+  }
+  if (c.expectedAllowDualMajor) {
+    const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+    const majorCount = blocks.filter((b) => b?.role === "major").length;
+    const dualMajorPass = blocks.length >= 2 && majorCount >= 2;
+    console.log(
+      `  -> DUAL-MAJOR ALLOWED ASSERTION: ${
+        dualMajorPass ? "PASS" : "FAIL"
+      } (pointBlocks=${blocks.length}, majorCount=${majorCount})`,
+    );
+
+    const point2Text = JSON.stringify(blocks[1] || {});
+    const hasBridgeLanguage =
+      /同时|也|此外|另外|同样|并且|而且|这也|另一方面|在职|工作/.test(
+        point2Text,
+      );
+    console.log(
+      `  -> POINT2 COHERENCE BRIDGE ASSERTION: ${
+        hasBridgeLanguage ? "PASS" : "FAIL"
+      }`,
     );
   }
 }

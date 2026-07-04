@@ -6,7 +6,6 @@ import Step1Analysis from './components/Step1Analysis';
 import Step2Brainstorm from './components/Step2Brainstorm';
 import Step3Drafting from './components/Step3Drafting';
 import Step4SentencePractice from './components/Step4SentencePractice';
-import Step5Feedback from './components/Step5Feedback';
 import { Topic, PracticeSession } from './types';
 
 export default function App() {
@@ -67,7 +66,6 @@ export default function App() {
       step2: { dimensions: [], seeds: [], bundles: [], thesisOptions: [], isCompleted: false },
       step3: { userDraft: '', subpoints: [], isCompleted: false },
       step4: { tasks: [], isCompleted: false },
-      step5: { isCompleted: false },
       createdAt: new Date().toISOString(),
     };
     setActiveTopic(topic);
@@ -93,7 +91,7 @@ export default function App() {
 
   const handleNextStep = () => {
     if (!session) return;
-    const next = Math.min(session.currentStep + 1, 5);
+    const next = Math.min(session.currentStep + 1, 4);
     handleSetStep(next);
   };
 
@@ -126,11 +124,6 @@ export default function App() {
         setAutoRedirectedSteps(prev => [...prev, 3]);
         handleSetStep(4);
       }, 2500);
-    } else if (currentStep === 4 && session.step4.isCompleted && !autoRedirectedSteps.includes(4)) {
-      timer = setTimeout(() => {
-        setAutoRedirectedSteps(prev => [...prev, 4]);
-        handleSetStep(5);
-      }, 5500);
     }
 
     return () => {
@@ -208,14 +201,6 @@ export default function App() {
                   session={session}
                   onUpdateSession={handleUpdateSession}
                   onNextStep={handleNextStep}
-                />
-              )}
-              {session.currentStep === 5 && (
-                <Step5Feedback
-                  topic={activeTopic}
-                  session={session}
-                  onUpdateSession={handleUpdateSession}
-                  onRestart={handleResetSession}
                 />
               )}
             </motion.div>

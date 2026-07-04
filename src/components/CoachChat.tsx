@@ -6,7 +6,7 @@ import { Topic, PracticeSession, ChatMessage } from '../types';
 interface CoachChatProps {
   topic: Topic;
   step: number;
-  stepKey: 'step1' | 'step2' | 'step3' | 'step4' | 'step5';
+  stepKey: 'step1' | 'step2' | 'step3' | 'step4';
   session: PracticeSession;
   onUpdateSession: (updates: Partial<PracticeSession>) => void;
   stepContext: any;
@@ -36,9 +36,65 @@ export default function CoachChat({
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const kickoffRef = useRef<string | null>(null);
+  const migratedLegacyStep3HistoryRef = useRef(false);
 
   // Get current step's chat history or initialize it
-  const chatHistory = session[stepKey]?.chatHistory || [];
+  const activeStep3SubpointId =
+    stepKey === 'step3' ? session.step3?.activeSubpointId : undefined;
+  const activeStep3Subpoint =
+    stepKey === 'step3'
+      ? session.step3?.subpoints?.find((sp) => sp.id === activeStep3SubpointId)
+      : undefined;
+  const chatHistory =
+    stepKey === 'step3'
+      ? activeStep3Subpoint?.chatHistory || []
+      : session[stepKey]?.chatHistory || [];
+
+  useEffect(() => {
+    if (stepKey !== 'step3') return;
+    if (migratedLegacyStep3HistoryRef.current) return;
+
+    const legacyHistory = Array.isArray(session.step3?.chatHistory)
+      ? session.step3.chatHistory
+      : [];
+    if (legacyHistory.length === 0) {
+      migratedLegacyStep3HistoryRef.current = true;
+      return;
+    }
+
+    const activeId = session.step3?.activeSubpointId;
+    const subpoints = Array.isArray(session.step3?.subpoints)
+      ? session.step3.subpoints
+      : [];
+    if (!activeId || subpoints.length === 0) return;
+
+    const activeSubpoint = subpoints.find((sp) => sp.id === activeId);
+    if (
+      activeSubpoint &&
+      Array.isArray(activeSubpoint.chatHistory) &&
+      activeSubpoint.chatHistory.length > 0
+    ) {
+      migratedLegacyStep3HistoryRef.current = true;
+      return;
+    }
+
+    const migratedSubpoints = subpoints.map((sp) =>
+      sp.id === activeId ? { ...sp, chatHistory: legacyHistory } : sp,
+    );
+
+    onUpdateSession({
+      step3: {
+        ...session.step3,
+        subpoints: migratedSubpoints,
+        chatHistory: [],
+      },
+    });
+    migratedLegacyStep3HistoryRef.current = true;
+  }, [
+    onUpdateSession,
+    session.step3,
+    stepKey,
+  ]);
 
   useEffect(() => {
     setShowResetConfirm(false); // Reset confirmation state on step change
@@ -154,9 +210,34 @@ export default function CoachChat({
     return parts.join('\n\n');
   };
 
+  // A subpoint's logic chain only counts as "complete" once every planned
+  // step actually carries a value. This is the client-side guard that stops
+  // the model from prematurely unlocking Step 4 (or auto-advancing the tab)
+  // while the paragraphPlan still has empty steps.
+  const isParagraphPlanFilled = (plan: any) => {
+    if (!plan || !Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) {
+      return false;
+    }
+    return plan.pointBlocks.every(
+      (block: any) =>
+        Array.isArray(block?.steps) &&
+        block.steps.length > 0 &&
+        block.steps.every((step: any) => step && String(step.value || '').trim()),
+    );
+  };
+
+  const isSubpointLogicComplete = (sp: any) => {
+    if (!sp) return false;
+    if (sp.paragraphPlan) return isParagraphPlanFilled(sp.paragraphPlan);
+    if (Array.isArray(sp.structureSteps) && sp.structureSteps.length > 0) {
+      return sp.structureSteps.every((step: any) => String(step?.value || '').trim());
+    }
+    return false;
+  };
+
   const sendUserMessage = async (
     textToSend: string,
-    options?: { hiddenUserMessage?: boolean },
+    options?: { hiddenUserMessage?: boolean; targetSubpointId?: string },
   ) => {
     if (!textToSend.trim() || loading) return;
 
@@ -170,6 +251,14 @@ export default function CoachChat({
     };
 
     const hiddenUserMessage = !!options?.hiddenUserMessage;
+    const activeSubpointIdAtSend =
+      stepKey === 'step3'
+        ? options?.targetSubpointId || session.step3?.activeSubpointId
+        : undefined;
+    if (stepKey === 'step3' && !activeSubpointIdAtSend) {
+      setErrorMsg('请先选择一个主体段落，再继续对话。');
+      return;
+    }
     const promptHistory = [...chatHistory, newUserMessage];
     const updatedHistory = hiddenUserMessage
       ? [...chatHistory]
@@ -177,17 +266,42 @@ export default function CoachChat({
 
     // Optimistically update UI (skip the synthetic kickoff user bubble)
     if (!hiddenUserMessage) {
-      onUpdateSession({
-        [stepKey]: {
-          ...session[stepKey],
-          chatHistory: updatedHistory,
-        },
-      });
+      if (stepKey === 'step3' && activeSubpointIdAtSend) {
+        const nextSubpoints = (session.step3.subpoints || []).map((sp: any) =>
+          sp.id === activeSubpointIdAtSend
+            ? { ...sp, chatHistory: updatedHistory }
+            : sp,
+        );
+        onUpdateSession({
+          step3: {
+            ...session.step3,
+            subpoints: nextSubpoints,
+          },
+        });
+      } else {
+        onUpdateSession({
+          [stepKey]: {
+            ...session[stepKey],
+            chatHistory: updatedHistory,
+          },
+        });
+      }
     }
 
     setLoading(true);
 
     try {
+      const sessionForRequest =
+        stepKey === 'step3' && activeSubpointIdAtSend
+          ? {
+              ...session,
+              step3: {
+                ...session.step3,
+                activeSubpointId: activeSubpointIdAtSend,
+              },
+            }
+          : session;
+
       const res = await fetch('/api/coach/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -196,7 +310,7 @@ export default function CoachChat({
           step,
           messages: promptHistory,
           stepContext,
-          session,
+          session: sessionForRequest,
           userMessage: textToSend.trim(),
         }),
       });
@@ -298,7 +412,7 @@ export default function CoachChat({
         if (stepKey === 'step3') {
           const currentStep3 = sessionUpdates.step3 || session.step3;
           const currentSubpoints = currentStep3.subpoints || [];
-          const activeId = currentStep3.activeSubpointId || session.step3?.activeSubpointId;
+          const activeId = activeSubpointIdAtSend || currentStep3.activeSubpointId || session.step3?.activeSubpointId;
           
           const updatedSubpoints = currentSubpoints.map((sp: any) => {
             if (sp.id === activeId) {
@@ -327,9 +441,6 @@ export default function CoachChat({
               if (data.progressUpdate.step3SubpointResult) {
                 updatedSp.result = data.progressUpdate.step3SubpointResult;
               }
-              if (data.progressUpdate.step3SubpointCompleted !== undefined) {
-                updatedSp.isCompleted = data.progressUpdate.step3SubpointCompleted;
-              }
               if (data.progressUpdate.paragraphPlan) {
                 updatedSp.paragraphPlan = mergeParagraphPlan(
                   updatedSp.paragraphPlan,
@@ -357,6 +468,14 @@ export default function CoachChat({
               }
               if (data.progressUpdate.step3SubpointSufficiencyCheck) {
                 updatedSp.sufficiencyCheck = data.progressUpdate.step3SubpointSufficiencyCheck;
+              }
+              // Completion gate: only honor the model's "completed" flag once the
+              // logic chain is actually filled in. This runs AFTER paragraphPlan /
+              // structureSteps merges so it inspects the merged state.
+              if (data.progressUpdate.step3SubpointCompleted === true) {
+                updatedSp.isCompleted = isSubpointLogicComplete(updatedSp);
+              } else if (data.progressUpdate.step3SubpointCompleted === false) {
+                updatedSp.isCompleted = false;
               }
               return updatedSp;
             }
@@ -399,23 +518,61 @@ export default function CoachChat({
             sp.id === activeId ? { ...sp, draft: subpointDraft } : sp
           );
 
-          // If all subpoints are completed, we can also auto-complete Step 3!
+          // If all subpoints are completed, we can also auto-complete Step 3.
+          // Note: per-subpoint isCompleted is now gated on the logic chain being
+          // actually filled, so this cannot flip true while steps are empty.
           const allSubpointsDone = finalSubpoints.length > 0 && finalSubpoints.every((sp: any) => sp.isCompleted);
+
+          // Plan A auto-advance: when the CURRENT body just became complete and
+          // another body still needs work, move the active tab to the next
+          // incomplete body so its (empty) chat auto-fires a fresh kickoff. The
+          // completed body keeps its own chatHistory/paragraphPlan intact.
+          let nextActiveSubpointId = currentStep3.activeSubpointId || activeId;
+          const activeJustCompleted = finalSubpoints.find(
+            (sp: any) => sp.id === activeId,
+          )?.isCompleted;
+          if (activeJustCompleted && !allSubpointsDone) {
+            const nextIncomplete = finalSubpoints.find((sp: any) => !sp.isCompleted);
+            if (nextIncomplete) {
+              nextActiveSubpointId = nextIncomplete.id;
+            }
+          }
 
           sessionUpdates = {
             ...sessionUpdates,
             step3: {
               ...currentStep3,
               subpoints: finalSubpoints,
-              isCompleted: allSubpointsDone || currentStep3.isCompleted
+              activeSubpointId: nextActiveSubpointId,
+              // Only complete the whole step when EVERY body is genuinely done.
+              // Do not trust a stray model isCompleted:true mid-flow.
+              isCompleted: allSubpointsDone
             }
           };
         }
       }
 
+      const finalHistory = [...updatedHistory, newAiMessage];
+      if (stepKey === 'step3' && activeSubpointIdAtSend) {
+        const step3State = sessionUpdates.step3 || session.step3;
+        const nextSubpoints = (step3State.subpoints || []).map((sp: any) =>
+          sp.id === activeSubpointIdAtSend
+            ? { ...sp, chatHistory: finalHistory }
+            : sp,
+        );
+        onUpdateSession({
+          ...sessionUpdates,
+          step3: {
+            ...step3State,
+            subpoints: nextSubpoints,
+          },
+        });
+        return;
+      }
+
       const nextStepKeyUpdate = {
         ...(sessionUpdates[stepKey] || session[stepKey]),
-        chatHistory: [...updatedHistory, newAiMessage],
+        chatHistory: finalHistory,
       };
 
       onUpdateSession({
@@ -473,6 +630,24 @@ export default function CoachChat({
           },
         ];
 
+    if (stepKey === 'step3') {
+      const activeId = session.step3?.activeSubpointId;
+      const resetSubpoints = (session.step3?.subpoints || []).map((sp: any) =>
+        sp.id === activeId ? { ...sp, chatHistory: initialHistory } : sp,
+      );
+      onUpdateSession({
+        step3: {
+          ...session.step3,
+          subpoints: resetSubpoints,
+        },
+      });
+      kickoffRef.current = null;
+      setErrorMsg('');
+      setInputText('');
+      setShowResetConfirm(false);
+      return;
+    }
+
     const updatedStepState: any = {
       ...session[stepKey],
       chatHistory: initialHistory,
@@ -486,8 +661,6 @@ export default function CoachChat({
       updatedStepState.userStance = '';
       updatedStepState.userPoints = '';
       updatedStepState.selectedThesis = '';
-    } else if (stepKey === 'step3') {
-      updatedStepState.userDraft = '';
     }
 
     onUpdateSession({
@@ -601,7 +774,9 @@ export default function CoachChat({
                                   subpoints: stepContext.subpoints,
                                 },
                               });
-                              sendUserMessage(`我想先论证这个分论点：${sp.content}`);
+                              sendUserMessage(`我想先论证这个分论点：${sp.content}`, {
+                                targetSubpointId: sp.id,
+                              });
                             }}
                             className={`block w-full text-left p-3 rounded-lg text-xs border shadow-sm transition cursor-pointer animate-fade-in ${
                               session?.step3?.activeSubpointId === sp.id

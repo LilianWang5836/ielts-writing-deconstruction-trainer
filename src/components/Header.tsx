@@ -15,7 +15,6 @@ const STEPS = [
   { num: 2, label: '观点生成', desc: 'Brainstorm & Thesis' },
   { num: 3, label: '论证拆解', desc: 'Structure & Draft' },
   { num: 4, label: '逐句写作', desc: 'Express & Collocate' },
-  { num: 5, label: 'AI反馈', desc: 'Evaluate & Review' },
 ];
 
 export default function Header({
@@ -85,7 +84,7 @@ export default function Header({
       {/* Progress Steps bar */}
       {activeTopic && (
         <div className="mx-auto mt-4 max-w-7xl">
-          <div className="grid grid-cols-5 gap-2">
+          <div className="grid grid-cols-4 gap-2">
             {STEPS.map((step) => {
               const isActive = currentStep === step.num;
               const isCompleted = currentStep > step.num;

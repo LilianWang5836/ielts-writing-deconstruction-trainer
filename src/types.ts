@@ -99,30 +99,17 @@ export interface ArgumentationFeedback {
 export interface SentencePracticeTask {
   id: string;
   concept: string; // e.g. "Students have the flexibility to manage their study schedules"
+  section: 'intro' | 'body1' | 'body2' | 'conclusion';
   prompts: string[]; // Lexical cues: "have the flexibility to...", "manage study schedules"
   userDraft?: string;
+  confirmedSentence?: string;
+  confirmed?: boolean;
   aiFeedback?: {
     grammar: string[];
     lexicalResource: string[];
     improved: string;
     score: number; // 1-9 Band
   };
-}
-
-export interface OverallFeedback {
-  bandScore: number;
-  taScore: number; // Task Achievement
-  ccScore: number; // Coherence and Cohesion
-  lrScore: number; // Lexical Resource
-  graScore: number; // Grammatical Accuracy and Range
-  structureDiagnosis: string;
-  logicCritique: string;
-  detailedFeedback: string;
-  revisions: {
-    before: string;
-    after: string;
-    explanation: string;
-  }[];
 }
 
 export interface ChatMessage {
@@ -160,7 +147,7 @@ export interface ParagraphPlan {
 export interface PracticeSession {
   id: string;
   topic: Topic;
-  currentStep: number; // 1 to 5
+  currentStep: number; // 1 to 4
   step1: {
     selectedType?: string;
     userCoreIssue?: string;
@@ -254,6 +241,7 @@ export interface PracticeSession {
       sufficiencyCheck?: { label: string; passed: boolean; desc: string };
       paragraphPlan?: ParagraphPlan;
       structureSteps?: LogicStep[];
+      chatHistory?: ChatMessage[];
     }[];
     activeSubpointId?: string;
     isCompleted: boolean;
@@ -261,11 +249,6 @@ export interface PracticeSession {
   };
   step4: {
     tasks: SentencePracticeTask[];
-    isCompleted: boolean;
-    chatHistory?: ChatMessage[];
-  };
-  step5: {
-    overallFeedback?: OverallFeedback;
     isCompleted: boolean;
     chatHistory?: ChatMessage[];
   };
