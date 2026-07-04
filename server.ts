@@ -3417,30 +3417,48 @@ Rules:
       const ai = getAI();
       const prompt = `
         You are an expert IELTS Writing Tutor.
-        Review the user's sentence draft to identify if there are any grammatical, stylistic, or lexical issues, or to confirm it is fully accurate and natural:
-        User's Draft: "${userDraft}"
+        Analyze the user's sentence and return precise inline annotations for errors.
 
-        Target Idea (Concept) to convey: "${concept}"
+        User's Draft: "${userDraft}"
+        Target Idea (Concept): "${concept}"
         Given lexical prompts: ${JSON.stringify(prompts)}
 
         CRITICAL INSTRUCTIONS:
-        1. Keep the feedback extremely brief, concise, and straight to the point. No fluff or overly long theoretical explanations.
-        2. Directly pinpoint grammatical errors, structural flaws, vocabulary/collocation issues, or confirm correctness in 1-2 brief sentences per point.
-        3. Use Markdown bold tags (**word** or **phrase**) to highlight core terms, errors, or exact suggestions so they are immediately scannable.
-        4. If the sentence is correct and natural, provide a short 1-sentence confirmation (e.g. "**The syntax is correct.** Use of the cleft sentence emphasizes the concept beautifully.").
-        5. Do NOT suggest alternative rewritten sentences. Do NOT offer any alternative sentence versions or "improved" translations.
-        6. Do NOT assign or mention any IELTS band score or grade.
-        
-        Provide:
-        - 1-2 points of very brief and scannable grammar/sentence structure analysis.
-        - 1-2 points of very brief and scannable lexical/vocabulary/style analysis.
+        1. DO NOT rewrite the sentence.
+        2. DO NOT provide an improved or corrected sentence.
+        3. Return only issue annotations that can be highlighted directly on the original sentence.
+        4. For each annotation, "text" MUST be an exact substring copied from the user's draft.
+        5. Explanations MUST be in plain Chinese with beginner-friendly wording (IELTS 5-5.5 level). Avoid heavy grammar jargon.
+        6. If you need to mention the problematic phrase, quote the original English words but explain in Chinese.
+        7. Also evaluate meaning alignment against the Chinese concept:
+           - aligned: core meaning is fully and correctly conveyed.
+           - partial: core direction is right but some key points are missing/weak.
+           - mismatched: major meaning is wrong, opposite, or largely unrelated.
+           IMPORTANT: Allow natural paraphrasing. Do NOT require literal word-by-word translation.
+        8. If the sentence is already natural and correct, return an empty annotations array.
+
+        Allowed categories:
+        - "grammar"
+        - "lexical"
+        - "wordOrder"
+        - "meaning"
 
         Format output as JSON:
         {
-          "grammar": ["string (extremely brief, direct grammatical feedback with **bold** highlights)"],
-          "lexicalResource": ["string (extremely brief, direct lexical feedback with **bold** highlights)"],
-          "improved": "",
-          "score": 0
+          "annotations": [
+            {
+              "text": "string (exact substring from user's draft)",
+              "category": "grammar | lexical | wordOrder | meaning",
+              "explanation": "string (brief explanation of issue and guidance)"
+            }
+          ],
+          "contentAlignment": {
+            "status": "aligned | partial | mismatched",
+            "summary": "string (plain Chinese summary)",
+            "coveredPoints": ["string"],
+            "missingPoints": ["string"],
+            "extraPoints": ["string"]
+          }
         }
       `;
 
@@ -3451,29 +3469,368 @@ Rules:
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              grammar: {
+              annotations: {
                 type: Type.ARRAY,
-                items: { type: Type.STRING },
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    text: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    explanation: { type: Type.STRING },
+                  },
+                  required: ["text", "category", "explanation"],
+                },
               },
-              lexicalResource: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
+              contentAlignment: {
+                type: Type.OBJECT,
+                properties: {
+                  status: { type: Type.STRING },
+                  summary: { type: Type.STRING },
+                  coveredPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                  missingPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                  extraPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                },
+                required: [
+                  "status",
+                  "summary",
+                  "coveredPoints",
+                  "missingPoints",
+                  "extraPoints",
+                ],
               },
-              improved: { type: Type.STRING },
-              score: { type: Type.NUMBER },
             },
-            required: ["grammar", "lexicalResource", "improved", "score"],
+            required: ["annotations", "contentAlignment"],
           },
         },
       });
 
       const data = parseAIResponse(response.text);
-      res.json(data);
+      const rawAnnotations = Array.isArray(data?.annotations)
+        ? data.annotations
+        : [];
+
+      const normalizeCategory = (
+        category: unknown,
+      ): "grammar" | "lexical" | "wordOrder" | "meaning" => {
+        const normalized = String(category || "")
+          .trim()
+          .toLowerCase();
+        if (
+          normalized.includes("meaning") ||
+          normalized.includes("semantic") ||
+          normalized.includes("content")
+        ) {
+          return "meaning";
+        }
+        if (
+          normalized.includes("lex") ||
+          normalized.includes("vocab") ||
+          normalized.includes("word choice")
+        ) {
+          return "lexical";
+        }
+        if (
+          normalized.includes("order") ||
+          normalized.includes("syntax") ||
+          normalized.includes("position")
+        ) {
+          return "wordOrder";
+        }
+        return "grammar";
+      };
+
+      const sanitizedAnnotations = rawAnnotations
+        .map((item: any) => {
+          const text = String(item?.text || "").trim();
+          const explanation = String(item?.explanation || "").trim();
+          if (!text || !explanation) return null;
+          if (!String(userDraft).includes(text)) return null;
+          return {
+            text,
+            category: normalizeCategory(item?.category),
+            explanation,
+          };
+        })
+        .filter(Boolean);
+
+      const rawAlignment = data?.contentAlignment || {};
+      const normalizedStatus = String(rawAlignment?.status || "")
+        .trim()
+        .toLowerCase();
+      const status: "aligned" | "partial" | "mismatched" =
+        normalizedStatus.includes("mismatch") || normalizedStatus.includes("wrong")
+          ? "mismatched"
+          : normalizedStatus.includes("partial") || normalizedStatus.includes("some")
+            ? "partial"
+            : "aligned";
+
+      const normalizeStringList = (value: unknown): string[] =>
+        Array.isArray(value)
+          ? value
+              .map((item) => String(item || "").trim())
+              .filter(Boolean)
+          : [];
+
+      res.json({
+        annotations: sanitizedAnnotations,
+        contentAlignment: {
+          status,
+          summary: String(rawAlignment?.summary || "").trim(),
+          coveredPoints: normalizeStringList(rawAlignment?.coveredPoints),
+          missingPoints: normalizeStringList(rawAlignment?.missingPoints),
+          extraPoints: normalizeStringList(rawAlignment?.extraPoints),
+        },
+      });
     } catch (error: any) {
       console.error("Error in /api/evaluate-sentence-practice:", error);
       res
         .status(500)
         .json({ error: error.message || "Failed to evaluate sentence" });
+    }
+  });
+
+  // 11. API - Inline guidance (selected text or whole sentence)
+  app.post("/api/inline-guidance", async (req, res) => {
+    try {
+      const { scopeText, fullDraft, concept, prompts, intent, questionText } = req.body;
+      const normalizedScopeText = String(scopeText || "").trim();
+      const normalizedFullDraft = String(fullDraft || "").trim();
+      const normalizedIntent = String(intent || "").trim();
+      const normalizedQuestionText = String(questionText || "").trim();
+      if (!normalizedScopeText && !normalizedFullDraft) {
+        // Allow empty draft guidance, but we still need concept context.
+        if (!String(concept || "").trim()) {
+          res.status(400).json({ error: "Missing concept for empty draft guidance" });
+          return;
+        }
+      }
+      if (!String(concept || "").trim()) {
+        res.status(400).json({ error: "Missing concept" });
+        return;
+      }
+
+      const ai = getAI();
+      const prompt = `
+        You are an IELTS writing coach.
+        The student is drafting ONE sentence in Step 4.
+
+        Chinese target concept:
+        "${String(concept || "")}"
+
+        Current full draft sentence:
+        "${normalizedFullDraft}"
+
+        User-selected text scope (can be empty):
+        "${normalizedScopeText}"
+
+        User-selected help intent tag (can be empty):
+        "${normalizedIntent}"
+
+        User free-text question (can be empty):
+        "${normalizedQuestionText}"
+
+        Suggested structural patterns:
+        ${JSON.stringify(Array.isArray(prompts) ? prompts : [])}
+
+        Classify the user's help need into one of:
+        - "vocabulary"
+        - "grammar"
+        - "wordOrder"
+        - "expression"
+
+        Classification rules:
+        - If intent tag is provided, use it as the primary signal:
+          selected_vocabulary/find_word -> vocabulary
+          selected_grammar -> grammar
+          selected_wordOrder -> wordOrder
+          selected_expression/start_sentence -> expression
+        - If selected scope is non-empty, focus diagnosis on that selected fragment first.
+        - If selected scope is empty and full draft exists, do NOT perform full-sentence "check"; focus on the student's stated blocker from intent/question and provide targeted guidance.
+        - If both selected scope and full draft are empty, classify as "expression" and guide how to start this sentence from the concept.
+
+        CRITICAL INSTRUCTIONS:
+        1. For "grammar", "wordOrder", and "expression", give guidance only and do NOT rewrite any part of the sentence.
+        2. Exception for "vocabulary": if the student clearly does not know which word/phrase to use, you MAY suggest 1-3 concrete candidate words or short phrases, with brief Chinese notes about nuance/register/collocation differences.
+        3. Even for "vocabulary", do NOT provide a ready-made full sentence, polished sentence, or full translated answer.
+        4. issue/hint MUST be plain Chinese with learner-friendly wording (IELTS 5-5.5 level), avoid heavy grammar jargon.
+        5. Keep it short and practical.
+
+        Return JSON:
+        {
+          "category": "vocabulary | grammar | wordOrder | expression",
+          "issue": "string (what is problematic now)",
+          "hint": "string (for vocabulary: may include 1-3 candidate words/phrases with brief nuance notes; for other categories: guidance only, no direct rewrite)"
+        }
+      `;
+
+      const response = await generateContentWithFallback({
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              category: { type: Type.STRING },
+              issue: { type: Type.STRING },
+              hint: { type: Type.STRING },
+            },
+            required: ["category", "issue", "hint"],
+          },
+        },
+      });
+
+      const data = parseAIResponse(response.text);
+      const forcedCategoryFromIntent = (() => {
+        const intentLower = normalizedIntent.toLowerCase();
+        if (!intentLower) return null;
+        if (intentLower.includes("vocabulary") || intentLower === "find_word") {
+          return "vocabulary" as const;
+        }
+        if (intentLower.includes("grammar")) {
+          return "grammar" as const;
+        }
+        if (intentLower.includes("wordorder") || intentLower.includes("word_order")) {
+          return "wordOrder" as const;
+        }
+        if (intentLower.includes("expression") || intentLower === "start_sentence") {
+          return "expression" as const;
+        }
+        return null;
+      })();
+      const normalizedCategory = String(data?.category || "")
+        .trim()
+        .toLowerCase();
+      let category: "vocabulary" | "grammar" | "wordOrder" | "expression" = "expression";
+      if (forcedCategoryFromIntent) {
+        category = forcedCategoryFromIntent;
+      } else if (normalizedCategory.includes("vocab") || normalizedCategory.includes("lex")) {
+        category = "vocabulary";
+      } else if (normalizedCategory.includes("order") || normalizedCategory.includes("syntax")) {
+        category = "wordOrder";
+      } else if (normalizedCategory.includes("gram")) {
+        category = "grammar";
+      }
+
+      res.json({
+        category,
+        issue: String(data?.issue || "").trim(),
+        hint: String(data?.hint || "").trim(),
+      });
+    } catch (error: any) {
+      console.error("Error in /api/inline-guidance:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Failed to get inline guidance" });
+    }
+  });
+
+  // 12. API - Match user draft to sentence task
+  app.post("/api/match-sentence-task", async (req, res) => {
+    try {
+      const { userDraft, candidates } = req.body;
+      const normalizedDraft = String(userDraft || "").trim();
+      const normalizedCandidates = Array.isArray(candidates)
+        ? candidates
+            .map((item: any) => ({
+              id: String(item?.id || "").trim(),
+              concept: String(item?.concept || "").trim(),
+            }))
+            .filter((item) => item.id && item.concept)
+        : [];
+
+      if (!normalizedDraft) {
+        res.status(400).json({ error: "Missing userDraft" });
+        return;
+      }
+      if (normalizedCandidates.length === 0) {
+        res.status(400).json({ error: "Missing candidates" });
+        return;
+      }
+      if (normalizedCandidates.length === 1) {
+        res.json({
+          matchedTaskId: normalizedCandidates[0].id,
+          confidence: "high",
+          reason: "只有一个候选句子，直接匹配。",
+        });
+        return;
+      }
+
+      const prompt = `
+        You are matching one English sentence draft to one Chinese target concept.
+        Choose the BEST matching candidate by meaning.
+
+        English draft:
+        "${normalizedDraft}"
+
+        Candidate concepts (JSON):
+        ${JSON.stringify(normalizedCandidates)}
+
+        Rules:
+        1. Return exactly one matchedTaskId from the candidates.
+        2. Use semantic meaning, not literal word overlap.
+        3. Allow paraphrasing; do NOT require word-by-word translation.
+        4. If two candidates are close, still pick one but lower confidence.
+        5. reason MUST be concise plain Chinese.
+
+        Return JSON:
+        {
+          "matchedTaskId": "string",
+          "confidence": "high | medium | low",
+          "reason": "string"
+        }
+      `;
+
+      const response = await generateContentWithFallback({
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              matchedTaskId: { type: Type.STRING },
+              confidence: { type: Type.STRING },
+              reason: { type: Type.STRING },
+            },
+            required: ["matchedTaskId", "confidence", "reason"],
+          },
+        },
+      });
+
+      const data = parseAIResponse(response.text);
+      const candidateIds = new Set(normalizedCandidates.map((item) => item.id));
+      let matchedTaskId = String(data?.matchedTaskId || "").trim();
+      if (!candidateIds.has(matchedTaskId)) {
+        matchedTaskId = normalizedCandidates[0].id;
+      }
+      const normalizedConfidence = String(data?.confidence || "")
+        .trim()
+        .toLowerCase();
+      const confidence: "high" | "medium" | "low" =
+        normalizedConfidence.includes("high")
+          ? "high"
+          : normalizedConfidence.includes("low")
+            ? "low"
+            : "medium";
+
+      res.json({
+        matchedTaskId,
+        confidence,
+        reason: String(data?.reason || "").trim(),
+      });
+    } catch (error: any) {
+      console.error("Error in /api/match-sentence-task:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Failed to match sentence task" });
     }
   });
 

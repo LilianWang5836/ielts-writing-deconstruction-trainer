@@ -104,12 +104,25 @@ export interface SentencePracticeTask {
   userDraft?: string;
   confirmedSentence?: string;
   confirmed?: boolean;
-  aiFeedback?: {
-    grammar: string[];
-    lexicalResource: string[];
-    improved: string;
-    score: number; // 1-9 Band
+  hasBeenChecked?: boolean;
+  contentAlignment?: {
+    status: 'aligned' | 'partial' | 'mismatched';
+    summary: string;
+    coveredPoints: string[];
+    missingPoints: string[];
+    extraPoints: string[];
   };
+  annotations?: {
+    text: string;
+    category: 'grammar' | 'lexical' | 'wordOrder' | 'expression' | 'meaning';
+    explanation: string;
+  }[];
+}
+
+export interface InlineGuidanceResult {
+  category: 'vocabulary' | 'grammar' | 'wordOrder' | 'expression';
+  issue: string;
+  hint: string;
 }
 
 export interface ChatMessage {
