@@ -1,13 +1,15 @@
-import React, { useState } from 'react';
-import { Filter, Sparkles, BookOpen, PlusCircle, ChevronRight, HelpCircle } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Filter, Sparkles, BookOpen, PlusCircle, ChevronRight, HelpCircle, Upload } from 'lucide-react';
 import { Topic } from '../types';
 import { PRESET_TOPICS } from '../topics';
+import { getImportedTopics, normalizeQuestionText } from '../topicStorage';
 
 interface TopicSelectorProps {
   onSelectTopic: (topic: Topic) => void;
+  onOpenImporter?: () => void;
 }
 
-export default function TopicSelector({ onSelectTopic }: TopicSelectorProps) {
+export default function TopicSelector({ onSelectTopic, onOpenImporter }: TopicSelectorProps) {
   // Filters
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [selectedType, setSelectedType] = useState<string>('All');
@@ -22,11 +24,23 @@ export default function TopicSelector({ onSelectTopic }: TopicSelectorProps) {
 
   // Filter Categories
   const categories = ['All', 'Education', 'Technology', 'Environment', 'Government', 'Health', 'Culture', 'Work'];
-  const types = ['All', 'Agree / Disagree', 'Discuss Both Views', 'Advantages / Disadvantages', 'Two-part Question', 'Problem / Solution'];
+  const types = ['All', 'Agree / Disagree', 'Discuss Both Views', 'Advantages / Disadvantages', 'Two-part Question', 'Problem / Solution', 'Positive / Negative', 'Other'];
   const difficulties = ['All', 'Easy', 'Medium', 'Hard'];
 
+  const allTopics = useMemo(() => {
+    const imported = getImportedTopics();
+    const seen = new Set(PRESET_TOPICS.map((t) => normalizeQuestionText(t.question)));
+    const uniqueImported = imported.filter((t) => {
+      const key = normalizeQuestionText(t.question);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return [...PRESET_TOPICS, ...uniqueImported];
+  }, []);
+
   // Filter Topics
-  const filteredTopics = PRESET_TOPICS.filter((t) => {
+  const filteredTopics = allTopics.filter((t) => {
     const matchCat = selectedCategory === 'All' || t.topic === selectedCategory;
     const matchType = selectedType === 'All' || t.questionType === selectedType;
     const matchDiff = selectedDifficulty === 'All' || t.difficulty === selectedDifficulty;
@@ -71,27 +85,38 @@ export default function TopicSelector({ onSelectTopic }: TopicSelectorProps) {
       </div>
 
       {/* Tabs */}
-      <div className="mb-6 flex border-b border-slate-200">
-        <button
-          onClick={() => setIsCustomMode(false)}
-          className={`px-4 py-3 font-sans text-sm font-semibold transition border-b-2 ${
-            !isCustomMode
-              ? 'border-indigo-600 text-indigo-600'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          从经典真题库选择
-        </button>
-        <button
-          onClick={() => setIsCustomMode(true)}
-          className={`px-4 py-3 font-sans text-sm font-semibold transition border-b-2 ${
-            isCustomMode
-              ? 'border-indigo-600 text-indigo-600'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          自定义全新题目
-        </button>
+      <div className="mb-6 flex items-center justify-between gap-3 border-b border-slate-200">
+        <div className="flex">
+          <button
+            onClick={() => setIsCustomMode(false)}
+            className={`px-4 py-3 font-sans text-sm font-semibold transition border-b-2 ${
+              !isCustomMode
+                ? 'border-indigo-600 text-indigo-600'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            从经典真题库选择
+          </button>
+          <button
+            onClick={() => setIsCustomMode(true)}
+            className={`px-4 py-3 font-sans text-sm font-semibold transition border-b-2 ${
+              isCustomMode
+                ? 'border-indigo-600 text-indigo-600'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            自定义全新题目
+          </button>
+        </div>
+        {onOpenImporter && (
+          <button
+            onClick={onOpenImporter}
+            className="mb-[-1px] inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-50 hover:text-indigo-700"
+          >
+            <Upload className="h-3.5 w-3.5" />
+            导入题目
+          </button>
+        )}
       </div>
 
       {!isCustomMode ? (

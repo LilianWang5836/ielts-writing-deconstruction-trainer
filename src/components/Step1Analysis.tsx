@@ -101,7 +101,7 @@ ${topic.question}
 【第一步：审题分析 🔍】
 欢迎！审题是写好雅思作文的第一步。为了彻底拆解这道题，我们一个一个问题来攻克：
 
-👉 **Q1：你认为这道题目属于什么题型？** (例如：Agree or Disagree, Discuss Both Views, Advantages/Disadvantages, Two-part, 还是 Problem/Solution？)`}
+👉 **Q1：你认为这道题目属于什么题型？** (例如：Agree or Disagree, Discuss Both Views, Advantages/Disadvantages, Two-part, Problem/Solution, Positive/Negative, 还是 Other？)`}
         >
           {errorMsg && (
             <div className="bg-rose-50 border border-rose-100 rounded-lg p-3 text-rose-800 text-xs flex items-center gap-2">

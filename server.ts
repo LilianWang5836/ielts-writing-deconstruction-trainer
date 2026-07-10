@@ -100,7 +100,7 @@ function fallbackNextStep(stepNum: number, session: any): string {
       return "先完成题型识别：这道 Task 2 题属于哪一类（如 Agree/Disagree、Discussion、Advantages/Disadvantages）？请直接给出你的判断。";
     }
     if (!eval1.coreIssue) {
-      return "请用一句话说出题目的核心争议：作者真正让你判断的焦点是什么（不要直译题干）？";
+      return "请用一句话说出这道题真正要你完成的写作任务（不要直译或复述背景）？";
     }
     if (!Array.isArray(eval1.constraints) || eval1.constraints.length === 0) {
       return "再补一步：这道题有哪些关键限定词（人群、场景、程度、时间）必须在论证中回应？请列 1-3 个。";
@@ -262,6 +262,142 @@ const STEP1_QUALIFIER_GROUPS: { label: string; zh: RegExp; en: RegExp }[] = [
   { label: "从不 (never)", zh: /从不|绝不/, en: /\bnever\b/i },
 ];
 
+// Hard-qualifier detection for the QUESTION alone (not requiring a student echo).
+// Used by questionBrief to decide whether the constraints slot is worth asking.
+const HARD_QUALIFIER_GROUPS = STEP1_QUALIFIER_GROUPS.filter(
+  (g) => g.label !== "所有 (all)", // "all" is too noisy as a hard-qualifier signal
+);
+
+type QuestionBrief = {
+  questionType: string;
+  writingDestination: string;
+  taskMap: { explore_A: string; explore_B: string };
+  hasHardQualifiers: boolean;
+  hardQualifiers: string[];
+  /** INTERNAL ONLY — neutral direction seeds for stuck follow-ups; never quote as preferred answers. */
+  candidateDirectionSeeds: string[];
+};
+
+function detectHardQualifiersInQuestion(question: string): string[] {
+  const q = String(question || "");
+  const labels: string[] = [];
+  for (const group of HARD_QUALIFIER_GROUPS) {
+    if (group.zh.test(q) || group.en.test(q)) labels.push(group.label);
+  }
+  return labels;
+}
+
+function inferQuestionTypeFromQuestion(question: string, knownType?: string): string {
+  const known = String(knownType || "").trim();
+  if (known) return known;
+
+  const q = String(question || "").toLowerCase();
+  const hasCauses = /\bcauses?\b|\breasons?\b|\bwhy\b|原因|为何/.test(q);
+  const hasSolutions =
+    /\bsolutions?\b|\bmeasures?\b|\bhow (can|should|could)\b|解决|措施/.test(q);
+  const hasPosNeg =
+    /positive or negative|positive.*negative|negative.*positive|is it a positive|利弊|积极还是消极|正面还是负面/.test(
+      q,
+    );
+  const hasAgree =
+    /to what extent|agree or disagree|do you agree|agree\/disagree|同意/.test(q);
+  const hasBothViews =
+    /discuss both|both views|both sides|讨论双方|双方观点/.test(q);
+  const hasAdvDis =
+    /advantages? and disadvantages?|outweigh|利大于弊|优缺点/.test(q);
+  const hasOther =
+    /who should (fund|pay|be responsible)|whose responsibility|谁应该|谁来出资|谁负责/.test(
+      q,
+    );
+
+  // Cause + solution is Problem/Solution (not Two-part).
+  if (hasCauses && hasSolutions) return "Problem / Solution";
+  // Cause + positive/negative (or pure P/N) maps to Positive / Negative for stage mapping.
+  if (hasPosNeg) return "Positive / Negative";
+  if (hasCauses && !hasSolutions && !hasPosNeg) return "Problem / Solution";
+  if (hasAgree) return "Agree / Disagree";
+  if (hasBothViews) return "Discuss Both Views";
+  if (hasAdvDis) return "Advantages / Disadvantages";
+  if (hasOther) return "Other";
+  // Two distinct question marks / "and" dual tasks without the above → Two-part.
+  const qMarks = (String(question || "").match(/\?/g) || []).length;
+  if (qMarks >= 2) return "Two-part Question";
+  return "Agree / Disagree";
+}
+
+function buildQuestionBrief(question: string, knownType?: string): QuestionBrief {
+  const questionType = inferQuestionTypeFromQuestion(question, knownType);
+  const hardQualifiers = detectHardQualifiersInQuestion(question);
+  const hasHardQualifiers = hardQualifiers.length > 0;
+
+  let writingDestination = "完成 Task 2 要求的立场与论证交付";
+  let taskMap = {
+    explore_A: "一方观点/论据",
+    explore_B: "另一方观点/论据",
+  };
+  let candidateDirectionSeeds = [
+    "具体场景/人群",
+    "机制或因果链条",
+  ];
+
+  if (questionType === "Problem / Solution") {
+    writingDestination = "解释问题成因，并提出对应解决措施";
+    taskMap = { explore_A: "原因/成因", explore_B: "解决措施" };
+    candidateDirectionSeeds = ["驱动机制（谁在推动、怎么发生）", "受影响的具体人群/场景"];
+  } else if (questionType === "Positive / Negative") {
+    const q = String(question || "").toLowerCase();
+    const hasCauses = /\bcauses?\b|\breasons?\b|\bwhy\b|原因/.test(q);
+    writingDestination = hasCauses
+      ? "先解释现象成因，再对这一发展作出积极/消极判定"
+      : "对这一现象/发展作出积极或消极判定，并给出可写的支撑";
+    taskMap = {
+      explore_A: hasCauses ? "原因/成因" : "现象分析（主任务）",
+      explore_B: "评价侧：分别收集积极角度与消极角度",
+    };
+    candidateDirectionSeeds = [
+      "积极面：具体受益者/场景",
+      "消极面：具体受损者/场景",
+    ];
+  } else if (questionType === "Two-part Question") {
+    writingDestination = "分别完成题目中的两个写作任务";
+    taskMap = { explore_A: "第一问任务", explore_B: "第二问任务" };
+  } else if (questionType === "Discuss Both Views") {
+    writingDestination = "讨论双方观点，并给出自己的立场";
+    taskMap = { explore_A: "观点A", explore_B: "观点B" };
+  } else if (questionType === "Advantages / Disadvantages") {
+    writingDestination = "分析利弊，并按题目要求给出权衡或结论";
+    taskMap = { explore_A: "优点/利", explore_B: "缺点/弊" };
+  } else if (questionType === "Agree / Disagree") {
+    writingDestination = "明确同意/不同意程度，并用论据支撑";
+    taskMap = { explore_A: "支持己方立场的论据", explore_B: "对立面/让步面论据" };
+  } else if (questionType === "Other") {
+    writingDestination = "按题目实际设问完成写作任务（非标准题型）";
+    taskMap = { explore_A: "第一核心任务", explore_B: "第二核心任务（若有）" };
+  }
+
+  return {
+    questionType,
+    writingDestination,
+    taskMap,
+    hasHardQualifiers,
+    hardQualifiers,
+    candidateDirectionSeeds,
+  };
+}
+
+function formatQuestionBriefForPrompt(brief: QuestionBrief): string {
+  return `=== INTERNAL questionBrief (NEVER quote, paraphrase, or reveal to the student) ===
+questionType: ${brief.questionType}
+writingDestination: ${brief.writingDestination}
+taskMap.explore_A: ${brief.taskMap.explore_A}
+taskMap.explore_B: ${brief.taskMap.explore_B}
+hasHardQualifiers: ${brief.hasHardQualifiers ? "true" : "false"}
+hardQualifiers: ${brief.hardQualifiers.length > 0 ? brief.hardQualifiers.join("; ") : "(none)"}
+candidateDirectionSeeds (INTERNAL ONLY — when student is stuck after one shallow answer, turn into TWO neutral candidate directions; NEVER present as preferred/better answers): ${brief.candidateDirectionSeeds.join(" | ")}
+evalNote usage (INTERNAL): if the student's claim is already a direct result of the essay phenomenon, treat logicValid=true and only ask for a concrete scene when exampleReady=false. Never announce evaluative conclusions the student has not stated.
+===============================================================================`;
+}
+
 function detectEchoedQualifiers(question: string, userText: string): string[] {
   const q = String(question || "");
   const u = String(userText || "");
@@ -311,6 +447,52 @@ function backfillStep1Constraints(
   }
   progressUpdate.step1Data = target;
   return labels;
+}
+
+const NO_HARD_QUALIFIER_MARKER = "无明显限定词";
+
+/**
+ * Deterministic safety net for questionBrief.hasHardQualifiers=false:
+ * when the essay question has no hard scope qualifiers and coreIssue is already
+ * filled, auto-fill constraints so the Coach never asks a fake "限定词" question.
+ * Returns true when the marker was written this turn.
+ */
+function applyNoHardQualifierGate(
+  question: string,
+  progressUpdate: any,
+  session: any,
+): boolean {
+  if (!progressUpdate || typeof progressUpdate !== "object") return false;
+
+  const knownType =
+    String(progressUpdate?.step1Data?.correctType || "").trim() ||
+    String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+    undefined;
+  const brief = buildQuestionBrief(question, knownType);
+  if (brief.hasHardQualifiers) return false;
+
+  const step1New =
+    progressUpdate.step1Data && typeof progressUpdate.step1Data === "object"
+      ? progressUpdate.step1Data
+      : null;
+  const step1Old = session?.step1?.coachEvaluation || {};
+
+  const coreIssue = String(step1New?.coreIssue || step1Old?.coreIssue || "").trim();
+  if (!coreIssue) return false;
+
+  const newConstraints = step1New?.constraints;
+  const oldConstraints = step1Old?.constraints;
+  const alreadyFilled =
+    (Array.isArray(newConstraints) &&
+      newConstraints.some((c) => String(c || "").trim())) ||
+    (Array.isArray(oldConstraints) &&
+      oldConstraints.some((c) => String(c || "").trim()));
+  if (alreadyFilled) return false;
+
+  const target = step1New || {};
+  target.constraints = [NO_HARD_QUALIFIER_MARKER];
+  progressUpdate.step1Data = target;
+  return true;
 }
 
 function looksLikeConstraintQuestion(part2: string): boolean {
@@ -622,10 +804,29 @@ function extractLastCoachQuestion(messages: any[]): string {
   return "";
 }
 
+/** Look back across recent coach turns so a later single-dimension scaffold
+ *  does not erase sibling dimensions named earlier in the same explore stage. */
+function extractCoachQuestionsWindow(
+  messages: any[],
+  maxCoachTurns: number = 4,
+): string {
+  if (!Array.isArray(messages) || maxCoachTurns <= 0) return "";
+  const coachTexts: string[] = [];
+  for (let i = messages.length - 1; i >= 0 && coachTexts.length < maxCoachTurns; i--) {
+    const m = messages[i];
+    if (m && m.sender === "ai" && String(m.text || "").trim()) {
+      coachTexts.push(String(m.text).trim());
+    }
+  }
+  return coachTexts.reverse().join("\n\n---\n\n");
+}
+
 async function checkStep2DimensionCoverage(params: {
   question: string;
   lastCoachQuestion: string;
+  coachQuestionsWindow?: string;
   studentAnswer: string;
+  priorUserPoints?: string;
 }): Promise<{
   hasMultipleDimensions: boolean;
   uncoveredDimension: string;
@@ -634,8 +835,12 @@ async function checkStep2DimensionCoverage(params: {
 } | null> {
   const essayQuestion = String(params.question || "").trim();
   const lastCoachQuestion = String(params.lastCoachQuestion || "").trim();
+  const coachQuestionsWindow = String(
+    params.coachQuestionsWindow || params.lastCoachQuestion || "",
+  ).trim();
   const studentAnswer = String(params.studentAnswer || "").trim();
-  if (!lastCoachQuestion || !studentAnswer) return null;
+  const priorUserPoints = String(params.priorUserPoints || "").trim();
+  if (!coachQuestionsWindow || !studentAnswer) return null;
 
   try {
     const prompt = `
@@ -644,18 +849,26 @@ You are checking ONE narrow fact about a single turn of an IELTS coaching dialog
 The IELTS essay question being discussed:
 "${essayQuestion}"
 
-The coach's most recent question was:
+Recent coach questions in THIS explore stage (oldest → newest; the last one may be a narrowed scaffold of an earlier multi-dimension question):
+"${coachQuestionsWindow}"
+
+Most recent coach question alone (for reference):
 "${lastCoachQuestion}"
 
-The student's answer was:
+Already recorded brainstorm points for this side (may be empty):
+"${priorUserPoints || "(none)"}"
+
+The student's CURRENT answer was:
 "${studentAnswer}"
 
 Task:
-1. Does the coach's question name TWO OR MORE distinct sub-dimensions/sub-angles/scenarios for the same side of the argument (e.g. joined by 与/和/、, or listed as 『A』『B』, or "A以及B")? If it only names ONE (or none), set hasMultipleDimensions=false, uncoveredDimension="", developedIsSolid=false, uncoveredRelevantToQuestion=false, and stop.
-2. If it names 2+, does the student's answer substantively develop ONLY ONE of them (the other is not mentioned at all, or only trivially/synonymously restated)? If the student's answer already substantively covers ALL named sub-dimensions, set hasMultipleDimensions=true but uncoveredDimension="".
-3. If exactly one sub-dimension is left uncovered, copy it EXACTLY as a short phrase from the coach's question (in Chinese) into "uncoveredDimension".
-4. Judge whether the student's answer for the DEVELOPED dimension is already "solid" (includes a concrete scenario/beneficiary/mechanism, could support a full IELTS body paragraph alone) vs "thin" (still vague/generic, one-liner). Set developedIsSolid accordingly.
-5. Judge whether the UNCOVERED dimension directly responds to a core qualifier/contrast in the essay question (e.g. "entirely", "highly beneficial", an explicit comparison) — set uncoveredRelevantToQuestion=true. If it is more of a repetition/overlap with the developed dimension, or a peripheral/minor detail that doesn't add a distinct angle to the essay's core argument, set uncoveredRelevantToQuestion=false.
+1. Across the RECENT COACH QUESTIONS WINDOW (not only the last message), did the coach name TWO OR MORE distinct sub-dimensions/sub-angles/scenarios for the same side (e.g. joined by 与/和/、, listed as 『A』『B』, "A以及B", or asked as two numbered expansion prompts)? Set hasMultipleDimensions accordingly.
+2. IMPORTANT: If an earlier coach turn named two dimensions, and a LATER turn only scaffolds ONE of them, still treat this as a multi-dimension case — the sibling dimension remains "named" for coverage purposes.
+3. Combine the student's current answer WITH already-recorded brainstorm points.
+   - If hasMultipleDimensions=true and exactly ONE named sub-dimension is still uncovered, copy that uncovered dimension EXACTLY as a short Chinese phrase into "uncoveredDimension".
+   - If all named dimensions are covered, or hasMultipleDimensions=false, set uncoveredDimension="".
+4. ALWAYS judge whether the student's CURRENT answer for the DEVELOPED dimension is already "solid" (includes a concrete scenario/beneficiary/mechanism, could support a full IELTS body paragraph alone) vs "thin" (still vague/generic, one-liner, or only restates an abstract label like "身份认同变弱"). Set developedIsSolid accordingly — even when hasMultipleDimensions=false.
+5. If uncoveredDimension is non-empty, judge whether it directly responds to a core qualifier/contrast in the essay question — set uncoveredRelevantToQuestion=true. Otherwise set uncoveredRelevantToQuestion=false.
 
 Respond with JSON only, matching the schema.
 `;
@@ -731,14 +944,28 @@ async function applyStep2RetentionGuard(
   if (!isExploreTransition) return;
 
   const lastCoachQuestion = extractLastCoachQuestion(messages);
-  if (!lastCoachQuestion) return;
+  const coachQuestionsWindow = extractCoachQuestionsWindow(messages, 4);
+  if (!coachQuestionsWindow) return;
 
   const check = await checkStep2DimensionCoverage({
     question,
     lastCoachQuestion,
+    coachQuestionsWindow,
     studentAnswer: userMessage,
+    priorUserPoints: oldUserPoints,
   });
-  if (!check?.hasMultipleDimensions || !check.uncoveredDimension) return;
+  if (!check?.hasMultipleDimensions || !check.uncoveredDimension) {
+    // Tag thin developed points so summary does not claim "完整性极高".
+    if (check && check.developedIsSolid === false) {
+      const basePoints = String(
+        data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+      ).trim();
+      if (basePoints && !basePoints.includes("待补例子")) {
+        data.progressUpdate.step2Data.userPoints = `${basePoints}（待补例子）`;
+      }
+    }
+    return;
+  }
 
   const { recommendation, reasonZh } = decideStep2Retention(
     check.developedIsSolid,
@@ -765,8 +992,9 @@ async function applyStep2RetentionGuard(
   const basePoints = String(
     data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
   ).trim();
+  const thinTag = check.developedIsSolid ? "" : "（待补例子）";
   data.progressUpdate.step2Data.userPoints =
-    `${basePoints} ［待裁决：${uncovered}｜${recommendation}］`.trim();
+    `${basePoints}${thinTag} ［待裁决：${uncovered}｜${recommendation}］`.trim();
 
   console.warn(
     `[Step2RetentionGuard] Reverted transition ${oldStage}->${newStage}; uncovered="${uncovered}"; recommendation=${recommendation}`,
@@ -869,6 +1097,14 @@ async function startServer() {
         - "Advantages / Disadvantages"
         - "Two-part Question"
         - "Problem / Solution"
+        - "Positive / Negative"
+        - "Other"
+
+        Classification rules:
+        - "Problem / Solution": asks for causes/reasons AND solutions/measures (NOT Two-part).
+        - "Positive / Negative": asks whether something is a positive or negative development/effect/trend.
+        - "Other": does not fit the above (e.g. who should fund, who is responsible).
+        - "Two-part Question": two distinct sub-questions that are NOT cause+solution and NOT positive/negative evaluation.
 
         Extract:
         1. The primary core controversy/issue to discuss.
@@ -924,6 +1160,198 @@ async function startServer() {
       res
         .status(500)
         .json({ error: error.message || "Failed to analyze topic" });
+    }
+  });
+
+  // 2b. API - Batch extract topic tags for import
+  app.post("/api/extract-topic-tags", async (req, res) => {
+    try {
+      const rawQuestions = Array.isArray(req.body?.questions)
+        ? req.body.questions
+        : [];
+      const questions = rawQuestions
+        .map((q: unknown) => String(q || "").trim())
+        .filter(Boolean);
+
+      if (questions.length === 0) {
+        res.status(400).json({ error: "Missing questions" });
+        return;
+      }
+      if (questions.length > 10) {
+        res.status(400).json({ error: "At most 10 questions per batch" });
+        return;
+      }
+
+      const TOPIC_CATEGORIES = [
+        "Education",
+        "Technology",
+        "Environment",
+        "Government",
+        "Health",
+        "Media",
+        "Crime",
+        "Culture",
+        "Work",
+      ] as const;
+      const QUESTION_TYPES = [
+        "Agree / Disagree",
+        "Discuss Both Views",
+        "Advantages / Disadvantages",
+        "Two-part Question",
+        "Problem / Solution",
+        "Positive / Negative",
+        "Other",
+      ] as const;
+      const DIFFICULTIES = ["Easy", "Medium", "Hard"] as const;
+
+      const normalizeTopic = (value: unknown): (typeof TOPIC_CATEGORIES)[number] => {
+        const raw = String(value || "").trim().toLowerCase();
+        const hit = TOPIC_CATEGORIES.find((c) => c.toLowerCase() === raw);
+        if (hit) return hit;
+        if (raw.includes("educat") || raw.includes("school") || raw.includes("student")) return "Education";
+        if (raw.includes("tech") || raw.includes("ai") || raw.includes("internet")) return "Technology";
+        if (raw.includes("environ") || raw.includes("climate") || raw.includes("pollut")) return "Environment";
+        if (raw.includes("govern") || raw.includes("policy") || raw.includes("tax")) return "Government";
+        if (raw.includes("health") || raw.includes("medical") || raw.includes("diet")) return "Health";
+        if (raw.includes("media") || raw.includes("news") || raw.includes("advertis")) return "Media";
+        if (raw.includes("crime") || raw.includes("prison") || raw.includes("punish")) return "Crime";
+        if (raw.includes("cultur") || raw.includes("language") || raw.includes("tradition")) return "Culture";
+        if (raw.includes("work") || raw.includes("job") || raw.includes("employ") || raw.includes("career")) return "Work";
+        return "Education";
+      };
+
+      const normalizeQuestionType = (
+        value: unknown,
+      ): (typeof QUESTION_TYPES)[number] => {
+        const raw = String(value || "").trim().toLowerCase();
+        const hit = QUESTION_TYPES.find((t) => t.toLowerCase() === raw);
+        if (hit) return hit;
+        if (raw.includes("agree") || raw.includes("disagree") || raw.includes("extent")) {
+          return "Agree / Disagree";
+        }
+        if (raw.includes("both") || raw.includes("discuss")) {
+          return "Discuss Both Views";
+        }
+        if (raw.includes("advantage") || raw.includes("disadvantage") || raw.includes("outweigh")) {
+          return "Advantages / Disadvantages";
+        }
+        if (raw.includes("problem") || raw.includes("solution") || raw.includes("cause")) {
+          return "Problem / Solution";
+        }
+        if (raw.includes("positive") || raw.includes("negative")) {
+          return "Positive / Negative";
+        }
+        if (
+          raw.includes("other") ||
+          raw.includes("fund") ||
+          raw.includes("who should") ||
+          raw.includes("responsible")
+        ) {
+          return "Other";
+        }
+        if (raw.includes("two") || raw.includes("part")) {
+          return "Two-part Question";
+        }
+        return "Agree / Disagree";
+      };
+
+      const normalizeDifficulty = (
+        value: unknown,
+      ): (typeof DIFFICULTIES)[number] => {
+        const raw = String(value || "").trim().toLowerCase();
+        if (raw.includes("easy") || raw === "e") return "Easy";
+        if (raw.includes("hard") || raw.includes("difficult") || raw === "h") return "Hard";
+        return "Medium";
+      };
+
+      const prompt = `
+        You are an IELTS Writing Task 2 classifier.
+        For EACH question below, extract exactly three tags.
+
+        Allowed topic values (pick ONE):
+        ${TOPIC_CATEGORIES.map((c) => `"${c}"`).join(", ")}
+
+        Allowed questionType values (pick ONE):
+        ${QUESTION_TYPES.map((t) => `"${t}"`).join(", ")}
+
+        Allowed difficulty values (pick ONE):
+        ${DIFFICULTIES.map((d) => `"${d}"`).join(", ")}
+
+        Difficulty guidance:
+        - Easy: clear single focus, common vocabulary, straightforward structure
+        - Medium: some abstraction or dual aspects, typical exam complexity
+        - Hard: abstract concepts, nuanced stance, multi-layered or dense wording
+
+        questionType classification rules:
+        - "Problem / Solution": asks for causes/reasons AND solutions/measures. Do NOT label as Two-part.
+        - "Positive / Negative": asks whether something is a positive or negative development/effect/trend.
+        - "Other": does not fit standard types (e.g. who should fund, who is responsible).
+        - "Two-part Question": two distinct sub-questions that are NOT cause+solution and NOT positive/negative.
+
+        Questions (JSON array, keep the SAME order in your output):
+        ${JSON.stringify(questions)}
+
+        Return JSON:
+        {
+          "results": [
+            {
+              "topic": "string",
+              "questionType": "string",
+              "difficulty": "string"
+            }
+          ]
+        }
+
+        CRITICAL:
+        - results.length MUST equal ${questions.length}
+        - results[i] corresponds to questions[i]
+        - Do NOT invent values outside the allowed lists
+      `;
+
+      const response = await generateContentWithFallback({
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              results: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    topic: { type: Type.STRING },
+                    questionType: { type: Type.STRING },
+                    difficulty: { type: Type.STRING },
+                  },
+                  required: ["topic", "questionType", "difficulty"],
+                },
+              },
+            },
+            required: ["results"],
+          },
+        },
+      });
+
+      const data = parseAIResponse(response.text);
+      const rawResults = Array.isArray(data?.results) ? data.results : [];
+
+      const results = questions.map((question, idx) => {
+        const item = rawResults[idx] || {};
+        return {
+          question,
+          topic: normalizeTopic(item?.topic),
+          questionType: normalizeQuestionType(item?.questionType),
+          difficulty: normalizeDifficulty(item?.difficulty),
+        };
+      });
+
+      res.json({ results });
+    } catch (error: any) {
+      console.error("Error in /api/extract-topic-tags:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Failed to extract topic tags" });
     }
   });
 
@@ -1008,6 +1436,14 @@ async function startServer() {
       );
       const activeStep3Claim = activeStep3Subpoint?.content?.trim?.() || "";
 
+      // Top-down internal brief: drives ask/skip/sufficiency strategy only — never student-facing content.
+      const knownQuestionType =
+        String(step1Eval?.correctType || "").trim() ||
+        String(req.body?.questionType || "").trim() ||
+        undefined;
+      const questionBrief = buildQuestionBrief(question, knownQuestionType);
+      const questionBriefStr = formatQuestionBriefForPrompt(questionBrief);
+
       let contextStr = "No previous step data available yet.";
       if (session) {
         let step1Summary = "";
@@ -1040,6 +1476,8 @@ async function startServer() {
 Question:
 ${question}
 
+${questionBriefStr}
+
 Known user ideas & Coach Diagnostics:
 
 [Step 1 (Question Analysis) Diagnosis]:
@@ -1058,6 +1496,15 @@ Current objective:
 Review the context above and the current step's instructions. Organize and develop the existing ideas. Keep full consistency with the established positions.
 =====================================
 `;
+      } else {
+        contextStr = `
+=== ContextSummary(CoachingState) ===
+Question:
+${question}
+
+${questionBriefStr}
+=====================================
+`;
       }
 
       let stepGuidelines = "";
@@ -1071,7 +1518,7 @@ Review the context above and the current step's instructions. Organize and devel
   ## Step 1 Slot Checklist (按缺口推进，不重复提问)
   Required slots:
   1) correctType (题型)
-  2) coreIssue (核心争议)
+  2) coreIssue (核心议题/写作任务焦点)
   3) constraints (关键限定词/范围约束)
   4) suggestedDimensions (建议讨论维度 2~4 个)
 
@@ -1081,6 +1528,58 @@ Review the context above and the current step's instructions. Organize and devel
   C. Ask ONLY the first still-missing slot.
   D. If all slots are present, output the completion summary and guide to Step 2.
 
+  Correction-first rule (CRITICAL):
+  - If the student's answer is off-target for the current slot, FIRST name the mismatch in one short sentence, THEN guide the correction. Do NOT open with empty praise like "非常准确/精准地抓住了/完美".
+  - Example: student restates background as coreIssue -> "你说的是题目背景现象，还不是写作任务焦点。请改成：这道题真正要你回答的是什么？"
+
+  Per-slot feedback — no spoiler (CRITICAL):
+  - When validating ONE filled slot while the NEXT slot is still missing, Part 1 must confirm ONLY what the student just answered for that slot (≤1 short sentence). Part 2 asks the first still-missing slot.
+  - correctType filled, coreIssue missing -> confirm the type label only (e.g. "**Two-part**，判断正确。"). FORBIDDEN in Part 1: enumerating sub-questions ("第一…第二…"), paraphrasing the essay prompt, stating causes/evaluation/stance tasks, or previewing questionBrief writingDestination/taskMap content. Treat "explaining what the two parts ask" as coreIssue content — the student must say it in Q2 first; you may echo it briefly only AFTER they answer coreIssue.
+  - coreIssue filled, constraints missing -> confirm their coreIssue wording only; do NOT list suggested dimensions or preview the essay structure.
+  - coreIssue filled, constraints auto-skipped (hasHardQualifiers=false) -> same as above: Part 1 confirms coreIssue only (≤1 sentence). Silently set constraints in progressUpdate; do NOT mention skipping, absent qualifiers, or "无明显限定词" in chat.
+  - constraints filled, suggestedDimensions missing -> confirm constraints only; do NOT suggest dimension names for them.
+  - Task A dimensions given, Task B dimensions missing (compound type) -> confirm Task A's dimension(s) only; do NOT preview what Task B's evaluation/analysis will conclude, do NOT say positive/negative content ahead of time.
+  - BAD (Q1 correct, coreIssue still missing): "它包含两个任务：分析原因 + 判断积极消极。"
+  - BAD (coreIssue correct, auto-skip constraints): "由于题目中没有 entirely/only 等绝对限定词，我们不需要去极端化思考，可以直接从多个维度切入。"
+  - GOOD (Q1 correct): "Two-part，判断正确。"
+  - GOOD (Q2 after student answer): "核心议题抓对了。"
+  - GOOD (Q2 → dimensions, no hard qualifiers): Part 1 "核心议题抓对了。" / Part 2 missing suggestedDimensions template only.
+
+  coreIssue definition by question type:
+  - Agree / Disagree, Discuss Both Views, Advantages / Disadvantages, Positive / Negative: state the central controversy/judgment the writer must make.
+  - Problem / Solution: state the problem object + what must be explained (causes and/or solutions), NOT a fake "debate".
+  - Two-part Question / Other: state the writing tasks the two (or more) questions require, in one sentence.
+  - Never accept a pure background paraphrase as coreIssue.
+
+  suggestedDimensions boundary (CRITICAL):
+  - Dimensions must be NEUTRAL analytical angles (e.g. 身份认同、文化多样性、经济发展), NOT evaluative conclusions.
+  - If the student already gives evaluative conclusions (e.g. "身份认同会变弱，但能促进经济"), extract the dimension nouns only, and leave the positive/negative judgment for Step 2 stance. Do NOT lock a stance in Step 1.
+
+  Granularity calibration (CRITICAL — Step 1 collects ENTRY POINTS, not content; do not drift into Step 2's job):
+  - A suggestedDimensions entry is an ABSTRACT LABEL that can be expanded LATER — think "经济、身份认同、社会结构", not a worked-out mechanism, causal chain, scenario, beneficiary, or impact/positive-negative judgment. Any of the latter belongs to Step 2 (brainstorm/explore) or Step 3 (paragraph logic), NOT Step 1.
+  - If the student's answer is ALREADY a full causal chain or concrete scenario (e.g. "人们为了有更多的工作机会，会重点学习主流语言，母语会被忽略"), do NOT chase it deeper and do NOT ask what its impact/effect is. Instead, ABSTRACT it UP into ONE short dimension label (e.g. "就业/经济需求") and move on — the detailed reasoning stays for the student to reconstruct in Step 2.
+  - Do NOT ask "这会带来什么影响" / "这是好事还是坏事" / "举个例子" while still in the suggestedDimensions slot — those are Step 2 questions (explore/stance), not Step 1. Step 1's only job here is naming enough neutral angles to analyze from.
+  - This is the mirror-image of the global FILLED_SHALLOW follow-up rule: there, thin answers get ONE depth follow-up; here, answers that are ALREADY too deep get pulled back up to a label, never pushed deeper.
+
+  suggestedDimensions anti-fabrication rule (CRITICAL — do not pad to hit the count):
+  - Every dimension you write into progressUpdate MUST be extractable from the student's own words (this turn or earlier). You MAY split one sentence into 2 labels if the student named 2 distinct factors (e.g. "经济发展" AND "方便沟通/商业活动" are 2 real factors in one sentence -> 2 legitimate labels). You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach the 2~4 target count.
+  - VIOLATION (do NOT do this): student's message only describes ONE causal chain — economic development -> communication convenience -> people learn the dominant language -> native language de-emphasized. Extracting "经济与商贸发展" and "沟通便利度" from it is fine (2 real factors), but then ALSO adding "文化身份认同" (never mentioned) as a 3rd dimension to look more thorough is FABRICATION and FORBIDDEN.
+  - Sufficiency gate: if the student's message truly yields only ONE genuine dimension, do NOT fabricate a second one and do NOT mark the step complete yet. Ask ONE follow-up offering TWO neutral candidate angle NAMES only (not content, not analysis) they have not covered, e.g. "除了[已给维度]，你觉得还可以从哪个角度补充？比如社会文化、教育制度这类角度，你选一个或换一个都可以。" This follows the global anti-loop guard: at most ONE such follow-up for this slot; after that, accept whatever the student gives (even if still just 1) and do not keep asking.
+  - Feedback proportionality: Part 1's confirmation must match what was ACTUALLY given. Do NOT describe a single causal chain as if the student did rich "多维度分析" (e.g. do not say "从经济、商业、沟通效率等多个角度精准指出了底层逻辑" when they only gave one line of reasoning). State plainly what was recorded, nothing more.
+
+  Per-task dimension flow (CRITICAL — ONLY for compound question types where questionBrief.taskMap names 2 distinct tasks: Two-part Question, Problem / Solution, Positive / Negative, multi-task Other):
+  - Do NOT ask ONE generic "list 2-4 dimensions" question for these types. Split into two sequential, task-scoped questions, but phrase BOTH as natural, direct ANGLE-level questions — never as a meta/procedural question about the analysis method itself, and never as a Step-2-style content/evaluation question (see Granularity calibration above — you are still only collecting entry-point LABELS here, not impacts or judgments):
+    1) Task A dimensions (ask first, while no dimension is recorded yet): ask directly what angles explain questionBrief.taskMap.explore_A (e.g. the causes/first task). Keep it plain and concrete, not "请列出维度名称" jargon-flavored. Prefer collecting 2 angles for Task A before moving to Task B (see Per-task sufficiency below).
+    2) Task B dimensions (ask second, ONLY after Task A has enough angles per Per-task sufficiency below) — this question's GOAL is to elicit Task B's ANGLES (what lenses to evaluate from), and it MUST read as a natural continuation of the conversation (referencing the phenomenon/topic just discussed, not restating "以上维度"), NOT a fresh isolated question and NOT a question about whether the prior angles are "reusable/applicable":
+       - FORBIDDEN framing: asking the student to judge whether their Task A angles "同样适用/是否可复用" — this exposes internal bookkeeping logic as if it were the substance of the question, and reads stiffly. That check is YOUR silent internal task, not the student's.
+       - FORBIDDEN framing (Granularity — CRITICAL): do NOT ask "这会带来什么影响" / "是好事还是坏事" / "举个例子" — that asks for Step 2 content (impact + polarity), not a Step 1 angle label. Ask for the ANGLE/lens to evaluate FROM, e.g. (for a causes+evaluation question) "那评估这种变化好不好，你觉得可以从哪些方面来看？比如身份认同、社会结构，只是举例，你可以换别的角度。" Do not force this exact wording — restate the topic in your own natural words, continuing from what was just discussed, but keep the ASK at the angle/label level.
+       - Whatever the student answers, even if they slip in evaluative language ("这会让身份认同变弱"), extract ONLY the neutral noun ("身份认同") as the dimension; do NOT lock a stance in Step 1 (apply the suggestedDimensions boundary rule above) and do NOT chase the evaluative claim further here.
+       - Do NOT invent the Task B dimension yourself — it must come from what the student actually said.
+  - Single-task question types (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages) keep the existing single generic "list 2-4 dimensions" question — do NOT split these; they only have one task to analyze.
+  - Tag each recorded dimension with which task(s) it covers using a short natural-language suffix so Step 2 can anchor correctly later, e.g. "经济发展（原因+评价均适用）" or "身份认同（评价）". Do not use raw field/stage names (taskMap, explore_A/B) as the tag text — and never expose this tagging logic to the student either.
+  - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), prefer at least 2 distinct angles before moving to the next task/slot. If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？") before moving on — do not silently transition to the next task with only 1 angle recorded for the current one. Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on (do not fabricate a 2nd to force the count).
+  - Sequencing with the global sufficiency gate above: after BOTH tasks have been asked (each following Per-task sufficiency), if the TOTAL distinct dimension count is still below 2, apply the sufficiency-gate follow-up (max ONE extra question) as a final top-up — do not fabricate to skip this.
+
   Critical skip rule (Step1-specific example of slot reuse):
   - A scope qualifier (entirely / completely / only / always / 完全 / 彻底 / 只 / 仅 / 必须 / 始终) that appears in the coreIssue answer IS the constraint. Recognizing it verbally in your feedback is NOT enough.
   - If the student's coreIssue answer (or current message) contains such a qualifier, you MUST in the SAME turn copy that qualifier into progressUpdate.step1Data.constraints AND skip the constraints question, moving directly to suggestedDimensions.
@@ -1089,15 +1588,25 @@ Review the context above and the current step's instructions. Organize and devel
   - Note: the server also backfills constraints from question-echoed qualifiers as a safety net, but you must not rely on it — do the copy-and-skip yourself.
   - When speaking to the student, say "关键限定" / "讨论维度" / "题型" — never quote raw slot/field names like "constraints" or "correctType", and never mention progressUpdate paths.
 
+  Hard-qualifier gate (from INTERNAL questionBrief — CRITICAL):
+  - If questionBrief.hasHardQualifiers=false: do NOT ask the constraints question. When coreIssue is filled, set constraints=["无明显限定词"] in the SAME turn and move to suggestedDimensions.
+  - Student-facing silence on skip (CRITICAL): never explain this gate in chat. FORBIDDEN: citing absent qualifiers ("entirely"/"only"/"完全"/"唯一"), "去极端化", "跳过这一步/这一 slot", "无明显限定词", or any hasHardQualifiers reasoning. Just confirm coreIssue briefly and ask the dimensions question.
+  - If questionBrief.hasHardQualifiers=true: ask the constraints question ONLY when the constraints slot is still empty (existing skip rule still applies if the student already echoed a qualifier).
+  - NEVER invent fake scope limits that are not in the question.
+
   Missing-slot question templates (use only when that slot is truly missing):
   - missing correctType -> "这道题属于哪一种 Task 2 题型？"
-  - missing coreIssue -> "请用一句话说：作者真正问你的问题是什么？不要翻译题目，而是说出它真正想讨论的议题。"
-  - missing constraints -> "题目里有没有哪些词，限制了讨论范围？请列 1~3 个。"
-  - missing suggestedDimensions -> "为了回答这道题，我们需要比较哪些方面？请列出 2~4 个维度即可。"
+  - missing coreIssue -> "请用一句话说：这道题真正要你完成的写作任务是什么？不要翻译或复述背景。"
+  - missing constraints -> "题目里有没有哪些词，限制了讨论范围？请列 1~3 个。" (ONLY when hasHardQualifiers=true)
+  - missing suggestedDimensions, single-task type -> "为了回答这道题，我们需要比较哪些方面？请列出 2~4 个中性维度名称即可（先不要下利弊结论）。"
+  - missing suggestedDimensions, compound type, Task A not yet answered -> use the Per-task dimension flow above, Task A question.
+  - Task A answered, Task B not yet answered (compound type) -> use the Per-task dimension flow above, Task B question (guided by Task A's answer).
+  - suggestedDimensions has only 1 genuine dimension so far after both tasks -> use the sufficiency-gate follow-up above (offer 2 neutral candidate angle names, max ONE follow-up, then accept whatever is given).
 
   Completion output (when all slots are filled):
-  - Part 1: concise praise + structured summary (题型、核心争议、关键限定、建议维度)
+  - Part 1: ONE short confirmation + compact structured summary (题型、核心议题、关键限定、建议维度). No long restatement. You MAY briefly echo writingDestination in structural terms only.
   - Part 2: explicit CTA telling the student to click the 【下一步】 button to enter Step 2. Part 2 MUST include the phrase "进入第二步".
+  - Structural preview ONLY (optional, one short clause): e.g. "下面我们按：原因段 → 评价段 来梳理" — using taskMap labels, NEVER attach a recommended stance or preferred conclusion (FORBIDDEN: "建议弊大于利" / "多数稳妥路径是…").
   - CRITICAL: In the SAME response when all 4 slots are filled, you MUST set progressUpdate.isCompleted: true.
   - FORBIDDEN after Step 1 completion: Do NOT ask Step 2 questions (stance, blueprint, body paragraphs, thesis) while still in Step 1. Those belong only in Step 2.
   - Do NOT populate progressUpdate.step2Data while step=1.
@@ -1107,7 +1616,15 @@ Review the context above and the current step's instructions. Organize and devel
 - Step 2: Essay Blueprint (文章蓝图/论点筹备与结构设计)
   Current State: BLUEPRINT_DESIGN
   Role: Essay Architect & Socratic Logical Coach.
-  Objective: Guide the student to brainstorm pros/cons of the core debate, choose a stance, and generate the final Essay Blueprint (the unique target artifact).
+  Objective: Guide the student to brainstorm the required sides of the question, choose a stance, and generate the final Essay Blueprint (the unique target artifact).
+
+  ## Question-type stage mapping (CRITICAL)
+  Map explore_A / explore_B using INTERNAL questionBrief.taskMap for THIS question — do NOT always treat them as "online pros vs offline pros":
+  - Agree / Disagree, Discuss Both Views, Advantages / Disadvantages: explore_A = one side; explore_B = the other side.
+  - Problem / Solution: explore_A = causes/reasons; explore_B = solutions/measures.
+  - Positive / Negative (or Two-part whose second question is positive/negative): explore_A = first task (often causes/reasons if present; otherwise the main phenomenon analysis); explore_B = evaluation side, and you MUST separately collect BOTH the positive angle and the negative angle before leaving explore_B.
+  - Other / generic Two-part: explore_A = first sub-question; explore_B = second sub-question.
+  - Prefer questionBrief.taskMap labels when they are more specific than the generic mapping above.
 
   ## Current Stage Logic (current_stage / 引入状态和状态变化)
   The student progresses through four distinct stages. You MUST strictly obey the rules of the active stage, determine the next stage based on user inputs, and output the correct 'currentStage' inside progressUpdate.step2Data:
@@ -1122,11 +1639,29 @@ Review the context above and the current step's instructions. Organize and devel
   - Prefer "沿着你刚才的这个维度，我们把它展开到具体场景/人群/机制" over generic repeats.
   - Use generic fallback only when no relevant dimension exists in context.
 
+  Dual readiness check (CRITICAL — do not conflate):
+  - logicValid: the claim itself is a valid result/judgment for the question (e.g. "身份认同变弱" can already be a valid negative impact of cultural loss). Do NOT force deeper abstract philosophy.
+  - exampleReady: there is at least one concrete scene/beneficiary/mechanism that can support ~90-110 words.
+  - A point may be logicValid=true but exampleReady=false. In that case, ask for a concrete example/scene, NOT a deeper "why".
+  - Only treat a body as fully ready when BOTH are true, OR the student explicitly chooses to keep a thin point and you tag it "（待补例子）" in userPoints.
+
+  Depth follow-up style (CRITICAL):
+  - FORBIDDEN open prompt after the student says they don't know how to expand: "请谈谈你的看法 / 请用一两句话展开".
+  - REQUIRED: offer exactly TWO concrete candidate directions (场景 / 后果 / 受益对象) and let the student pick or fill one. Do NOT write a full ready-made sentence for them.
+  - Candidate directions MUST be neutral: do NOT imply which direction is easier, safer, or higher-scoring. You may privately consult questionBrief.candidateDirectionSeeds, but never present them as preferred answers.
+  - If the student's claim is already a direct result of the essay phenomenon (e.g. cultural loss → weaker identity), acknowledge logicValid=true, then only ask for a scene if exampleReady is still false.
+
+  Compact feedback rule (CRITICAL, explore stages):
+  - Part 1 MUST be one short confirmation in this shape: "很好，目前我们记录到：[用户原话要点]。"
+  - FORBIDDEN: renumbering, bold restating, or multi-bullet paraphrase of what the student just said.
+  - Do NOT invent empty numbered list items (never output a bare "1." with no content).
+
   Dimension Coverage & Retention Rule (CRITICAL — prevents silently dropping sibling dimensions):
-  - MANDATORY FIRST STEP before you decide anything else about transitioning: re-read the text of your OWN immediately preceding question in "Previous Conversation Logs" above (the last "IELTS AI Coach:" line for this side), plus the student's own current/prior message on this side. Explicitly ask yourself: "Did that question (or the student's own words) name TWO OR MORE distinct sub-angles/scenarios/sub-dimensions for this side (e.g. joined by 与/和/、, or listed as 『A』『B』, or 'A以及B')?"
-  - If YES to that question, and the student's current answer only develops ONE of those named sub-dimensions (not a mere synonym/rephrasing of it — a substantively different angle), this is an "uncovered dimension" case. This check runs BEFORE the sufficiency gate below and BEFORE any depth follow-up decision.
+  - MANDATORY FIRST STEP before you decide anything else about transitioning: re-read ALL of your own coach questions in the CURRENT explore stage in "Previous Conversation Logs" (not only the last line). If an earlier turn named TWO OR MORE dimensions and a later turn only scaffolds one of them, the sibling dimension is STILL named and must be checked for coverage.
+  - Also check progressUpdate.step2Data.userPoints / prior user messages on this side for any dimension the student already named but has not developed.
+  - If YES to multi-dimension naming, and the student's current answer (+ recorded points) only develops ONE of those named sub-dimensions, this is an "uncovered dimension" case. This check runs BEFORE the sufficiency gate below and BEFORE any depth follow-up decision.
   - If NO (only one dimension was ever named, or the "other" one is just a synonym of the developed one), skip this rule entirely and proceed with the normal sufficiency-gated transition below.
-  - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient.
+  - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient OR is tagged （待补例子）.
   - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED (stay in the current explore stage) and fold exactly ONE retention question into your reply. Do NOT ask an open-ended "which do you prefer" question — you must EVALUATE first and state ONE default recommendation with a reason, then give the student a single override phrase:
     - Developed point still thin (missing concrete scenario/beneficiary/mechanism) -> default recommendation is to keep BOTH; ask for 1-2 sentences on the uncovered dimension too. (No override phrase needed here — this is just a request for more content.)
     - Developed point already solid enough alone to carry a full 90-110 word paragraph -> evaluate whether the uncovered dimension directly answers a core qualifier/contrast in the essay question (e.g. "entirely", "highly beneficial") or is more of a repetition/peripheral detail of the developed point:
@@ -1135,46 +1670,50 @@ Review the context above and the current step's instructions. Organize and devel
     - Both dimensions already have enough material -> default recommendation is to keep BOTH; tell the student Step 3 will assign one point as 详写 and the other as 略写 to stay within the 90-110 word budget.
     - Example (mirrors a real case, KEEP branch): your own question named both "面对面互动" and "教师监督"; the student only develops "教师监督" (with a concrete beneficiary: young/low-self-control kids). This point alone is solid, and "面对面互动" also directly answers the essay's "entirely/replace" contrast, so your reply should read like: "『教师监督』这一点已经足够扎实，可以独立支撑一段。『面对面互动』和题目直接相关，建议保留下来作为一个略写的补充点。如果你想专注只写监管，回复'放弃面对面互动'即可。" and currentStage stays on the current explore stage this turn.
   - On the NEXT turn, interpret the student's reply RELATIVE TO the specific default recommendation you proposed (do not always assume the same fixed outcome): a vague agreement ("好的"/"随便"/"都行") means ACCEPT the recommendation you gave; an explicit contradiction (e.g. saying "放弃" when you recommended keeping, or "保留"/"都要" when you recommended dropping) means the OPPOSITE of your recommendation. Then immediately record the decision and advance currentStage per the normal transition rule — do not ask about the same uncovered dimension again (anti-loop: at most ONE retention question per side).
-  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "B面：教师监督（已展开，作为主论点）；面对面互动（保留-略写）" or "...（用户放弃）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "B面：教师监督（已展开，作为主论点）；面对面互动（保留-略写）" or "...（用户放弃）" or "...（待补例子）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
 
-  1. Stage "explore_A": Explore Advantages of Side A (发散A面/如：线上优势)
-     - Preferred question: If Step1 dimensions already include online-flexibility/resource-access style ideas, explicitly quote that dimension and ask for concrete scenarios/target groups/mechanism. Example: "你已经提到『线上灵活性与资源可及性』，具体在哪些学习场景或人群上最能体现价值？"
-     - Fallback question: "第一步，我们先不要急着决定立场。先想一想：哪些情况下，线上教育确实具有明显优势？不用组织语言，想到什么写什么即可。"
+  1. Stage "explore_A": Explore Side A / Task 1 (按上面的题型映射)
+     - Preferred question: quote a Step1 dimension and ask for concrete scenarios/target groups/mechanism.
+     - Fallback question: ask for 1-2 concrete points for this side/task only.
      - Wait for student answer.
-     - Allowed Actions: Only ask about, validate, and record Side A points.
+     - Allowed Actions: Only ask about, validate, and record Side A / Task 1 points.
      - Next Stage Transition (sufficiency-gated):
        - FIRST apply the Dimension Coverage & Retention Rule's mandatory first step above. If it triggers, keep currentStage: "explore_A" this turn and ask the retention question instead of transitioning; only transition on the following turn after the student answers.
-       - IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side A — the information is already there. Briefly acknowledge and transition. Set currentStage: "explore_B".
-       - Transition to "explore_B" ONLY when the Side A content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension).
-       - If it is NOT sufficient (only a repeated label or one-liner without any concrete angle), STAY in "explore_A" and ask ONE depth follow-up instead of advancing. Keep currentStage: "explore_A".
-       - After that single follow-up, accept whatever is given and transition (respect the anti-loop guard: at most ONE follow-up per point).
+       - IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: "explore_B".
+       - Transition to "explore_B" ONLY when Side A content is enough to illustrate as a claim (not merely an echo/label of a Step1 dimension).
+       - If it is NOT sufficient (only a repeated label or one-liner without any concrete angle), STAY in "explore_A" and ask ONE depth follow-up with TWO concrete candidate directions. Keep currentStage: "explore_A".
+       - After that single follow-up, accept whatever is given, tag （待补例子） if still thin, and transition (anti-loop: at most ONE follow-up per point).
      - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "explore_B" when the sufficiency gate above passes.
      - Content-completeness boundary (apply before recording):
-       - If user answer is only a label repeat (or too shallow) with no concrete scenario/mechanism/target-group detail, ask ONE specific follow-up question and DO NOT invent details for them.
-       - Each slot/point can trigger at most ONE depth follow-up. After one follow-up, accept and move forward even if concise.
+       - If user answer is only a label repeat (or too shallow) with no concrete scenario/mechanism/target-group detail, ask ONE specific follow-up with TWO candidate directions and DO NOT invent details for them.
+       - Each slot/point can trigger at most ONE depth follow-up. After one follow-up, accept and move forward even if concise, but if still thin append "（待补例子）" in userPoints.
        - If user answer is already complete, you may refine wording (language polish) but must not add new factual content.
-     - Feedback format SHOULD be concise: "很好，目前我们记录到：[用户已给出的点]。"
+     - Feedback format MUST be concise: "很好，目前我们记录到：[用户已给出的点]。"
 
-  2. Stage "explore_B": Explore Advantages of Side B (发散B面/如：传统课堂优势)
-     - Preferred question: If Step1 dimensions already include offline-irreplaceability style ideas, explicitly quote that dimension and ask for concrete scenarios/target groups/mechanism. Example: "你已经提到『线下不可替代性（面对面互动、教师即时监督）』，哪一个课堂场景最能体现这种不可替代？对哪类学生影响最大？"
-     - Fallback question: "那再想想：哪些情况下，传统课堂/传统方式依然不可替代？"
+  2. Stage "explore_B": Explore Side B / Task 2 (按上面的题型映射)
+     - Preferred question: quote a Step1 dimension and ask for concrete expansion of THIS side/task.
+     - For Positive / Negative evaluation sides: explicitly collect both the positive angle and the negative angle before leaving this stage.
+     - Fallback question: ask for 1-2 concrete points for this side/task only.
      - Wait for student answer.
-     - Allowed Actions: Only ask about, validate, and record Side B points.
+     - Allowed Actions: Only ask about, validate, and record Side B / Task 2 points.
      - Next Stage Transition (sufficiency-gated):
        - FIRST apply the Dimension Coverage & Retention Rule's mandatory first step above. If it triggers, keep currentStage: "explore_B" this turn and ask the retention question instead of transitioning; only transition on the following turn after the student answers.
-       - IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side B — the information is already there. Briefly acknowledge and transition. Set currentStage: "stance".
-       - Transition to "stance" ONLY when the Side B content is sufficient enough for further illustration as a claim (not merely an echo/label of a Step1 dimension such as "面对面互动，教师即时监督").
-       - If it is NOT sufficient, STAY in "explore_B" and ask ONE depth follow-up (concrete scenario / mechanism / beneficiary) instead of advancing. Keep currentStage: "explore_B".
-       - After that single follow-up, accept whatever is given and transition (anti-loop: at most ONE follow-up per point).
+       - IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: "stance".
+       - Transition to "stance" ONLY when Side B content is enough to illustrate as a claim (not merely an echo/label of a Step1 dimension).
+       - If it is NOT sufficient, STAY in "explore_B" and ask ONE depth follow-up with TWO concrete candidate directions. Keep currentStage: "explore_B".
+       - After that single follow-up, accept whatever is given, tag （待补例子） if still thin, and transition (anti-loop: at most ONE follow-up per point).
      - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "stance" when the sufficiency gate above passes.
      - Content-completeness boundary (apply before recording):
-       - If user answer only repeats known labels (e.g. "面对面互动，教师即时监督与纪律管理") without new concrete info, ask ONE specific follow-up and DO NOT auto-fill concrete expansion by yourself.
+       - If user answer only repeats known labels without new concrete info, ask ONE specific follow-up with TWO candidate directions and DO NOT auto-fill concrete expansion by yourself.
        - You MUST NOT introduce new mechanism/scenario/beneficiary details that the user never said.
        - If user answer is complete, language polish is allowed without adding new facts.
-     - Feedback format SHOULD be concise: "很好，传统课堂优势目前记录到：[用户已给出的点]。"
+     - Feedback format MUST be concise: "很好，目前我们记录到：[用户已给出的点]。"
 
   3. Stage "stance": Determine overall stance & formulate stance sentence
-     - Target Question: "结合刚才想到的这些内容，你最终更倾向于哪一种立场？\n① 完全同意\n② 部分同意\n③ 完全不同意\n\n请告诉我序号，并用一两句话（中文即可）描述你对这道题目的具体立场。"
+     - Default Target Question (Agree/Disagree style): "结合刚才想到的这些内容，你最终更倾向于哪一种立场？\n① 完全同意\n② 部分同意\n③ 完全不同意\n\n请告诉我序号，并用一两句话（中文即可）描述你对这道题目的具体立场。"
+     - For Positive / Negative (or outweigh-style) questions, use: "结合刚才的利弊点，你最终更倾向于哪一种立场？\n① 完全积极\n② 利大于弊\n③ 弊大于利\n④ 完全消极\n\n请告诉我序号，并用一两句话说明理由。"
+     - Wording rule: call ②/③ "带让步的立场". NEVER call 弊大于利 / 利大于弊 a "折中立场".
+     - FORBIDDEN: recommending which stance option is safer/better/more common (e.g. "多数稳妥路径是弊大于利" / "建议选③"). Present options neutrally; after the student chooses, only check consistency with their brainstormed points.
      - Wait for student answer.
      - Allowed Actions: Only ask about and validate their overall stance and stance description.
      - Next Stage Transition: When they provide the stance choice/description, validate and transition to "summary". Set currentStage: "summary".
@@ -1184,16 +1723,17 @@ Review the context above and the current step's instructions. Organize and devel
      - Allowed Actions: Once in "summary", you must evaluate the layout and structure of the planned Body paragraphs based on the brainstormed points.
        - **Strict Constraint**: Do NOT generate 4+ body paragraphs. In IELTS Task 2, an essay should strictly contain **only 2 or 3 Body Paragraphs (主体段)**.
        - You must analyze the brainstormed points (Side A and Side B) and determine how they should be mapped into these 2-3 body paragraphs. Specifically, decide whether certain points should be combined into a single paragraph (e.g. combined under a unified theme), kept separate (e.g. Side A in Body 1, Side B in Body 2), or dropped entirely if they are weak or redundant.
-       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "保留-略写", "用户放弃"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
+       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "保留-略写", "用户放弃", "待补例子"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
          - A point tagged "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point (not promoted to its own body paragraph, not silently dropped).
          - A point tagged "用户放弃" MUST be listed in clustering.outliers with a suggestion noting the student already chose to drop it during brainstorming.
+         - A point tagged "待补例子" MUST NOT be described as "完整性极高". Mark Completeness as "待补充具体例子", and either ask one short example question before finishing OR clearly note that Step 3 should start by adding a concrete scene.
        - **AI Paragraph Layout Evaluation**:
          - In your final Socratic text response in Stage "summary", you MUST explicitly present this layout to the student.
          - For each proposed Body Paragraph (Body 1, Body 2, etc.), provide a clear evaluation assessing three dimensions:
            - **写作难度 (Writing Difficulty)**: (e.g., Low/Medium/High, explaining why)
-           - **完整性 (Completeness)**: (e.g., whether it forms a solid, logical closed loop)
+           - **完整性 (Completeness)**: honest status — "可写" / "待补充具体例子" / "素材不足". NEVER say "完整性极高" when any mapped point is tagged 待补例子 or lacks a concrete scene.
            - **篇幅 (Paragraph Length)**: (e.g., whether it has too few or too many ideas, and a suggestion on length)
-         - Present this evaluation warmly and clearly in Chinese.
+         - Keep the evaluation compact; avoid long ceremonial praise.
        - You MUST answer internally for every planned Body paragraph:
          1. Is there enough material to support a complete IELTS body paragraph (about 90–110 words)?
          2. If not: DO NOT finish Stage 2. Continue Socratic dialogue by asking the user for more ideas or details specifically for the body paragraph(s) that lack sufficient material, and remain in Stage 2.
@@ -1496,7 +2036,9 @@ ${stepGuidelines}
 
 - Match the current step's context. Help them improve.
 - Keep the tone encouraging, professional, and tutor-like. Use ONLY Chinese for explanations and guidance.
-- CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time.
+- CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time. In explore stages, do NOT renumber or paraphrase the student's answer into a long structured summary.
+- INTERNAL-ONLY RULE (CRITICAL, applies to all steps): Internal brief / pre-analysis fields (questionBrief, writingDestination, taskMap, hasHardQualifiers, candidateDirectionSeeds, evalNote) may ONLY decide what to ask, whether to ask, and whether content is sufficient. They MUST NEVER appear in student-facing text as the Coach's preferred answers, recommended stance, preferred causes, or ready-made conclusions. Coach core value = guided practice; do NOT force the Coach's opinions onto the student.
+- NATURAL LANGUAGE & CONTINUITY RULE (CRITICAL, applies to all steps): Every question you ask (except the very first question of a brand-new step) MUST read as a natural continuation of the conversation, not an isolated template. Any example wording given in these guidelines (e.g. "ask something like: '...'") is illustrative ONLY — rephrase it in your own natural words, referencing what the student just said/the topic just discussed, rather than reproducing the example sentence structure verbatim. NEVER turn an internal bookkeeping check (e.g. "is this dimension reusable", "does this cover both tasks", "is there a hard qualifier") into the literal question you ask the student — that logic must stay silent in progressUpdate; the student-facing question must be about the essay CONTENT itself, phrased the way a real human tutor would continue the dialogue.
 - CONTEXT-FIRST RULE (CRITICAL): Before asking for new ideas: 1. Review existing user ideas. 2. Determine whether they can be organized, grouped, compared, or developed. 3. Prefer using existing ideas. 4. Only ask for additional ideas when meaningful progress cannot be made from existing information.
 - SLOT REUSE RULE (CRITICAL, applies to all steps):
   - Before asking any new question, first scan: (a) Previous Steps Context, (b) conversation history, (c) current user message.
@@ -1507,17 +2049,18 @@ ${stepGuidelines}
     1) EMPTY: no usable answer -> ask the slot question.
     2) FILLED_SHALLOW: has a label/fragment but missing key specifics (mechanism, scenario, beneficiary, causal link, or required step element) -> ask ONE depth follow-up, and NEVER auto-invent missing details.
     3) FILLED_OK: key specifics are present -> you may polish wording to be CLEARER and SIMPLER (NOT more academic or fancy), keeping it easy to translate into simple English, but must NOT add new factual content.
-  - Anti-loop guard: each slot/point allows at most ONE depth follow-up. After one follow-up, accept concise content and continue progressing (you may note "可继续深化" in critique, but do not keep looping).
+  - Anti-loop guard: each slot/point allows at most ONE depth follow-up. After one follow-up, accept concise content and continue progressing. If the accepted content is still thin (no concrete scene/mechanism/beneficiary), append "（待补例子）" in the relevant progress field / userPoints so later stages stay honest. You may note "可继续深化" in critique, but do not keep looping.
 - NO INTERNAL JARGON IN CHAT TEXT (CRITICAL, applies to ALL steps 1–5):
   - The "text" field is ONLY for the student. "progressUpdate" is ONLY for the system/UI. Never mix them.
   - FORBIDDEN in Part 1 or Part 2: raw JSON field names, English enum/stage values, or implementation vocabulary, including:
     - Step 1: correctType, coreIssue, constraints, suggestedDimensions, step1Data, slot
     - Step 2: currentStage, explore_A, explore_B, stance, summary, userPoints, clustering, outliers, blueprint, KEEP_MINOR, DROP, EXPAND_BOTH
     - Step 3: paragraphPlan, pointBlock, total_then_points, direct_points, single_point, step3SubpointSteps, expansionStrategy, major, minor
+    - Internal brief: questionBrief, writingDestination, taskMap, hasHardQualifiers, candidateDirectionSeeds, evalNote, recommendedStance, easyCauses
     - Global: progressUpdate, isCompleted, JSON, schema, enum
   - ALLOWED: natural Chinese that conveys the SAME meaning (题型、关键限定、A面/B面、详写/略写、先总起再分点、两个方向…).
   - When you make an internal decision, write it to progressUpdate silently; in text, give at most 1–2 sentences of user-facing summary, then immediately ask the next concrete question.
-  - Do NOT narrate your decision process (e.g. "我决定采用…模式", "经过诊断这是 Multi-point", "我为你选择了 total_then_points").
+  - Do NOT narrate your decision process (e.g. "我决定采用…模式", "经过诊断这是 Multi-point", "我为你选择了 total_then_points", "由于题目中没有 entirely/only…我们跳过限定词").
 - PROACTIVE MOMENTUM AND GUIDANCE (CRITICAL): NEVER end a response without a clear next-step instruction, guiding question, or actionable prompt.
   - If the student's input is a brief affirmation, acknowledgement, or filler word (e.g., "嗯", "然后呢", "好的", "好的好的", "对", "对的", "是", "是的", "对，没有了", "嗯呢", "好的，明白"), you MUST NOT respond with simple filler phrases (like "很好。我们继续。") without a clear, specific follow-up question.
   - Instead, you MUST immediately analyze where you are in the current step's tasklist, formulate the next concrete, constructive question in the Socratic sequence (e.g., ask about constraints, underlying contradiction, or ask them to map their thoughts into an argument stance/subpoints), and present it clearly as the next specific question.
@@ -1955,6 +2498,8 @@ Student says:
       // Step 1 deterministic safety net (A): if the student already echoed a scope
       // qualifier that exists in the essay question, credit it into constraints even
       // when the model left the slot empty, and repair a redundant "限定词" question.
+      // Also apply hard-qualifier gate (B): when the question itself has no hard
+      // qualifiers, auto-fill constraints=["无明显限定词"] so Coach never invents one.
       if (currentStepNum === 1 && data?.progressUpdate) {
         const backfilled = backfillStep1Constraints(
           question,
@@ -1962,7 +2507,18 @@ Student says:
           data.progressUpdate,
           session,
         );
-        if (backfilled.length > 0 && data?.text) {
+        const noHardFilled = applyNoHardQualifierGate(
+          question,
+          data.progressUpdate,
+          session,
+        );
+        const repairedLabels =
+          backfilled.length > 0
+            ? backfilled
+            : noHardFilled
+              ? [NO_HARD_QUALIFIER_MARKER]
+              : [];
+        if (repairedLabels.length > 0 && data?.text) {
           const split = splitTwoParts(data.text, 1);
           if (split.part1 && looksLikeConstraintQuestion(split.part2)) {
             const s1 = data.progressUpdate.step1Data || {};
@@ -1974,13 +2530,15 @@ Student says:
               (Array.isArray(oldDims) && oldDims.some((d: any) => String(d || "").trim()));
             const nextPart2 = dimsFilled
               ? "关键限定我已经帮你记下了。四个审题要素都齐了，请点击下方【下一步】按钮，我们进入第二步：确定立场与论点。"
-              : `关键限定我已经帮你记下了（你提到的「${backfilled.join("、")}」）。那我们直接看下一步：为了回答这道题，需要从哪些方面来比较或展开？请列出 2~4 个讨论维度。`;
+              : noHardFilled
+                ? "为了回答这道题，我们需要从哪些方面来比较或展开？请列出 2~4 个中性维度名称即可（先不要下利弊结论）。"
+                : `关键限定我已经帮你记下了（你提到的「${backfilled.join("、")}」）。那我们直接看下一步：为了回答这道题，需要从哪些方面来比较或展开？请列出 2~4 个讨论维度。`;
             data.text = `${split.part1.trim()}\n\n---\n\n${nextPart2}`;
             if (dimsFilled) {
               data.progressUpdate.isCompleted = true;
             }
             console.warn(
-              `[Step1Guard] Backfilled constraints=${JSON.stringify(backfilled)} and repaired redundant qualifier question.`,
+              `[Step1Guard] Filled constraints=${JSON.stringify(repairedLabels)} and repaired redundant qualifier question.`,
             );
           }
         }
@@ -2154,7 +2712,7 @@ Student says:
         "${userAnalysisText}"
 
         Analyze the question yourself first:
-        1. Determine the correct IELTS Question Type (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages, Two-part Question, or Problem / Solution).
+        1. Determine the correct IELTS Question Type (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages, Two-part Question, Problem / Solution, Positive / Negative, or Other).
         2. Identify the central core issue/controversy.
         3. Identify any critical scope constraints (e.g. "entirely", "only", "always", specific target groups).
 

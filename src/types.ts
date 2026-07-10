@@ -2,7 +2,7 @@ export interface Topic {
   id: string;
   question: string;
   topic: 'Education' | 'Technology' | 'Environment' | 'Government' | 'Health' | 'Media' | 'Crime' | 'Culture' | 'Work';
-  questionType: 'Agree / Disagree' | 'Discuss Both Views' | 'Advantages / Disadvantages' | 'Two-part Question' | 'Problem / Solution';
+  questionType: 'Agree / Disagree' | 'Discuss Both Views' | 'Advantages / Disadvantages' | 'Two-part Question' | 'Problem / Solution' | 'Positive / Negative' | 'Other';
   difficulty: 'Easy' | 'Medium' | 'Hard';
 }
 

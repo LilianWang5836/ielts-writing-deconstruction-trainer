@@ -47,7 +47,7 @@ export const PRESET_TOPICS: Topic[] = [
     id: 't7',
     question: 'As the world becomes more interconnected, traditional cultural values and languages are being lost. What are the main causes of this, and is it a positive or negative development?',
     topic: 'Culture',
-    questionType: 'Two-part Question',
+    questionType: 'Positive / Negative',
     difficulty: 'Hard',
   },
   {

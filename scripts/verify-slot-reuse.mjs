@@ -33,15 +33,145 @@ mustContain(
 mustContain("## Step 1 Slot Checklist (按缺口推进，不重复提问)", "step1 slot checklist");
 mustContain("Cross-slot extraction is mandatory", "step1 cross-slot extraction instruction");
 mustContain("线上教育是否会完全替代传统课堂", "step1 entirely skip example (mirrors real case)");
+mustContain(
+  "Per-slot feedback — no spoiler (CRITICAL):",
+  "step1 per-slot no-spoiler feedback rule",
+);
+mustContain(
+  "correctType filled, coreIssue missing -> confirm the type label only",
+  "step1 Q1 feedback must not spoil coreIssue",
+);
+mustContain(
+  'BAD (Q1 correct, coreIssue still missing): "它包含两个任务：分析原因 + 判断积极消极。"',
+  "step1 no-spoiler bad example",
+);
+mustContain(
+  'GOOD (Q1 correct): "Two-part，判断正确。"',
+  "step1 no-spoiler good Q1 example",
+);
+mustContain(
+  "Student-facing silence on skip (CRITICAL): never explain this gate in chat",
+  "step1 hard-qualifier skip must stay silent in chat",
+);
+mustContain(
+  'BAD (coreIssue correct, auto-skip constraints): "由于题目中没有 entirely/only',
+  "step1 bad example: narrating hard-qualifier skip",
+);
+mustNotContain(
+  "我们不需要做特殊的去极端化思考",
+  "no de-extremization narration in prompt examples",
+);
+
+// Step 1 suggestedDimensions anti-fabrication + sufficiency gate
+mustContain(
+  "suggestedDimensions anti-fabrication rule (CRITICAL — do not pad to hit the count):",
+  "step1 dimensions anti-fabrication rule header",
+);
+mustContain(
+  "You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach the 2~4 target count.",
+  "step1 dimensions anti-fabrication hard rule",
+);
+mustContain(
+  'adding "文化身份认同" (never mentioned) as a 3rd dimension to look more thorough is FABRICATION and FORBIDDEN',
+  "step1 dimensions anti-fabrication violation example",
+);
+mustContain(
+  "Sufficiency gate: if the student's message truly yields only ONE genuine dimension, do NOT fabricate a second one and do NOT mark the step complete yet",
+  "step1 dimensions sufficiency gate forbids premature completion",
+);
+mustContain(
+  "at most ONE such follow-up for this slot; after that, accept whatever the student gives",
+  "step1 dimensions follow-up is anti-loop bounded",
+);
+mustContain(
+  "Feedback proportionality: Part 1's confirmation must match what was ACTUALLY given.",
+  "step1 dimensions feedback proportionality rule",
+);
+mustContain(
+  "suggestedDimensions has only 1 genuine dimension so far after both tasks -> use the sufficiency-gate follow-up above",
+  "step1 dimensions missing-slot template covers single-dimension case",
+);
+
+// Step 1 granularity calibration (entry points, not content — do not drift into Step 2)
+mustContain(
+  "Granularity calibration (CRITICAL — Step 1 collects ENTRY POINTS, not content; do not drift into Step 2's job):",
+  "step1 granularity calibration header",
+);
+mustContain(
+  'If the student\'s answer is ALREADY a full causal chain or concrete scenario (e.g. "人们为了有更多的工作机会，会重点学习主流语言，母语会被忽略"), do NOT chase it deeper',
+  "step1 granularity: abstract-up example mirrors real case",
+);
+mustContain(
+  'Do NOT ask "这会带来什么影响" / "这是好事还是坏事" / "举个例子" while still in the suggestedDimensions slot',
+  "step1 granularity: forbids Step2-style content questions in Step1",
+);
+mustContain(
+  "This is the mirror-image of the global FILLED_SHALLOW follow-up rule",
+  "step1 granularity: mirrors FILLED_SHALLOW rule in the opposite direction",
+);
+
+// Step 1 per-task dimension flow (compound question types)
+mustContain(
+  "Per-task dimension flow (CRITICAL — ONLY for compound question types where questionBrief.taskMap names 2 distinct tasks",
+  "step1 per-task dimension flow header",
+);
+mustContain(
+  "phrase BOTH as natural, direct ANGLE-level questions — never as a meta/procedural question about the analysis method itself, and never as a Step-2-style content/evaluation question",
+  "step1 per-task dimension flow: angle-level, not content-level, phrasing",
+);
+mustContain(
+  'FORBIDDEN framing: asking the student to judge whether their Task A angles "同样适用/是否可复用"',
+  "step1 per-task dimension flow: forbids meta reusability framing",
+);
+mustContain(
+  'FORBIDDEN framing (Granularity — CRITICAL): do NOT ask "这会带来什么影响" / "是好事还是坏事" / "举个例子"',
+  "step1 per-task dimension flow: forbids Step2-style Task B content framing",
+);
+mustContain(
+  "Do NOT invent the Task B dimension yourself — it must come from what the student actually said.",
+  "step1 per-task dimension flow: Task B dimension must come from student",
+);
+mustContain(
+  "Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total):",
+  "step1 per-task sufficiency header",
+);
+mustContain(
+  "do not silently transition to the next task with only 1 angle recorded for the current one",
+  "step1 per-task sufficiency: forbids premature task transition with only 1 angle",
+);
+mustContain(
+  "Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on",
+  "step1 per-task sufficiency: anti-loop bounded per task",
+);
+mustContain(
+  "Single-task question types (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages) keep the existing single generic",
+  "step1 per-task dimension flow: single-task types unaffected",
+);
+mustContain(
+  "Tag each recorded dimension with which task(s) it covers using a short natural-language suffix",
+  "step1 per-task dimension flow: dimension task tagging",
+);
+mustContain(
+  "missing suggestedDimensions, compound type, Task A not yet answered -> use the Per-task dimension flow above, Task A question.",
+  "step1 missing-slot template: compound type Task A",
+);
+mustContain(
+  "Task A answered, Task B not yet answered (compound type) -> use the Per-task dimension flow above, Task B question (guided by Task A's answer).",
+  "step1 missing-slot template: compound type Task B",
+);
+mustContain(
+  "Task A dimensions given, Task B dimensions missing (compound type) -> confirm Task A's dimension(s) only; do NOT preview",
+  "step1 no-spoiler rule covers Task A -> Task B transition",
+);
 
 // Step 2 dynamic dimension and anti-autofill
 mustContain("Dimension-aware questioning rule (CRITICAL):", "step2 dimension-aware rule");
 mustContain(
-  "Preferred question: If Step1 dimensions already include online-flexibility/resource-access style ideas",
+  "Preferred question: quote a Step1 dimension and ask for concrete scenarios/target groups/mechanism.",
   "step2 explore_A preferred question",
 );
 mustContain(
-  "Preferred question: If Step1 dimensions already include offline-irreplaceability style ideas",
+  "Preferred question: quote a Step1 dimension and ask for concrete expansion of THIS side/task.",
   "step2 explore_B preferred question",
 );
 mustContain("If user answer only repeats known labels", "step2 no label-repeat autofill rule");
@@ -56,21 +186,21 @@ mustContain("若是 FILLED_SHALLOW：最多追问一次具体化问题", "step3 
 // Step 2 explore sufficiency gating (explore_A + explore_B)
 mustContain("Next Stage Transition (sufficiency-gated):", "explore sufficiency-gated transition header");
 mustContain(
-  "Transition to \"explore_B\" ONLY when the Side A content is sufficient enough for further illustration as a claim",
+  "Transition to \"explore_B\" ONLY when Side A content is enough to illustrate as a claim",
   "explore_A sufficiency gate",
 );
 mustContain(
-  "Transition to \"stance\" ONLY when the Side B content is sufficient enough for further illustration as a claim",
+  "Transition to \"stance\" ONLY when Side B content is enough to illustrate as a claim",
   "explore_B sufficiency gate",
 );
 mustContain('STAY in "explore_A" and ask ONE depth follow-up', "explore_A not-sufficient branch");
 mustContain('STAY in "explore_B" and ask ONE depth follow-up', "explore_B not-sufficient branch");
 mustContain(
-  'IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side A',
+  "IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: \"explore_B\".",
   "explore_A sufficient no-reask branch",
 );
 mustContain(
-  'IF SUFFICIENT (already enough to illustrate as a claim) AND the retention rule did NOT trigger: do NOT re-ask or repeat any depth question about Side B',
+  "IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: \"stance\".",
   "explore_B sufficient no-reask branch",
 );
 
@@ -84,11 +214,11 @@ mustContain(
   "step2 retention rule is a mandatory pre-transition check",
 );
 mustContain(
-  "plus the student's own current/prior message on this side",
+  "Also check progressUpdate.step2Data.userPoints / prior user messages on this side",
   "step2 retention trigger covers user-introduced dimensions",
 );
 mustContain(
-  "not a mere synonym/rephrasing of it — a substantively different angle",
+  "only develops ONE of those named sub-dimensions",
   "step2 retention rule excludes synonym repeats",
 );
 mustContain(
@@ -151,6 +281,14 @@ mustContain(
   "step2 retention guard: last-question extractor exists",
 );
 mustContain(
+  "function extractCoachQuestionsWindow(",
+  "step2 retention guard: multi-turn coach question window exists",
+);
+mustContain(
+  "coachQuestionsWindow",
+  "step2 retention guard: coverage check uses coach question window",
+);
+mustContain(
   "await applyStep2RetentionGuard(data, session, userMessage, messages, question);",
   "step2 retention guard: wired into coach handler",
 );
@@ -193,14 +331,80 @@ mustContain(
   "step2 summary maps retained dimension to minor point",
 );
 mustContain(
-  'A point tagged "用户放弃" MUST be listed in clustering.outliers',
-  "step2 summary maps dropped dimension to outliers",
+  'A point tagged "待补例子" MUST NOT be described as "完整性极高"',
+  "step2 summary stays honest about thin points tagged 待补例子",
+);
+mustContain(
+  "Question-type stage mapping (CRITICAL)",
+  "step2 maps explore stages by question type",
+);
+mustContain(
+  "Dual readiness check (CRITICAL",
+  "step2 distinguishes logicValid vs exampleReady",
+);
+
+// questionBrief + INTERNAL-ONLY (top-down ask strategy; never force Coach opinions)
+mustContain("function buildQuestionBrief(", "questionBrief builder exists");
+mustContain("function formatQuestionBriefForPrompt(", "questionBrief formatter exists");
+mustContain("function applyNoHardQualifierGate(", "hard-qualifier gate safety net exists");
+mustContain(
+  "INTERNAL-ONLY RULE (CRITICAL, applies to all steps):",
+  "global INTERNAL-ONLY RULE",
+);
+mustContain(
+  "NATURAL LANGUAGE & CONTINUITY RULE (CRITICAL, applies to all steps):",
+  "global natural language & continuity rule",
+);
+mustContain(
+  "Any example wording given in these guidelines (e.g. \"ask something like: '...'\") is illustrative ONLY — rephrase it in your own natural words",
+  "global rule: example wording is illustrative only, must be rephrased",
+);
+mustContain(
+  'NEVER turn an internal bookkeeping check (e.g. "is this dimension reusable", "does this cover both tasks", "is there a hard qualifier") into the literal question you ask the student',
+  "global rule: forbids exposing internal bookkeeping checks as student-facing questions",
+);
+mustContain(
+  "Hard-qualifier gate (from INTERNAL questionBrief — CRITICAL):",
+  "step1 hard-qualifier gate in prompt",
+);
+mustContain(
+  'If questionBrief.hasHardQualifiers=false: do NOT ask the constraints question',
+  "step1 skips constraints when no hard qualifiers",
+);
+mustContain(
+  'Structural preview ONLY (optional, one short clause): e.g. "下面我们按：原因段 → 评价段 来梳理"',
+  "step1 completion preview is structural only",
+);
+mustContain(
+  'FORBIDDEN: recommending which stance option is safer/better/more common (e.g. "多数稳妥路径是弊大于利" / "建议选③")',
+  "step2 stance forbids recommending a preferred stance",
+);
+mustContain(
+  "Candidate directions MUST be neutral: do NOT imply which direction is easier, safer, or higher-scoring",
+  "step2 candidate directions must stay neutral",
+);
+mustContain(
+  "You may privately consult questionBrief.candidateDirectionSeeds, but never present them as preferred answers",
+  "step2 candidateDirectionSeeds are internal-only",
+);
+mustContain(
+  "Internal brief: questionBrief, writingDestination, taskMap, hasHardQualifiers, candidateDirectionSeeds, evalNote, recommendedStance, easyCauses",
+  "NO INTERNAL JARGON lists brief fields including rejected content fields",
+);
+mustNotContain("recommendedStance:", "no recommendedStance field assignment in brief");
+mustNotContain("easyPath", "no easyPath content-suggestion structure");
+mustNotContain(
+  "可轻提示：多数稳妥路径",
+  "no soft stance recommendation phrasing",
 );
 
 // Step 3 length budget
 mustContain("LENGTH BUDGET (decide mode & detail BEFORE writing steps):", "step3 length budget header");
 mustContain("targets about 90-110 words total", "step3 90-110 word budget");
-mustContain("For a 2-point claim, do NOT mark both pointBlocks as 'major'.", "step3 no-two-major rule");
+mustContain(
+  "Do NOT mechanically force major+minor for symmetric two-point claims.",
+  "step3 no-two-major rule",
+);
 mustContain("Length-aware balance:", "step3 length-aware balance rule");
 
 // Step 3 plain-language / writability standard

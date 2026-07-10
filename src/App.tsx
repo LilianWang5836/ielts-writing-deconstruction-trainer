@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import Header from './components/Header';
 import TopicSelector from './components/TopicSelector';
+import TopicImporter from './components/TopicImporter';
 import Step1Analysis from './components/Step1Analysis';
 import Step2Brainstorm from './components/Step2Brainstorm';
 import Step3Drafting from './components/Step3Drafting';
@@ -13,6 +14,8 @@ export default function App() {
   const [session, setSession] = useState<PracticeSession | null>(null);
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
   const [autoRedirectedSteps, setAutoRedirectedSteps] = useState<number[]>([]);
+  const [viewMode, setViewMode] = useState<'select' | 'import'>('select');
+  const [topicListVersion, setTopicListVersion] = useState(0);
 
   // Check backend health & API key on mount
   useEffect(() => {
@@ -154,13 +157,27 @@ export default function App() {
         <AnimatePresence mode="wait">
           {!activeTopic || !session ? (
             <motion.div
-              key="selector"
+              key={viewMode === 'import' ? 'importer' : 'selector'}
               initial={{ opacity: 0, y: 15 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -15 }}
               transition={{ duration: 0.25 }}
             >
-              <TopicSelector onSelectTopic={handleSelectTopic} />
+              {viewMode === 'import' ? (
+                <TopicImporter
+                  onBack={() => setViewMode('select')}
+                  onImported={() => {
+                    setTopicListVersion((v) => v + 1);
+                    setViewMode('select');
+                  }}
+                />
+              ) : (
+                <TopicSelector
+                  key={topicListVersion}
+                  onSelectTopic={handleSelectTopic}
+                  onOpenImporter={() => setViewMode('import')}
+                />
+              )}
             </motion.div>
           ) : (
             <motion.div
