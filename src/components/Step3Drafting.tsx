@@ -13,6 +13,10 @@ import {
 } from "lucide-react";
 import { Topic, PracticeSession } from "../types";
 import CoachChat from "./CoachChat";
+import {
+  canSelectSubpoint,
+  isStep3FullyComplete,
+} from "../utils/step3Quality";
 
 type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
 
@@ -41,7 +45,24 @@ export default function Step3Drafting({
     "第一个分论点\n第二个分论点";
 
   const clusters = session.step2.coachEvaluation?.clustering?.clusters;
-  const fallbackBodies = session.step2.coachEvaluation?.blueprint?.bodies;
+  const step2Blueprint = session.step2.coachEvaluation?.blueprint;
+  const fallbackBodiesFromArray = Array.isArray(step2Blueprint?.bodies)
+    ? step2Blueprint.bodies
+    : [];
+  // Keep parity with server-side digest fallback: support both bodies[] and body1/body2.
+  const fallbackBodies =
+    fallbackBodiesFromArray.length > 0
+      ? fallbackBodiesFromArray
+      : [
+          {
+            title: "Body Paragraph 1",
+            content: String(step2Blueprint?.body1 || "").trim(),
+          },
+          {
+            title: "Body Paragraph 2",
+            content: String(step2Blueprint?.body2 || "").trim(),
+          },
+        ].filter((b) => b.content.length > 0);
   const cleanedPointLines = subpointsStr
     .split(/(?:\n|;|；)/)
     .flatMap((p) => p.split(/(?=\b\d+\.\s)/))
@@ -58,6 +79,23 @@ export default function Step3Drafting({
     const pointLine = cleanedPointLines[idx];
     if (pointLine && pointLine.length >= 8) return pointLine;
     return fallback;
+  };
+
+  const splitUserPointsByTask = (raw: string): string[] => {
+    const text = String(raw || "").trim();
+    if (!text) return [];
+    const aMatch = text.match(/A面[^：:]*[：:]([\s\S]*?)(?=B面[^：:]*[：:]|$)/);
+    const bMatch = text.match(/B面[^：:]*[：:]([\s\S]*)$/);
+    const aText = String(aMatch?.[1] || "")
+      .replace(/^[；;，,\s]+|[；;，,\s]+$/g, "")
+      .trim();
+    const bText = String(bMatch?.[1] || "")
+      .replace(/^[；;，,\s]+|[；;，,\s]+$/g, "")
+      .trim();
+    if (aText || bText) {
+      return [aText, bText].filter(Boolean);
+    }
+    return [];
   };
 
   const parsedSubpoints: Step3Subpoint[] = clusters && Array.isArray(clusters) && clusters.length > 0
@@ -82,19 +120,29 @@ export default function Step3Drafting({
         theme: body.title || `主题 ${i + 1}`,
         isCompleted: false,
       }))
-    : subpointsStr
-        .split(/(?:\n|;|；)/)
-        .flatMap((p) => p.split(/(?=\b\d+\.\s)/))
-        .map((p) => p.trim())
-        .filter((p) => p !== "")
-        .map((p, i) => ({
-          id: `sp-${i}`,
+    : (() => {
+        const taskBuckets = splitUserPointsByTask(subpointsStr);
+        const fallbackLines =
+          taskBuckets.length > 0
+            ? taskBuckets
+            : subpointsStr
+                .split(/(?:\n|;|；)/)
+                .flatMap((p) => p.split(/(?=\b\d+\.\s)/))
+                .map((p) => p.trim())
+                .filter((p) => p !== "");
+        return fallbackLines.map((p, i) => ({
+          id: `body-${i + 1}`,
           content: p,
           points: [p],
           targetBody: `Body Paragraph ${i + 1}`,
           theme: `分论点 ${i + 1}`,
           isCompleted: false,
         }));
+      })();
+
+  const parsedSubpointsSignature = parsedSubpoints
+    .map((sp) => `${sp.id}:${String(sp.content || "").trim()}`)
+    .join("|");
 
   const subpoints =
     session.step3.subpoints &&
@@ -104,9 +152,13 @@ export default function Step3Drafting({
 
   useEffect(() => {
     setActiveTab("step3");
+    const existing = session.step3.subpoints || [];
+    const shapeChanged =
+      !existing ||
+      existing.length !== parsedSubpoints.length ||
+      existing.some((sp, idx) => sp.id !== parsedSubpoints[idx]?.id);
     if (
-      !session.step3.subpoints ||
-      session.step3.subpoints.length !== parsedSubpoints.length
+      shapeChanged
     ) {
       const currentActive = session.step3.activeSubpointId;
       const activeStillExists =
@@ -123,7 +175,7 @@ export default function Step3Drafting({
         },
       });
     }
-  }, [parsedSubpoints.length, onUpdateSession, session.step3]);
+  }, [parsedSubpoints.length, parsedSubpointsSignature, onUpdateSession, session.step3]);
 
   useEffect(() => {
     if (
@@ -142,6 +194,25 @@ export default function Step3Drafting({
     });
   }, [onUpdateSession, session.step3, subpoints]);
 
+  // If session points at a later body while earlier ones are incomplete, reset
+  // to the first incomplete body (sequential lock).
+  useEffect(() => {
+    const activeId = session.step3.activeSubpointId;
+    if (!activeId || subpoints.length === 0) return;
+    if (canSelectSubpoint(subpoints, activeId)) return;
+    const firstAllowed =
+      subpoints.find((sp) => canSelectSubpoint(subpoints, sp.id))?.id ||
+      subpoints[0].id;
+    if (firstAllowed && firstAllowed !== activeId) {
+      onUpdateSession({
+        step3: {
+          ...session.step3,
+          activeSubpointId: firstAllowed,
+        },
+      });
+    }
+  }, [session.step3.activeSubpointId, subpoints, onUpdateSession, session.step3]);
+
   const activeSubpoint = subpoints.find(
     (s) => s.id === session.step3.activeSubpointId,
   );
@@ -149,7 +220,8 @@ export default function Step3Drafting({
     ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先判断这是单点还是多点论点，用大白话简要说明结构安排，然后直接开始第一个具体问题；结构细节写入系统即可，不要在对话里提字段名。`
     : "";
 
-  const isStep3Finished = session.step3.isCompleted || (subpoints.length > 0 && subpoints.every((s) => s.isCompleted));
+  // Board quality is authoritative — never unlock from a stale isCompleted flag alone.
+  const isStep3Finished = isStep3FullyComplete(session, subpoints);
 
   const strategyLabel: Record<string, string> = {
     explanation: "解释",
@@ -201,7 +273,7 @@ export default function Step3Drafting({
                   <div className="text-left">
                     <h4 className="font-sans font-bold text-emerald-900 text-xs">🎉 论证逻辑链全通关！</h4>
                     <p className="font-sans text-[11px] text-emerald-700 leading-normal">
-                      两个核心分论点的逻辑链已构建完成，即将为你<strong>自动切换</strong>到下一步学术句式升级...
+                      两个核心分论点的逻辑链已构建完成。点击下方按钮，进入下一步学术句式升级。
                     </p>
                   </div>
                 </div>
@@ -248,10 +320,14 @@ export default function Step3Drafting({
               ← 主体段列表
             </button>
             <div className="h-4 w-px bg-slate-200 shrink-0 mx-0.5"></div>
-            {subpoints.map((sp, idx) => (
+            {subpoints.map((sp, idx) => {
+              const tabSelectable = canSelectSubpoint(subpoints, sp.id);
+              return (
               <button
                 key={sp.id}
+                disabled={!tabSelectable}
                 onClick={() => {
+                  if (!tabSelectable) return;
                   onUpdateSession({
                     step3: { ...session.step3, activeSubpointId: sp.id }
                   });
@@ -259,7 +335,9 @@ export default function Step3Drafting({
                 className={`text-[11px] font-sans font-bold px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 shrink-0 border ${
                   sp.id === session.step3.activeSubpointId
                     ? "bg-indigo-650 text-white border-indigo-650 shadow-sm"
-                    : "bg-white text-slate-600 border-slate-200 hover:border-slate-300"
+                    : tabSelectable
+                    ? "bg-white text-slate-600 border-slate-200 hover:border-slate-300"
+                    : "bg-slate-50 text-slate-400 border-slate-100 cursor-not-allowed opacity-60"
                 }`}
               >
                 <span>{sp.targetBody || `主体段 ${idx + 1}`}</span>
@@ -267,7 +345,8 @@ export default function Step3Drafting({
                   <CheckCircle2 className={`h-3.5 w-3.5 ${sp.id === session.step3.activeSubpointId ? 'text-white' : 'text-emerald-500'}`} />
                 )}
               </button>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -286,10 +365,14 @@ export default function Step3Drafting({
                 </p>
               </div>
               <div className="w-full max-w-md space-y-3">
-                {subpoints.map((subpoint, idx) => (
+                {subpoints.map((subpoint, idx) => {
+                  const selectable = canSelectSubpoint(subpoints, subpoint.id);
+                  return (
                   <button
                     key={subpoint.id}
+                    disabled={!selectable}
                     onClick={() => {
+                      if (!selectable) return;
                       onUpdateSession({
                         step3: {
                           ...session.step3,
@@ -298,7 +381,11 @@ export default function Step3Drafting({
                         }
                       });
                     }}
-                    className="w-full border border-slate-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/20 rounded-xl p-4 text-left transition-all hover:shadow-3xs group flex items-start gap-3.5"
+                    className={`w-full border rounded-xl p-4 text-left transition-all flex items-start gap-3.5 ${
+                      selectable
+                        ? 'border-slate-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/20 hover:shadow-3xs group'
+                        : 'border-slate-100 bg-slate-50/60 opacity-60 cursor-not-allowed'
+                    }`}
                   >
                     <span className="h-6 w-6 rounded-full bg-indigo-50 text-indigo-600 font-sans font-bold text-xs flex items-center justify-center shrink-0 group-hover:bg-indigo-100">
                       {idx + 1}
@@ -331,6 +418,8 @@ export default function Step3Drafting({
                       <span className="text-[10px] text-slate-450 flex items-center gap-1 font-semibold mt-2.5">
                         {subpoint.isCompleted ? (
                           <span className="text-emerald-600 flex items-center gap-1 font-bold">✓ 论证逻辑已闭环</span>
+                        ) : !selectable ? (
+                          <span className="text-slate-400">请先完成前面的主体段</span>
                         ) : (
                           <span>待构建论证链条 · 点击开始</span>
                         )}
@@ -338,7 +427,8 @@ export default function Step3Drafting({
                     </div>
                     <ArrowRight className="h-4 w-4 text-slate-400 group-hover:text-indigo-500 transition self-center shrink-0" />
                   </button>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ) : (

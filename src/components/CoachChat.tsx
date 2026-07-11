@@ -2,6 +2,20 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
+import {
+  applyStudentAnswerToTargetStep,
+  clearAllStep3PlanValues,
+  isKickoffOrInstructionText,
+  isParagraphPlanQualityFilled,
+  isPlaceholderEchoValue,
+  isStep3FullyComplete,
+  isSubpointGenuinelyComplete,
+  isValidStep3StepValue,
+  guardStep3ValueProvenance,
+  guardFlatStep3ValueProvenance,
+  sanitizeParagraphPlanValues,
+  sanitizeStructureStepsValues,
+} from '../utils/step3Quality';
 
 interface CoachChatProps {
   topic: Topic;
@@ -214,24 +228,55 @@ export default function CoachChat({
   // step actually carries a value. This is the client-side guard that stops
   // the model from prematurely unlocking Step 4 (or auto-advancing the tab)
   // while the paragraphPlan still has empty steps.
-  const isParagraphPlanFilled = (plan: any) => {
-    if (!plan || !Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) {
-      return false;
-    }
-    return plan.pointBlocks.every(
-      (block: any) =>
-        Array.isArray(block?.steps) &&
-        block.steps.length > 0 &&
-        block.steps.every((step: any) => step && String(step.value || '').trim()),
-    );
+  const isParagraphPlanFilled = (plan: any) => isParagraphPlanQualityFilled(plan);
+
+  const isSubpointLogicComplete = (sp: any) =>
+    isSubpointGenuinelyComplete(sp);
+
+  const isSubstantiveStep3Answer = (msg: string) => {
+    const t = String(msg || '').trim();
+    if (t.length < 4) return false;
+    if (isKickoffOrInstructionText(t)) return false;
+    return !/^(对|是|是的|对的|好的|嗯|明白|好|继续|下一步|ok|okay|yes)$/i.test(t);
   };
 
-  const isSubpointLogicComplete = (sp: any) => {
-    if (!sp) return false;
-    if (sp.paragraphPlan) return isParagraphPlanFilled(sp.paragraphPlan);
-    if (Array.isArray(sp.structureSteps) && sp.structureSteps.length > 0) {
-      return sp.structureSteps.every((step: any) => String(step?.value || '').trim());
+  // If the model forgot to write the student's answer into the first empty
+  // board step (common on the final link), backfill it from this turn's message.
+  const backfillFirstEmptyStepFromUser = (
+    sp: any,
+    userMessage: string,
+    skipBackfill?: boolean,
+  ) => {
+    if (!sp || skipBackfill || !isSubstantiveStep3Answer(userMessage)) return false;
+    const answer = String(userMessage).trim();
+
+    // Treat a placeholder-echo (model copied its own "例如：..." hint into
+    // value) the same as empty — it is not the student's actual answer.
+    const needsFill = (step: any) =>
+      !isValidStep3StepValue(String(step?.value || '')) ||
+      isPlaceholderEchoValue(String(step?.value || ''), String(step?.placeholder || ''));
+
+    if (sp.paragraphPlan && Array.isArray(sp.paragraphPlan.pointBlocks)) {
+      for (const block of sp.paragraphPlan.pointBlocks) {
+        if (!Array.isArray(block?.steps)) continue;
+        for (const step of block.steps) {
+          if (needsFill(step)) {
+            step.value = answer;
+            return true;
+          }
+        }
+      }
     }
+
+    if (Array.isArray(sp.structureSteps)) {
+      for (const step of sp.structureSteps) {
+        if (needsFill(step)) {
+          step.value = answer;
+          return true;
+        }
+      }
+    }
+
     return false;
   };
 
@@ -312,6 +357,9 @@ export default function CoachChat({
           stepContext,
           session: sessionForRequest,
           userMessage: textToSend.trim(),
+          ...(stepKey === 'step3' && hiddenUserMessage
+            ? { isHiddenKickoff: true }
+            : {}),
         }),
       });
 
@@ -332,6 +380,7 @@ export default function CoachChat({
       if (data.progressUpdate) {
         // Real-time synchronization of step1Data, step2Data, and step3Data as the student chats
         if (stepKey === 'step1' && data.progressUpdate.step1Data) {
+          const boardOverrides = session.step1.boardOverrides || {};
           sessionUpdates.step1 = {
             ...session.step1,
             userAnalysisNotes: (() => {
@@ -347,8 +396,13 @@ export default function CoachChat({
             coachEvaluation: {
               ...(session.step1.coachEvaluation || {}),
               ...data.progressUpdate.step1Data,
+              ...boardOverrides,
             },
-            isCompleted: data.progressUpdate.isCompleted || session.step1.isCompleted || false,
+            // Honor explicit false from server (premature-completion guard).
+            isCompleted:
+              data.progressUpdate.isCompleted === false
+                ? false
+                : Boolean(data.progressUpdate.isCompleted || session.step1.isCompleted),
           };
         } else if (stepKey === 'step2' && data.progressUpdate.step2Data) {
           sessionUpdates.step2 = {
@@ -360,18 +414,31 @@ export default function CoachChat({
               ...(session.step2.coachEvaluation || {}),
               ...data.progressUpdate.step2Data,
             },
-            isCompleted: data.progressUpdate.isCompleted || session.step2.isCompleted || false,
+            isCompleted:
+              data.progressUpdate.isCompleted === false
+                ? false
+                : Boolean(data.progressUpdate.isCompleted || session.step2.isCompleted),
           };
         } else if (stepKey === 'step3' && data.progressUpdate.step3Data) {
           sessionUpdates.step3 = {
             ...session.step3,
             userDraft: data.progressUpdate.step3Data.userDraft || session.step3.userDraft,
-            isCompleted: data.progressUpdate.isCompleted || session.step3.isCompleted || false,
+            // Never OR-in a stale true; server false must win.
+            isCompleted:
+              data.progressUpdate.isCompleted === false
+                ? false
+                : Boolean(data.progressUpdate.isCompleted || session.step3.isCompleted),
           };
         }
 
         if (data.progressUpdate.isCompleted) {
           if (stepKey === 'step1') {
+            const boardOverrides = session.step1.boardOverrides || {};
+            const mergedEval = {
+              ...(session.step1.coachEvaluation || {}),
+              ...(data.progressUpdate.step1Data || {}),
+              ...boardOverrides,
+            };
             sessionUpdates.step1 = {
               ...session.step1,
               ...(sessionUpdates.step1 || {}),
@@ -385,7 +452,7 @@ export default function CoachChat({
                 }
                 return `${prevNotes} | ${newMsg}`;
               })(),
-              coachEvaluation: data.progressUpdate.step1Data || session.step1.coachEvaluation,
+              coachEvaluation: Object.keys(mergedEval).length > 0 ? mergedEval : session.step1.coachEvaluation,
               isCompleted: true,
             };
           } else if (stepKey === 'step2') {
@@ -442,10 +509,27 @@ export default function CoachChat({
                 updatedSp.result = data.progressUpdate.step3SubpointResult;
               }
               if (data.progressUpdate.paragraphPlan) {
+                const prevPlanSnapshot = updatedSp.paragraphPlan
+                  ? JSON.parse(JSON.stringify(updatedSp.paragraphPlan))
+                  : null;
                 updatedSp.paragraphPlan = mergeParagraphPlan(
                   updatedSp.paragraphPlan,
                   data.progressUpdate.paragraphPlan,
                 );
+                sanitizeParagraphPlanValues(updatedSp.paragraphPlan);
+                // Same provenance firewall as the server: planning drafts must
+                // not leak into later empty value slots in this turn.
+                guardStep3ValueProvenance(updatedSp.paragraphPlan, prevPlanSnapshot);
+                if (hiddenUserMessage) {
+                  // Kickoff = planning draft only; never confirm values.
+                  clearAllStep3PlanValues(updatedSp.paragraphPlan);
+                } else if (isSubstantiveStep3Answer(textToSend)) {
+                  applyStudentAnswerToTargetStep(
+                    updatedSp.paragraphPlan,
+                    prevPlanSnapshot,
+                    textToSend,
+                  );
+                }
               }
               if (
                 Array.isArray(data.progressUpdate.step3SubpointSteps) &&
@@ -455,11 +539,35 @@ export default function CoachChat({
                 // chosen logic chain. Preserve previously captured values (matched by key)
                 // when an incoming entry's value is empty, so a re-declaration turn does
                 // not wipe progress.
-                updatedSp.structureSteps = mergeLogicSteps(
-                  updatedSp.structureSteps || [],
-                  data.progressUpdate.step3SubpointSteps,
+                const prevFlat = updatedSp.structureSteps || [];
+                updatedSp.structureSteps = sanitizeStructureStepsValues(
+                  mergeLogicSteps(
+                    prevFlat,
+                    data.progressUpdate.step3SubpointSteps,
+                  ),
+                );
+                guardFlatStep3ValueProvenance(updatedSp.structureSteps, prevFlat);
+                if (hiddenUserMessage) {
+                  updatedSp.structureSteps = updatedSp.structureSteps.map(
+                    (s: any) => ({ ...s, value: "" }),
+                  );
+                }
+              } else if (updatedSp.structureSteps) {
+                updatedSp.structureSteps = sanitizeStructureStepsValues(
+                  updatedSp.structureSteps,
                 );
               }
+
+              // Safety net: if the board still has an empty step but the student
+              // just answered it, write the answer in before the completion gate.
+              if (!isSubpointLogicComplete(updatedSp)) {
+                backfillFirstEmptyStepFromUser(
+                  updatedSp,
+                  textToSend,
+                  hiddenUserMessage,
+                );
+              }
+
               if (data.progressUpdate.step3SubpointCompletenessChecks) {
                 updatedSp.completenessChecks = data.progressUpdate.step3SubpointCompletenessChecks;
               }
@@ -469,13 +577,17 @@ export default function CoachChat({
               if (data.progressUpdate.step3SubpointSufficiencyCheck) {
                 updatedSp.sufficiencyCheck = data.progressUpdate.step3SubpointSufficiencyCheck;
               }
-              // Completion gate: only honor the model's "completed" flag once the
-              // logic chain is actually filled in. This runs AFTER paragraphPlan /
-              // structureSteps merges so it inspects the merged state.
-              if (data.progressUpdate.step3SubpointCompleted === true) {
-                updatedSp.isCompleted = isSubpointLogicComplete(updatedSp);
-              } else if (data.progressUpdate.step3SubpointCompleted === false) {
+              // Completion gate: board fullness is authoritative.
+              // - Explicit false keeps it incomplete (server premature-completion guard).
+              // - Explicit true OR omitted: mark complete only when every planned
+              //   step has a value (after the backfill safety net above).
+              if (data.progressUpdate.step3SubpointCompleted === false || hiddenUserMessage) {
                 updatedSp.isCompleted = false;
+              } else {
+                updatedSp.isCompleted = isSubpointGenuinelyComplete(updatedSp, {
+                  currentUserMessage: hiddenUserMessage ? '' : textToSend,
+                  isHiddenKickoff: hiddenUserMessage,
+                });
               }
               return updatedSp;
             }
@@ -514,14 +626,32 @@ export default function CoachChat({
             subpointDraft = parts.join('\n\n');
           }
 
-          const finalSubpoints = updatedSubpoints.map((sp: any) => 
-            sp.id === activeId ? { ...sp, draft: subpointDraft } : sp
-          );
+          const finalSubpoints = updatedSubpoints.map((sp: any) => {
+            // Re-validate EVERY body: board quality + real student dialogue.
+            const withDraft =
+              sp.id === activeId ? { ...sp, draft: subpointDraft } : { ...sp };
+            const genuine = isSubpointGenuinelyComplete(withDraft, {
+              currentUserMessage:
+                sp.id === activeId && !hiddenUserMessage ? textToSend : undefined,
+              isHiddenKickoff: hiddenUserMessage && sp.id === activeId,
+            });
+            return {
+              ...withDraft,
+              isCompleted: genuine,
+            };
+          });
 
           // If all subpoints are completed, we can also auto-complete Step 3.
           // Note: per-subpoint isCompleted is now gated on the logic chain being
           // actually filled, so this cannot flip true while steps are empty.
-          const allSubpointsDone = finalSubpoints.length > 0 && finalSubpoints.every((sp: any) => sp.isCompleted);
+          const provisionalStep3 = {
+            ...currentStep3,
+            subpoints: finalSubpoints,
+          };
+          const allSubpointsDone = isStep3FullyComplete(
+            { ...session, step3: provisionalStep3 },
+            finalSubpoints,
+          );
 
           // Plan A auto-advance: when the CURRENT body just became complete and
           // another body still needs work, move the active tab to the next
@@ -553,6 +683,12 @@ export default function CoachChat({
       }
 
       const finalHistory = [...updatedHistory, newAiMessage];
+      if (data.progressUpdate?.memory) {
+        sessionUpdates = {
+          ...sessionUpdates,
+          memory: data.progressUpdate.memory,
+        };
+      }
       if (stepKey === 'step3' && activeSubpointIdAtSend) {
         const step3State = sessionUpdates.step3 || session.step3;
         const nextSubpoints = (step3State.subpoints || []).map((sp: any) =>

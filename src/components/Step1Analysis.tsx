@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { motion } from 'motion/react';
-import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Award, Layers } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Layers, Pencil, Plus, Trash2, Check } from 'lucide-react';
 import { Topic, PracticeSession } from '../types';
 import CoachChat from './CoachChat';
 
@@ -10,6 +9,9 @@ interface Step1AnalysisProps {
   onUpdateSession: (updates: Partial<PracticeSession>) => void;
   onNextStep: () => void;
 }
+
+type BoardOverrides = NonNullable<PracticeSession['step1']['boardOverrides']>;
+type EditableField = keyof BoardOverrides;
 
 export default function Step1Analysis({
   topic,
@@ -21,6 +23,9 @@ export default function Step1Analysis({
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [activeTab, setActiveTab] = useState<'step1' | 'step2' | 'step3' | 'step4'>('step1');
+  const [editingField, setEditingField] = useState<EditableField | null>(null);
+  const [draftText, setDraftText] = useState('');
+  const [draftList, setDraftList] = useState<string[]>([]);
 
   // Auto-focus active tab on mount
   useEffect(() => {
@@ -84,6 +89,85 @@ export default function Step1Analysis({
     score: 0
   } : null);
 
+  // Jump button only after the coach emits the Step 1 completion CTA
+  // ("进入第二步"), not merely when slots look filled mid Task-B questioning.
+  const showNextStepButton = useMemo(() => {
+    if (!session.step1.isCompleted) return false;
+    const history = session.step1.chatHistory || [];
+    return history.some(
+      (m) =>
+        m.sender === 'ai' &&
+        typeof m.text === 'string' &&
+        (m.text.includes('进入第二步') ||
+          m.text.includes('进入第二阶段') ||
+          /进入\s*Step\s*2/i.test(m.text)),
+    );
+  }, [session.step1.isCompleted, session.step1.chatHistory]);
+
+  const applyBoardPatch = (patch: BoardOverrides) => {
+    if (!evalData) return;
+    const nextOverrides: BoardOverrides = {
+      ...(session.step1.boardOverrides || {}),
+      ...patch,
+    };
+    // Invalidate step1 digest so the next coach turn rebuilds from board edits.
+    const nextMemory = session.memory
+      ? { ...session.memory, step1: undefined }
+      : undefined;
+    onUpdateSession({
+      step1: {
+        ...session.step1,
+        boardOverrides: nextOverrides,
+        coachEvaluation: {
+          ...evalData,
+          ...patch,
+        },
+      },
+      ...(nextMemory ? { memory: nextMemory } : {}),
+    });
+  };
+
+  const startEditText = (field: EditableField, current: string) => {
+    setEditingField(field);
+    setDraftText(current || '');
+    setDraftList([]);
+  };
+
+  const startEditList = (field: 'constraints' | 'suggestedDimensions', current: string[]) => {
+    setEditingField(field);
+    setDraftList(current.length > 0 ? [...current] : ['']);
+    setDraftText('');
+  };
+
+  const cancelEdit = () => {
+    setEditingField(null);
+    setDraftText('');
+    setDraftList([]);
+  };
+
+  const saveTextField = (field: 'correctType' | 'coreIssue' | 'writingTask' | 'keyQualifier') => {
+    applyBoardPatch({ [field]: draftText.trim() });
+    cancelEdit();
+  };
+
+  const saveListField = (field: 'constraints' | 'suggestedDimensions') => {
+    const cleaned = draftList.map((item) => item.trim()).filter(Boolean);
+    applyBoardPatch({ [field]: cleaned });
+    cancelEdit();
+  };
+
+  const EditButton = ({ onClick }: { onClick: () => void }) => (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-500 hover:bg-slate-100 hover:text-indigo-700"
+      title="编辑"
+    >
+      <Pencil className="h-3 w-3" />
+      编辑
+    </button>
+  );
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
       {/* LEFT COLUMN: AI Coach Dialogue Area */}
@@ -110,8 +194,8 @@ ${topic.question}
             </div>
           )}
 
-          {/* Coach Controls / Action bar - Auto-progression upon AI completion */}
-          {session.step1.isCompleted && (
+          {/* Coach Controls / Action bar — only after completion CTA */}
+          {showNextStepButton && (
             <div className="mt-4 border-t border-emerald-100 pt-3.5 animate-fade-in">
               <div className="bg-emerald-50 border border-emerald-200/80 rounded-xl p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-xs">
                 <div className="flex items-center gap-2.5">
@@ -121,7 +205,7 @@ ${topic.question}
                   <div className="text-left">
                     <h4 className="font-sans font-bold text-emerald-900 text-xs">🎉 审题诊断通关！</h4>
                     <p className="font-sans text-[11px] text-emerald-700 leading-normal">
-                      AI Coach 已认定你完成了审题，即将为你<strong>自动切换</strong>到下一步观点生成...
+                      AI Coach 已认定你完成了审题。点击下方按钮，进入下一步观点生成。
                     </p>
                   </div>
                 </div>
@@ -199,16 +283,76 @@ ${topic.question}
                 <div className="bg-slate-50 border border-slate-200/60 rounded-xl p-4 space-y-4">
                   {/* ① 题型 */}
                   <div>
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">① 题型 (Question Type)</span>
-                    <p className={`text-sm ${evalData.correctType ? 'text-indigo-900 font-bold' : 'text-slate-400 italic font-medium'}`}>
-                      {evalData.correctType || "🔍 正在倾听并识别题型..."}
-                    </p>
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">① 题型 (Question Type)</span>
+                      {editingField !== 'correctType' && (
+                        <EditButton onClick={() => startEditText('correctType', evalData.correctType || '')} />
+                      )}
+                    </div>
+                    {editingField === 'correctType' ? (
+                      <div className="space-y-2">
+                        <input
+                          value={draftText}
+                          onChange={(e) => setDraftText(e.target.value)}
+                          className="w-full rounded border border-indigo-200 bg-white px-2.5 py-1.5 text-sm text-indigo-900 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                          placeholder="例如：Two-part Question"
+                          autoFocus
+                        />
+                        <div className="flex gap-2">
+                          <button type="button" onClick={() => saveTextField('correctType')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-indigo-700">
+                            <Check className="h-3 w-3" /> 保存
+                          </button>
+                          <button type="button" onClick={cancelEdit} className="rounded px-2.5 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-100">取消</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className={`text-sm ${evalData.correctType ? 'text-indigo-900 font-bold' : 'text-slate-400 italic font-medium'}`}>
+                        {evalData.correctType || "🔍 正在倾听并识别题型..."}
+                      </p>
+                    )}
                   </div>
 
                   {/* ② 核心议题 & 写作任务 */}
                   <div>
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">② 核心议题 & 写作任务 (Writing Task)</span>
-                    {evalData.writingTask || evalData.coreIssue ? (
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">② 核心议题 & 写作任务 (Writing Task)</span>
+                      {editingField !== 'coreIssue' && editingField !== 'writingTask' && (
+                        <EditButton onClick={() => startEditText('coreIssue', evalData.coreIssue || '')} />
+                      )}
+                    </div>
+                    {editingField === 'coreIssue' || editingField === 'writingTask' ? (
+                      <div className="space-y-2 bg-white p-2.5 rounded border border-indigo-150">
+                        <label className="block text-[10px] font-semibold text-slate-400">
+                          {editingField === 'coreIssue' ? '核心议题' : '写作任务'}
+                        </label>
+                        <textarea
+                          value={draftText}
+                          onChange={(e) => setDraftText(e.target.value)}
+                          rows={2}
+                          className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                          autoFocus
+                        />
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => saveTextField(editingField)}
+                            className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-indigo-700"
+                          >
+                            <Check className="h-3 w-3" /> 保存
+                          </button>
+                          {editingField === 'coreIssue' && (
+                            <button
+                              type="button"
+                              onClick={() => startEditText('writingTask', evalData.writingTask || '')}
+                              className="rounded px-2.5 py-1 text-[10px] font-semibold text-indigo-600 hover:bg-indigo-50"
+                            >
+                              改写作任务
+                            </button>
+                          )}
+                          <button type="button" onClick={cancelEdit} className="rounded px-2.5 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-100">取消</button>
+                        </div>
+                      </div>
+                    ) : evalData.writingTask || evalData.coreIssue ? (
                       <div className="space-y-1 bg-white p-2.5 rounded border border-slate-150 shadow-3xs">
                         {evalData.coreIssue && (
                           <p className="text-xs text-slate-700 leading-relaxed font-semibold">
@@ -228,8 +372,50 @@ ${topic.question}
 
                   {/* ③ 关键限定 */}
                   <div>
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">③ 关键限定词 (Key Qualifiers)</span>
-                    {evalData.keyQualifier || (evalData.constraints && evalData.constraints.length > 0) ? (
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">③ 关键限定词 (Key Qualifiers)</span>
+                      {editingField !== 'constraints' && (
+                        <EditButton onClick={() => startEditList('constraints', evalData.constraints || [])} />
+                      )}
+                    </div>
+                    {editingField === 'constraints' ? (
+                      <div className="space-y-2 bg-white p-2.5 rounded border border-indigo-150">
+                        {draftList.map((item, i) => (
+                          <div key={i} className="flex items-center gap-1.5">
+                            <input
+                              value={item}
+                              onChange={(e) => {
+                                const next = [...draftList];
+                                next[i] = e.target.value;
+                                setDraftList(next);
+                              }}
+                              className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                              placeholder="限定词"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setDraftList(draftList.filter((_, idx) => idx !== i))}
+                              className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => setDraftList([...draftList, ''])}
+                          className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo-600 hover:text-indigo-800"
+                        >
+                          <Plus className="h-3 w-3" /> 添加
+                        </button>
+                        <div className="flex gap-2 pt-1">
+                          <button type="button" onClick={() => saveListField('constraints')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-indigo-700">
+                            <Check className="h-3 w-3" /> 保存
+                          </button>
+                          <button type="button" onClick={cancelEdit} className="rounded px-2.5 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-100">取消</button>
+                        </div>
+                      </div>
+                    ) : evalData.keyQualifier || (evalData.constraints && evalData.constraints.length > 0) ? (
                       <div className="space-y-1.5 bg-white p-2.5 rounded border border-slate-150 shadow-3xs">
                         <div className="flex flex-wrap gap-1">
                           {(evalData.constraints || []).map((c, i) => (
@@ -251,8 +437,50 @@ ${topic.question}
 
                   {/* ④ 建议讨论维度 */}
                   <div>
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">④ 建议讨论维度 (Suggested Dimensions)</span>
-                    {evalData.suggestedDimensions && evalData.suggestedDimensions.length > 0 ? (
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">④ 建议讨论维度 (Suggested Dimensions)</span>
+                      {editingField !== 'suggestedDimensions' && (
+                        <EditButton onClick={() => startEditList('suggestedDimensions', evalData.suggestedDimensions || [])} />
+                      )}
+                    </div>
+                    {editingField === 'suggestedDimensions' ? (
+                      <div className="space-y-2 mt-1">
+                        {draftList.map((item, i) => (
+                          <div key={i} className="flex items-center gap-1.5">
+                            <input
+                              value={item}
+                              onChange={(e) => {
+                                const next = [...draftList];
+                                next[i] = e.target.value;
+                                setDraftList(next);
+                              }}
+                              className="flex-1 rounded border border-indigo-200 bg-indigo-50/40 px-2.5 py-1.5 text-xs text-indigo-900 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                              placeholder="维度标签，如：经济发展"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setDraftList(draftList.filter((_, idx) => idx !== i))}
+                              className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => setDraftList([...draftList, ''])}
+                          className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo-600 hover:text-indigo-800"
+                        >
+                          <Plus className="h-3 w-3" /> 添加维度
+                        </button>
+                        <div className="flex gap-2 pt-1">
+                          <button type="button" onClick={() => saveListField('suggestedDimensions')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-indigo-700">
+                            <Check className="h-3 w-3" /> 保存
+                          </button>
+                          <button type="button" onClick={cancelEdit} className="rounded px-2.5 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-100">取消</button>
+                        </div>
+                      </div>
+                    ) : evalData.suggestedDimensions && evalData.suggestedDimensions.length > 0 ? (
                       <div className="grid grid-cols-2 gap-1.5 mt-1">
                         {evalData.suggestedDimensions.map((dim, i) => (
                           <div key={i} className="bg-indigo-50/50 border border-indigo-100 rounded px-2.5 py-1.5 text-xs text-indigo-900 font-semibold flex items-center gap-1.5">

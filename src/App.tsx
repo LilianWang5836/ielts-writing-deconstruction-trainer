@@ -13,7 +13,6 @@ export default function App() {
   const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
   const [session, setSession] = useState<PracticeSession | null>(null);
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
-  const [autoRedirectedSteps, setAutoRedirectedSteps] = useState<number[]>([]);
   const [viewMode, setViewMode] = useState<'select' | 'import'>('select');
   const [topicListVersion, setTopicListVersion] = useState(0);
 
@@ -43,17 +42,6 @@ export default function App() {
         const parsed: PracticeSession = JSON.parse(saved);
         setActiveTopic(parsed.topic);
         setSession(parsed);
-        
-        // Only skip auto-redirect for steps the user already advanced past (manual back-nav).
-        // If step1.isCompleted but currentStep is still 1, we must allow auto-redirect.
-        const completed: number[] = [];
-        const cur = parsed.currentStep || 1;
-        if (parsed.step1?.isCompleted && cur > 1) completed.push(1);
-        if (parsed.step2?.isCompleted && cur > 2) completed.push(2);
-        const step3Completed = parsed.step3?.isCompleted || (parsed.step3?.subpoints?.length > 0 && parsed.step3.subpoints.every((s: any) => s.isCompleted));
-        if (step3Completed && cur > 3) completed.push(3);
-        if (parsed.step4?.isCompleted && cur > 4) completed.push(4);
-        setAutoRedirectedSteps(completed);
       } catch (e) {
         console.error('Failed to restore session:', e);
       }
@@ -73,7 +61,6 @@ export default function App() {
     };
     setActiveTopic(topic);
     setSession(initialSession);
-    setAutoRedirectedSteps([]);
     localStorage.setItem('ielts_deconstruct_session', JSON.stringify(initialSession));
   };
 
@@ -101,46 +88,8 @@ export default function App() {
   const handleResetSession = () => {
     setActiveTopic(null);
     setSession(null);
-    setAutoRedirectedSteps([]);
     localStorage.removeItem('ielts_deconstruct_session');
   };
-
-  // Auto-transition to next step when completed while active on that step
-  useEffect(() => {
-    if (!session) return;
-    const { currentStep } = session;
-    
-    let timer: NodeJS.Timeout;
-    
-    if (currentStep === 1 && session.step1.isCompleted && !autoRedirectedSteps.includes(1)) {
-      timer = setTimeout(() => {
-        setAutoRedirectedSteps(prev => [...prev, 1]);
-        handleSetStep(2);
-      }, 2500);
-    } else if (currentStep === 2 && session.step2.isCompleted && !autoRedirectedSteps.includes(2)) {
-      timer = setTimeout(() => {
-        setAutoRedirectedSteps(prev => [...prev, 2]);
-        handleSetStep(3);
-      }, 2500);
-    } else if (currentStep === 3 && (session.step3.isCompleted || (session.step3.subpoints?.length > 0 && session.step3.subpoints.every((s: any) => s.isCompleted))) && !autoRedirectedSteps.includes(3)) {
-      timer = setTimeout(() => {
-        setAutoRedirectedSteps(prev => [...prev, 3]);
-        handleSetStep(4);
-      }, 2500);
-    }
-
-    return () => {
-      if (timer) clearTimeout(timer);
-    };
-  }, [
-    session?.currentStep,
-    session?.step1.isCompleted,
-    session?.step2.isCompleted,
-    session?.step3.isCompleted,
-    session?.step3.subpoints,
-    session?.step4.isCompleted,
-    autoRedirectedSteps
-  ]);
 
   return (
     <div className="min-h-screen lg:h-screen lg:overflow-hidden bg-slate-50/50 flex flex-col">

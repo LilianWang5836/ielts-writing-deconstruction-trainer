@@ -176,6 +176,15 @@ export interface PracticeSession {
       keyQualifier?: string;
       suggestedDimensions?: string[];
     };
+    /** User edits on the right-side board; always win over later AI progressUpdate merges. */
+    boardOverrides?: {
+      correctType?: string;
+      coreIssue?: string;
+      writingTask?: string;
+      keyQualifier?: string;
+      constraints?: string[];
+      suggestedDimensions?: string[];
+    };
     isCompleted: boolean;
     chatHistory?: ChatMessage[];
   };
@@ -265,5 +274,52 @@ export interface PracticeSession {
     isCompleted: boolean;
     chatHistory?: ChatMessage[];
   };
+  /**
+   * Cross-step stable digests. Rebuilt only when sourceHash mismatches
+   * (canonical fields changed, including boardOverrides). Never student-facing.
+   */
+  memory?: SessionMemory;
   createdAt: string;
+}
+
+/** Stable, hash-keyed snapshot of a prior step's converged state. */
+export interface Step1Digest {
+  sourceHash: string;
+  updatedAt: string;
+  questionType: string;
+  coreIssue: string;
+  constraints: string[];
+  dimensions: string[];
+  /** Slot names still missing or thin — ask only these. */
+  openGaps: string[];
+  filled: string[];
+}
+
+export interface Step2Digest {
+  sourceHash: string;
+  updatedAt: string;
+  currentStage: string;
+  thesis: string;
+  userPoints: string;
+  body1: string;
+  body2: string;
+  openGaps: string[];
+  filled: string[];
+}
+
+export interface Step3Digest {
+  sourceHash: string;
+  updatedAt: string;
+  activeSubpointId: string;
+  filledStepCount: number;
+  totalStepCount: number;
+  /** Empty step labels still needing content. */
+  openGaps: string[];
+  filled: string[];
+}
+
+export interface SessionMemory {
+  step1?: Step1Digest;
+  step2?: Step2Digest;
+  step3?: Step3Digest;
 }

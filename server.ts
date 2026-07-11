@@ -93,6 +93,23 @@ function splitTwoParts(
   return { ok: true, part1, part2, reason: "" };
 }
 
+/**
+ * When a guard overrides a model's draft conclusion (e.g. reverting a premature
+ * "summary" back to an explore stage), it must reuse ONLY the genuinely-separated
+ * Part 1 feedback — never the raw, unsplit draft text. If the model's response is
+ * missing the required "---" separator, `splitTwoParts` cannot isolate Part 1 from
+ * Part 2, and the raw text may already contain a Part-2-style "we're done" / full
+ * evaluation baked into one continuous block. Reusing it verbatim would carry that
+ * stale conclusion into the corrected response, producing a self-contradictory
+ * message. Fall back to a minimal, safe acknowledgment instead in that case —
+ * confirmed state must be decided BEFORE text is assembled, never patched after.
+ */
+function safeOverridePart1(text: string): string {
+  const split = splitTwoParts(text, 1);
+  if (split.ok) return split.part1;
+  return "好的，这部分内容我已经记下了。";
+}
+
 function fallbackNextStep(stepNum: number, session: any): string {
   if (stepNum === 1) {
     const eval1 = session?.step1?.coachEvaluation || {};
@@ -192,6 +209,10 @@ function sanitizeProgressUpdateWithSession(
 
   const step1New = progressUpdate?.step1Data;
   const step1Old = session?.step1?.coachEvaluation || {};
+  const boardOverrides =
+    session?.step1?.boardOverrides && typeof session.step1.boardOverrides === "object"
+      ? session.step1.boardOverrides
+      : {};
   if (step1New && typeof step1New === "object") {
     const step1StringKeys = [
       "correctType",
@@ -214,6 +235,13 @@ function sanitizeProgressUpdateWithSession(
       ) {
         delete step1New[key];
       }
+    }
+    // User board edits always win over AI rewrites for the same fields.
+    for (const [key, value] of Object.entries(boardOverrides)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === "string" && !String(value).trim()) continue;
+      if (Array.isArray(value) && value.length === 0) continue;
+      step1New[key] = value;
     }
   }
 
@@ -276,7 +304,51 @@ type QuestionBrief = {
   hardQualifiers: string[];
   /** INTERNAL ONLY — neutral direction seeds for stuck follow-ups; never quote as preferred answers. */
   candidateDirectionSeeds: string[];
+  /**
+   * Whether this prompt asks for a personal stance / overall judgment.
+   * false for pure what/why/how tasks (e.g. Problem/Solution, many Two-part).
+   * When false, Step 2 skips the "stance" stage and goes explore_B → summary.
+   */
+  requiresStance: boolean;
 };
+
+/** Explicit opinion/judgment asks — not "what measures should" style wording. */
+function hasExplicitStanceAsk(question: string): boolean {
+  const q = String(question || "").toLowerCase();
+  return (
+    /to what extent|agree or disagree|do you agree|agree\/disagree|your opinion|your view|do you think/.test(
+      q,
+    ) ||
+    /outweigh|positive or negative|positive.*negative|negative.*positive|is it a positive/.test(
+      q,
+    ) ||
+    /同意|不同意|你的看法|利大于弊|弊大于利|积极还是消极|正面还是负面|你认为/.test(q)
+  );
+}
+
+/**
+ * Deterministic: does this essay require a personal stance / overall judgment?
+ * Computed once in Step 1 via questionBrief; Step 2 must honor the skip.
+ */
+function detectRequiresStance(question: string, questionType: string): boolean {
+  const type = String(questionType || "").trim();
+  if (type === "Agree / Disagree") return true;
+  if (type === "Discuss Both Views") return true;
+  if (type === "Positive / Negative") return true;
+  if (type === "Advantages / Disadvantages") {
+    // Pure "discuss advantages and disadvantages" → no forced stance;
+    // outweigh / do you think → requires judgment.
+    return hasExplicitStanceAsk(question);
+  }
+  if (type === "Problem / Solution") {
+    return hasExplicitStanceAsk(question);
+  }
+  if (type === "Two-part Question" || type === "Other") {
+    return hasExplicitStanceAsk(question);
+  }
+  // Unknown type: only ask stance if the prompt explicitly requests judgment.
+  return hasExplicitStanceAsk(question);
+}
 
 function detectHardQualifiersInQuestion(question: string): string[] {
   const q = String(question || "");
@@ -375,6 +447,8 @@ function buildQuestionBrief(question: string, knownType?: string): QuestionBrief
     taskMap = { explore_A: "第一核心任务", explore_B: "第二核心任务（若有）" };
   }
 
+  const requiresStance = detectRequiresStance(question, questionType);
+
   return {
     questionType,
     writingDestination,
@@ -382,6 +456,7 @@ function buildQuestionBrief(question: string, knownType?: string): QuestionBrief
     hasHardQualifiers,
     hardQualifiers,
     candidateDirectionSeeds,
+    requiresStance,
   };
 }
 
@@ -393,9 +468,430 @@ taskMap.explore_A: ${brief.taskMap.explore_A}
 taskMap.explore_B: ${brief.taskMap.explore_B}
 hasHardQualifiers: ${brief.hasHardQualifiers ? "true" : "false"}
 hardQualifiers: ${brief.hardQualifiers.length > 0 ? brief.hardQualifiers.join("; ") : "(none)"}
+requiresStance: ${brief.requiresStance ? "true" : "false"}
 candidateDirectionSeeds (INTERNAL ONLY — when student is stuck after one shallow answer, turn into TWO neutral candidate directions; NEVER present as preferred/better answers): ${brief.candidateDirectionSeeds.join(" | ")}
 evalNote usage (INTERNAL): if the student's claim is already a direct result of the essay phenomenon, treat logicValid=true and only ask for a concrete scene when exampleReady=false. Never announce evaluative conclusions the student has not stated.
 ===============================================================================`;
+}
+
+function buildOverviewStance(brief: QuestionBrief): string {
+  const a = brief.taskMap.explore_A || "第一任务";
+  const b = brief.taskMap.explore_B || "第二任务";
+  return `本文按题目两个任务展开：先写「${a}」，再写「${b}」。`;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-step memory digests (stable digest + sourceHash + invalidation)
+// Rebuild ONLY when canonical source fields change. boardOverrides always
+// participate in the Step1 hash so user board edits invalidate stale digests.
+// questionBrief is intentionally NOT cached (cheap deterministic rules).
+// ---------------------------------------------------------------------------
+
+function stableHash(input: string): string {
+  // djb2 — fast, deterministic, good enough for cache keys (not crypto).
+  let h = 5381;
+  const s = String(input || "");
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h) ^ s.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function normalizeStringList(arr: any): string[] {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((d: any) => String(d || "").trim())
+    .filter((d: string) => d.length > 0);
+}
+
+function getMergedStep1Eval(session: any): Record<string, any> {
+  const eval1 = session?.step1?.coachEvaluation || {};
+  const overrides =
+    session?.step1?.boardOverrides && typeof session.step1.boardOverrides === "object"
+      ? session.step1.boardOverrides
+      : {};
+  return { ...eval1, ...overrides };
+}
+
+function computeStep1SourceHash(session: any, question: string): string {
+  const merged = getMergedStep1Eval(session);
+  const payload = [
+    String(question || "").trim(),
+    String(merged.correctType || "").trim(),
+    String(merged.coreIssue || "").trim(),
+    normalizeStringList(merged.constraints).join("|"),
+    normalizeStringList(merged.suggestedDimensions).join("|"),
+    session?.step1?.isCompleted ? "1" : "0",
+  ].join("\n");
+  return stableHash(payload);
+}
+
+function buildStep1Digest(session: any, question: string): any {
+  const merged = getMergedStep1Eval(session);
+  const questionType = String(merged.correctType || "").trim();
+  const coreIssue = String(merged.coreIssue || "").trim();
+  const constraints = normalizeStringList(merged.constraints);
+  const dimensions = normalizeStringList(merged.suggestedDimensions);
+  const filled: string[] = [];
+  const openGaps: string[] = [];
+  if (questionType) filled.push("correctType");
+  else openGaps.push("correctType");
+  if (coreIssue) filled.push("coreIssue");
+  else openGaps.push("coreIssue");
+  if (constraints.length > 0) filled.push("constraints");
+  else openGaps.push("constraints");
+  if (dimensions.length >= 2) filled.push("suggestedDimensions");
+  else openGaps.push("suggestedDimensions");
+
+  return {
+    sourceHash: computeStep1SourceHash(session, question),
+    updatedAt: new Date().toISOString(),
+    questionType,
+    coreIssue,
+    constraints,
+    dimensions,
+    openGaps,
+    filled,
+  };
+}
+
+function computeStep2SourceHash(session: any, question: string): string {
+  const eval2 = session?.step2?.coachEvaluation || {};
+  const blueprint = eval2.blueprint || session?.step2?.blueprint || {};
+  const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
+  const body1 = String(
+    bodies[0]?.content || bodies[0]?.title || blueprint.body1 || "",
+  ).trim();
+  const body2 = String(
+    bodies[1]?.content || bodies[1]?.title || blueprint.body2 || "",
+  ).trim();
+  const payload = [
+    String(question || "").trim(),
+    String(eval2.currentStage || session?.step2?.currentStage || "").trim(),
+    String(eval2.userStance || session?.step2?.userStance || "").trim(),
+    String(eval2.userPoints || session?.step2?.userPoints || "").trim(),
+    String(blueprint.position || eval2.suggestedStance || "").trim(),
+    body1,
+    body2,
+    session?.step2?.isCompleted ? "1" : "0",
+  ].join("\n");
+  return stableHash(payload);
+}
+
+function buildStep2Digest(session: any, question: string): any {
+  const eval2 = session?.step2?.coachEvaluation || {};
+  const blueprint = eval2.blueprint || session?.step2?.blueprint || {};
+  const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
+  const body1 = String(
+    bodies[0]?.content || bodies[0]?.title || blueprint.body1 || "",
+  ).trim();
+  const body2 = String(
+    bodies[1]?.content || bodies[1]?.title || blueprint.body2 || "",
+  ).trim();
+  const currentStage = String(
+    eval2.currentStage || session?.step2?.currentStage || "explore_A",
+  ).trim();
+  const thesis = String(
+    blueprint.position || eval2.suggestedStance || eval2.userStance || session?.step2?.userStance || "",
+  ).trim();
+  const userPoints = String(
+    eval2.userPoints || session?.step2?.userPoints || "",
+  ).trim();
+
+  const filled: string[] = [];
+  const openGaps: string[] = [];
+  if (userPoints) filled.push("userPoints");
+  else openGaps.push("userPoints");
+  if (thesis) filled.push("thesis");
+  else if (currentStage === "stance" || currentStage === "summary") {
+    // Pure what/why tasks do not require a personal stance — skip thesis gap.
+    const knownType =
+      String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+      undefined;
+    const brief = buildQuestionBrief(question, knownType);
+    if (brief.requiresStance) {
+      openGaps.push("thesis");
+    }
+  }
+  if (body1) filled.push("body1");
+  if (body2) filled.push("body2");
+  if (currentStage === "summary" && (!body1 || !body2)) {
+    if (!body1) openGaps.push("body1");
+    if (!body2) openGaps.push("body2");
+  }
+
+  return {
+    sourceHash: computeStep2SourceHash(session, question),
+    updatedAt: new Date().toISOString(),
+    currentStage,
+    thesis,
+    userPoints,
+    body1,
+    body2,
+    openGaps,
+    filled,
+  };
+}
+
+function computeStep3SourceHash(session: any, question: string): string {
+  const subpoints = Array.isArray(session?.step3?.subpoints)
+    ? session.step3.subpoints
+    : [];
+  const parts = subpoints.map((sp: any) => {
+    const plan = sp?.paragraphPlan;
+    const stepVals: string[] = [];
+    if (plan?.totalClaim) stepVals.push(`tc:${String(plan.totalClaim).trim()}`);
+    if (Array.isArray(plan?.pointBlocks)) {
+      for (const block of plan.pointBlocks) {
+        for (const step of block?.steps || []) {
+          stepVals.push(
+            `${String(step?.key || step?.label || "").trim()}=${String(step?.value || "").trim()}`,
+          );
+        }
+      }
+    } else if (Array.isArray(sp?.structureSteps)) {
+      for (const step of sp.structureSteps) {
+        stepVals.push(
+          `${String(step?.key || step?.label || "").trim()}=${String(step?.value || "").trim()}`,
+        );
+      }
+    }
+    return [
+      String(sp?.id || ""),
+      String(sp?.content || "").trim(),
+      String(plan?.mode || ""),
+      sp?.isCompleted ? "1" : "0",
+      stepVals.join(";"),
+    ].join("|");
+  });
+  const payload = [
+    String(question || "").trim(),
+    String(session?.step3?.activeSubpointId || "").trim(),
+    session?.step3?.isCompleted ? "1" : "0",
+    parts.join("\n"),
+  ].join("\n");
+  return stableHash(payload);
+}
+
+function buildStep3Digest(session: any, question: string): any {
+  const subpoints = Array.isArray(session?.step3?.subpoints)
+    ? session.step3.subpoints
+    : [];
+  const activeId = String(session?.step3?.activeSubpointId || "").trim();
+  const active =
+    subpoints.find((sp: any) => sp.id === activeId) || subpoints[0] || null;
+  const filled: string[] = [];
+  const openGaps: string[] = [];
+  let filledStepCount = 0;
+  let totalStepCount = 0;
+
+  const plan = active?.paragraphPlan;
+  if (plan && Array.isArray(plan.pointBlocks)) {
+    if (plan.mode === "total_then_points") {
+      totalStepCount += 1;
+      const tc = String(plan.totalClaim || "").trim();
+      if (tc) {
+        filledStepCount += 1;
+        filled.push("totalClaim");
+      } else {
+        openGaps.push("totalClaim");
+      }
+    }
+    for (const block of plan.pointBlocks) {
+      const blockLabel = String(block?.subClaim || block?.label || "分点").trim();
+      for (const step of block?.steps || []) {
+        totalStepCount += 1;
+        const label = String(step?.label || step?.key || "step").trim();
+        if (isGenuineStep3StepValue(step)) {
+          filledStepCount += 1;
+          filled.push(`${blockLabel}:${label}`);
+        } else {
+          openGaps.push(`${blockLabel}:${label}`);
+        }
+      }
+    }
+  } else if (Array.isArray(active?.structureSteps)) {
+    for (const step of active.structureSteps) {
+      totalStepCount += 1;
+      const label = String(step?.label || step?.key || "step").trim();
+      if (isGenuineStep3StepValue(step)) {
+        filledStepCount += 1;
+        filled.push(label);
+      } else {
+        openGaps.push(label);
+      }
+    }
+  }
+
+  return {
+    sourceHash: computeStep3SourceHash(session, question),
+    updatedAt: new Date().toISOString(),
+    activeSubpointId: activeId,
+    filledStepCount,
+    totalStepCount,
+    openGaps,
+    filled,
+  };
+}
+
+/**
+ * Resolve digests from session.memory when sourceHash still matches;
+ * otherwise rebuild. Returns { memory, rebuilt: string[] }.
+ */
+function resolveSessionMemory(
+  session: any,
+  question: string,
+): { memory: any; rebuilt: string[] } {
+  const prev = session?.memory && typeof session.memory === "object" ? session.memory : {};
+  const rebuilt: string[] = [];
+  const memory: any = {};
+
+  const s1Hash = computeStep1SourceHash(session, question);
+  if (prev.step1?.sourceHash === s1Hash && prev.step1) {
+    memory.step1 = prev.step1;
+  } else {
+    memory.step1 = buildStep1Digest(session, question);
+    rebuilt.push("step1");
+  }
+
+  const s2Hash = computeStep2SourceHash(session, question);
+  if (prev.step2?.sourceHash === s2Hash && prev.step2) {
+    memory.step2 = prev.step2;
+  } else {
+    memory.step2 = buildStep2Digest(session, question);
+    rebuilt.push("step2");
+  }
+
+  const s3Hash = computeStep3SourceHash(session, question);
+  if (prev.step3?.sourceHash === s3Hash && prev.step3) {
+    memory.step3 = prev.step3;
+  } else {
+    memory.step3 = buildStep3Digest(session, question);
+    rebuilt.push("step3");
+  }
+
+  return { memory, rebuilt };
+}
+
+/**
+ * After progressUpdate mutates step data, merge into a virtual session and
+ * rebuild digests so the client persists a fresh memory snapshot.
+ */
+function refreshMemoryAfterProgress(
+  session: any,
+  question: string,
+  progressUpdate: any,
+): any {
+  const virtual = {
+    ...(session || {}),
+    step1: { ...(session?.step1 || {}) },
+    step2: { ...(session?.step2 || {}) },
+    step3: { ...(session?.step3 || {}) },
+    memory: session?.memory,
+  };
+
+  if (progressUpdate?.step1Data && typeof progressUpdate.step1Data === "object") {
+    const boardOverrides = session?.step1?.boardOverrides || {};
+    virtual.step1.coachEvaluation = {
+      ...(session?.step1?.coachEvaluation || {}),
+      ...progressUpdate.step1Data,
+      ...boardOverrides,
+    };
+    if (progressUpdate.isCompleted === true) virtual.step1.isCompleted = true;
+    if (progressUpdate.isCompleted === false) virtual.step1.isCompleted = false;
+  }
+
+  if (progressUpdate?.step2Data && typeof progressUpdate.step2Data === "object") {
+    virtual.step2.coachEvaluation = {
+      ...(session?.step2?.coachEvaluation || {}),
+      ...progressUpdate.step2Data,
+    };
+    if (progressUpdate.step2Data.userStance) {
+      virtual.step2.userStance = progressUpdate.step2Data.userStance;
+    }
+    if (progressUpdate.step2Data.userPoints) {
+      virtual.step2.userPoints = progressUpdate.step2Data.userPoints;
+    }
+    if (progressUpdate.isCompleted === true) virtual.step2.isCompleted = true;
+    if (progressUpdate.isCompleted === false) virtual.step2.isCompleted = false;
+  }
+
+  if (Number(progressUpdate?.step) === 3 || progressUpdate?.paragraphPlan || progressUpdate?.step3SubpointSteps) {
+    // Step3 plan lives on the active subpoint; mirror into virtual for hashing.
+    const activeId =
+      session?.step3?.activeSubpointId ||
+      (Array.isArray(session?.step3?.subpoints) && session.step3.subpoints[0]?.id) ||
+      "";
+    const subpoints = Array.isArray(session?.step3?.subpoints)
+      ? session.step3.subpoints.map((sp: any) => {
+          if (sp.id !== activeId) return sp;
+          const next = { ...sp };
+          if (progressUpdate.paragraphPlan) {
+            next.paragraphPlan = progressUpdate.paragraphPlan;
+          }
+          if (Array.isArray(progressUpdate.step3SubpointSteps)) {
+            next.structureSteps = progressUpdate.step3SubpointSteps;
+          }
+          return next;
+        })
+      : [];
+    virtual.step3 = {
+      ...virtual.step3,
+      subpoints,
+      activeSubpointId: activeId,
+      isCompleted:
+        progressUpdate.isCompleted === true
+          ? true
+          : session?.step3?.isCompleted || false,
+    };
+  }
+
+  // Force rebuild from virtual (ignore stale prev hashes for fields we just mutated).
+  return {
+    step1: buildStep1Digest(virtual, question),
+    step2: buildStep2Digest(virtual, question),
+    step3: buildStep3Digest(virtual, question),
+  };
+}
+
+function formatMemoryDigestsForPrompt(memory: any): string {
+  if (!memory || typeof memory !== "object") return "";
+  const s1 = memory.step1;
+  const s2 = memory.step2;
+  const s3 = memory.step3;
+  const lines: string[] = [
+    "=== INTERNAL memory digests (stable; NEVER quote field names to the student) ===",
+    "Use filled items as already-known — do NOT re-ask them. Ask ONLY about openGaps.",
+  ];
+  if (s1) {
+    lines.push(
+      `[step1Digest] type=${s1.questionType || "(empty)"} | coreIssue=${s1.coreIssue || "(empty)"} | constraints=${(s1.constraints || []).join("; ") || "(empty)"} | dimensions=${(s1.dimensions || []).join("; ") || "(empty)"}`,
+    );
+    lines.push(
+      `  filled=[${(s1.filled || []).join(", ")}] openGaps=[${(s1.openGaps || []).join(", ")}]`,
+    );
+  }
+  if (s2) {
+    lines.push(
+      `[step2Digest] stage=${s2.currentStage || "(empty)"} | thesis=${s2.thesis || "(empty)"} | body1=${s2.body1 || "(empty)"} | body2=${s2.body2 || "(empty)"}`,
+    );
+    lines.push(
+      `  userPoints=${s2.userPoints || "(empty)"}`,
+    );
+    lines.push(
+      `  filled=[${(s2.filled || []).join(", ")}] openGaps=[${(s2.openGaps || []).join(", ")}]`,
+    );
+  }
+  if (s3) {
+    lines.push(
+      `[step3Digest] active=${s3.activeSubpointId || "(none)"} | steps=${s3.filledStepCount || 0}/${s3.totalStepCount || 0}`,
+    );
+    lines.push(
+      `  filled=[${(s3.filled || []).join(", ")}] openGaps=[${(s3.openGaps || []).join(", ")}]`,
+    );
+  }
+  lines.push("===============================================================================");
+  return lines.join("\n");
 }
 
 function detectEchoedQualifiers(question: string, userText: string): string[] {
@@ -495,6 +991,127 @@ function applyNoHardQualifierGate(
   return true;
 }
 
+/**
+ * Deterministic safety net for questionBrief.requiresStance=false:
+ * when the essay does not ask for a personal stance, never linger in "stance".
+ * Force explore_B → summary, auto-fill a neutral overview for blueprint.position,
+ * and rewrite any accidental stance-choice question in Part 2.
+ */
+function applyNoStanceGate(
+  question: string,
+  data: any,
+  session: any,
+): boolean {
+  if (!data?.progressUpdate || typeof data.progressUpdate !== "object") {
+    return false;
+  }
+  const progressUpdate = data.progressUpdate;
+
+  const knownType =
+    String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+    String(session?.step1?.boardOverrides?.questionType || "").trim() ||
+    undefined;
+  const brief = buildQuestionBrief(question, knownType);
+
+  const step2New =
+    progressUpdate.step2Data && typeof progressUpdate.step2Data === "object"
+      ? progressUpdate.step2Data
+      : null;
+  if (!step2New) return false;
+
+  // Stamp requiresStance every turn regardless of branch below, so the client
+  // stepper (Step2Brainstorm) can render 3 vs 4 stages without duplicating
+  // this deterministic detection logic.
+  step2New.requiresStance = brief.requiresStance;
+  progressUpdate.step2Data = step2New;
+  if (brief.requiresStance) return false;
+
+  const stage = String(
+    step2New.currentStage ||
+      session?.step2?.coachEvaluation?.currentStage ||
+      "",
+  ).trim();
+
+  const overview = buildOverviewStance(brief);
+  const existingStance = String(
+    step2New.userStance ||
+      session?.step2?.userStance ||
+      session?.step2?.coachEvaluation?.userStance ||
+      "",
+  ).trim();
+
+  let changed = false;
+
+  // Skip stance stage entirely: explore_B / stance → summary.
+  if (stage === "stance" || stage === "explore_B") {
+    // Only auto-advance to summary when leaving explore_B if the model already
+    // tried to enter stance, OR chat text is asking a stance-choice question.
+    const chatAsksStance = looksLikeStanceChoiceQuestion(String(data.text || ""));
+    if (stage === "stance" || chatAsksStance) {
+      step2New.currentStage = "summary";
+      changed = true;
+    }
+  }
+
+  if (
+    String(step2New.currentStage || "").trim() === "summary" ||
+    stage === "stance"
+  ) {
+    if (!existingStance) {
+      step2New.userStance = overview;
+      changed = true;
+    }
+    if (!step2New.blueprint || typeof step2New.blueprint !== "object") {
+      step2New.blueprint = {
+        question: String(question || ""),
+        position: existingStance || overview,
+        bodies: [],
+      };
+      changed = true;
+    } else if (!String(step2New.blueprint.position || "").trim()) {
+      step2New.blueprint.position = existingStance || overview;
+      changed = true;
+    }
+  }
+
+  if (looksLikeStanceChoiceQuestion(String(data.text || ""))) {
+    const split = splitTwoParts(String(data.text || ""), 1);
+    const part1 = (split.part1 || "").trim();
+    const repair =
+      "两端论据已经够用了。这道题不需要单独选定一个「个人立场」，我们直接根据刚才的两点任务整理写作蓝图。";
+    data.text = part1
+      ? `${part1}\n\n---\n\n${repair}`
+      : repair;
+    if (String(step2New.currentStage || "").trim() !== "summary") {
+      step2New.currentStage = "summary";
+    }
+    if (!String(step2New.userStance || "").trim()) {
+      step2New.userStance = overview;
+    }
+    changed = true;
+  }
+
+  progressUpdate.step2Data = step2New;
+  if (changed) {
+    console.log(
+      `[Step2NoStanceGate] requiresStance=false → stage=${step2New.currentStage}; overview filled=${!existingStance}`,
+    );
+  }
+  return changed;
+}
+
+function looksLikeStanceChoiceQuestion(text: string): boolean {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  // Numbered stance options / "确立你的整体立场" / "老师帮我推荐"
+  return (
+    /确立你的整体立场|最终更倾向于哪[一种种]立场|你最终更倾向于/.test(t) ||
+    /老师帮我推荐一个/.test(t) ||
+    (/①/.test(t) && /②/.test(t) && /立场/.test(t)) ||
+    (/完全支持|完全同意|部分同意|完全不同意/.test(t) && /立场/.test(t))
+  );
+}
+
 function looksLikeConstraintQuestion(part2: string): boolean {
   const t = String(part2 || "");
   return (
@@ -530,19 +1147,14 @@ function isStep1SlotsComplete(step1Eval: Record<string, any>): boolean {
 
 function textSuggestsStep1Complete(text: string): boolean {
   const t = String(text || "");
+  // Canonical CTA required by Step 1 completion prompt. Keep this strict so
+  // mid-flow Task B questions (compound types) cannot unlock the jump button.
   return (
     t.includes("进入第二步") ||
     t.includes("进入第二阶段") ||
-    t.includes("脑暴与蓝图设计") ||
     /进入\s*Step\s*2/i.test(t) ||
-    /Step\s*2\s*[:：]/i.test(t) ||
-    t.includes("观点形成") ||
-    t.includes("观点生成") ||
     t.includes("恭喜通关审题") ||
-    (t.includes("审题") && t.includes("通关")) ||
-    t.includes("四个审题要素都齐了") ||
-    (t.includes("已完成") && t.includes("审题")) ||
-    /Argument Formation/i.test(t)
+    t.includes("四个审题要素都齐了")
   );
 }
 
@@ -559,7 +1171,1019 @@ function textSuggestsStep2Complete(text: string): boolean {
   );
 }
 
-function applyStepCompletionHeuristic(data: any, stepNum: number): void {
+function textSuggestsStep3Complete(text: string): boolean {
+  const t = String(text || "");
+  return (
+    t.includes("第三步段落逻辑链构建已全部完成") ||
+    t.includes("进入第四步：逐句写作练习") ||
+    t.includes("进入第四阶段") ||
+    t.includes("进入逐句写作") ||
+    t.includes("进入逐句写作练习") ||
+    (t.includes("进入第四步") && t.includes("写作"))
+  );
+}
+
+function isSubstantiveStep3Answer(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (t.length < 4) return false;
+  if (isKickoffOrInstructionText(t)) return false;
+  return !/^(对|是|是的|对的|好的|嗯|明白|好|继续|下一步|ok|okay|yes)$/i.test(t);
+}
+
+/** Hidden kickoff / model-echoed instruction text must never count as a filled step. */
+function isKickoffOrInstructionText(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return (
+    /请基于这个已确立的主体段分论点直接开始/.test(t) ||
+    /先判断这是单点还是多点论点/.test(t) ||
+    /结构细节写入系统即可/.test(t) ||
+    /不要在对话里提字段名/.test(t)
+  );
+}
+
+function isValidStep3StepValue(value: string): boolean {
+  const v = String(value || "").trim();
+  if (!v) return false;
+  return !isKickoffOrInstructionText(v);
+}
+
+/**
+ * Detects when the model echoed its own "例如：..." placeholder text back as
+ * the step's "value" instead of writing the student's actual answer. This is
+ * the dominant root cause of Step 3 being declared complete while the
+ * dialogue hasn't actually reached that step — the board LOOKS full but the
+ * content was never said by the student, just copied from the hint.
+ */
+function normalizeForEchoCompare(text: string): string {
+  return String(text || "")
+    .replace(/^\s*(例如|e\.g\.?|eg)[:：,，]?\s*/i, "")
+    .replace(/[\s，,。.！!？?；;：:""''「」【】\-—]/g, "")
+    .toLowerCase();
+}
+
+function isPlaceholderEchoValue(value: string, placeholder: string): boolean {
+  const p = normalizeForEchoCompare(placeholder);
+  if (!p) return false;
+  const v = normalizeForEchoCompare(value);
+  if (!v) return false;
+  return v === p;
+}
+
+function isGenuineStep3StepValue(step: any): boolean {
+  if (!step) return false;
+  const v = String(step.value || "");
+  if (!isValidStep3StepValue(v)) return false;
+  if (isPlaceholderEchoValue(v, String(step.placeholder || ""))) return false;
+  return true;
+}
+
+function sanitizeParagraphPlanValues(plan: any): void {
+  if (!plan || typeof plan !== "object") return;
+  if (plan.totalClaim && !isValidStep3StepValue(String(plan.totalClaim))) {
+    plan.totalClaim = "";
+  }
+  if (!Array.isArray(plan.pointBlocks)) return;
+  for (const block of plan.pointBlocks) {
+    if (!Array.isArray(block?.steps)) continue;
+    for (const step of block.steps) {
+      if (!isGenuineStep3StepValue(step)) {
+        step.value = "";
+      }
+    }
+  }
+}
+
+function isParagraphPlanFilled(plan: any): boolean {
+  if (!plan || !Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) {
+    return false;
+  }
+  if (
+    plan.mode === "total_then_points" &&
+    String(plan.totalClaim || "").trim() &&
+    !isValidStep3StepValue(String(plan.totalClaim))
+  ) {
+    return false;
+  }
+  return plan.pointBlocks.every(
+    (block: any) =>
+      Array.isArray(block?.steps) &&
+      block.steps.length > 0 &&
+      block.steps.every((step: any) => isGenuineStep3StepValue(step)),
+  );
+}
+
+/** Board-quality gate for a Step 3 body. Never trust isCompleted alone. */
+function isSubpointQualityComplete(sp: any): boolean {
+  if (!sp) return false;
+  if (sp.paragraphPlan) return isParagraphPlanFilled(sp.paragraphPlan);
+  if (Array.isArray(sp.structureSteps) && sp.structureSteps.length > 0) {
+    return sp.structureSteps.every((s: any) => isGenuineStep3StepValue(s));
+  }
+  return false;
+}
+
+/** At least one real student utterance in this body's chat (not kickoff/filler). */
+function subpointHasStudentDialogue(sp: any): boolean {
+  const hist = Array.isArray(sp?.chatHistory) ? sp.chatHistory : [];
+  return hist.some((m: any) => {
+    if (m?.sender !== "user") return false;
+    const t = String(m?.text || "").trim();
+    if (!t || isKickoffOrInstructionText(t)) return false;
+    return isSubstantiveStep3Answer(t);
+  });
+}
+
+/**
+ * Body is done only when the board is filled AND the student actually spoke
+ * in this body's dialogue. Prevents kickoff/model-only boards from unlocking
+ * Body 2 and then completing the whole Step 3.
+ */
+function isSubpointGenuinelyComplete(
+  sp: any,
+  options?: { currentUserMessage?: string; isHiddenKickoff?: boolean },
+): boolean {
+  if (!isSubpointQualityComplete(sp)) return false;
+  if (options?.isHiddenKickoff) return false;
+  if (subpointHasStudentDialogue(sp)) return true;
+  const msg = String(options?.currentUserMessage || "").trim();
+  return !!msg && isSubstantiveStep3Answer(msg) && !isKickoffOrInstructionText(msg);
+}
+
+/** Keep plan structure (mode/blocks/placeholders) but wipe every value. */
+function clearAllStep3PlanValues(plan: any): void {
+  if (!plan || typeof plan !== "object") return;
+  plan.totalClaim = "";
+  if (!Array.isArray(plan.pointBlocks)) return;
+  for (const block of plan.pointBlocks) {
+    if (!Array.isArray(block?.steps)) continue;
+    for (const step of block.steps) {
+      if (step && typeof step === "object") step.value = "";
+    }
+  }
+}
+
+function nextIncompleteStep3BodyLabel(
+  subpoints: any[],
+  activeId: string,
+): string {
+  const next = (subpoints || []).find(
+    (sp: any) => sp?.id !== activeId && !isSubpointGenuinelyComplete(sp),
+  );
+  if (!next) return "下一段";
+  return String(next.targetBody || next.theme || next.content || "下一段").trim() || "下一段";
+}
+
+/** Strip whole-step completion CTA when other bodies still need work. */
+function rewriteStep3AdvanceToNextBody(data: any, nextLabel: string): void {
+  if (!data) return;
+  data.progressUpdate.isCompleted = false;
+  const split = splitTwoParts(String(data.text || ""), 3);
+  const part1 = (split.part1 || "这一段的论证链已经完整。").trim();
+  const ask = `这一段先告一段落。接下来我们写「${nextLabel}」——请用一句话先说出这段要论证的核心分论点。`;
+  data.text = `${part1}\n\n---\n\n${ask}`;
+  console.warn(
+    `[Step3Guard] Cleared premature whole-step CTA; advancing to next body (${nextLabel}).`,
+  );
+}
+
+/**
+ * After the ACTIVE body is quality-filled, decide whether the whole Step 3
+ * can unlock. Never trust sibling isCompleted flags — re-check board quality.
+ */
+function finalizeStep3WholeStepCompletion(
+  data: any,
+  session: any,
+  activeId: string,
+  options?: { currentUserMessage?: string; isHiddenKickoff?: boolean },
+): void {
+  if (!data?.progressUpdate) return;
+
+  const subpoints = session?.step3?.subpoints || [];
+  const expectedBodyCount = inferExpectedStep3BodyCount(session);
+  const hasEnoughBodies =
+    expectedBodyCount <= 0 || subpoints.length >= expectedBodyCount;
+
+  const othersDone =
+    hasEnoughBodies &&
+    subpoints.length > 0 &&
+    subpoints.every((sp: any) => {
+      if (sp.id === activeId) {
+        // Active body's board was just validated as filled by the caller;
+        // still require real student dialogue for this body.
+        return isSubpointGenuinelyComplete(sp, {
+          currentUserMessage: options?.currentUserMessage,
+          isHiddenKickoff: options?.isHiddenKickoff,
+        });
+      }
+      return isSubpointGenuinelyComplete(sp);
+    });
+
+  if (!hasEnoughBodies || !othersDone) {
+    const nextLabel = !hasEnoughBodies
+      ? `主体段 ${Math.max(subpoints.length, 0) + 1}`
+      : nextIncompleteStep3BodyLabel(subpoints, activeId);
+    // Always rewrite when the model claimed whole-step completion OR set the flag.
+    // Current-body done ≠ whole Step 3 done.
+    if (
+      textSuggestsStep3Complete(String(data.text || "")) ||
+      data.progressUpdate.isCompleted
+    ) {
+      rewriteStep3AdvanceToNextBody(data, nextLabel);
+    } else {
+      data.progressUpdate.isCompleted = false;
+    }
+    if (!hasEnoughBodies) {
+      console.warn(
+        `[Step3Guard] Expected ${expectedBodyCount} bodies but only ${subpoints.length} found.`,
+      );
+    } else {
+      console.warn(
+        "[Step3Guard] Active body may be filled, but sibling bodies lack quality board and/or student dialogue — withholding whole-step completion.",
+      );
+    }
+    return;
+  }
+
+  if (
+    textSuggestsStep3Complete(String(data.text || "")) ||
+    data.progressUpdate.isCompleted
+  ) {
+    data.progressUpdate.isCompleted = true;
+  }
+}
+
+function findFirstEmptyPlanStep(
+  plan: any,
+): { blockLabel: string; stepLabel: string; blockIndex: number; stepIndex: number } | null {
+  if (!plan || !Array.isArray(plan.pointBlocks)) return null;
+  for (let bi = 0; bi < plan.pointBlocks.length; bi++) {
+    const block = plan.pointBlocks[bi];
+    const steps = Array.isArray(block?.steps) ? block.steps : [];
+    for (let si = 0; si < steps.length; si++) {
+      if (!isGenuineStep3StepValue(steps[si])) {
+        return {
+          blockLabel: String(block?.label || `分点${bi + 1}`),
+          stepLabel: String(steps[si]?.label || "展开"),
+          blockIndex: bi,
+          stepIndex: si,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+type Step3PlanStepRef = {
+  kind: "totalClaim" | "step";
+  blockIndex: number;
+  stepIndex: number;
+  key: string;
+};
+
+/**
+ * Provenance firewall for Step 3 values.
+ *
+ * Internal planning fields (mode / diagnosis / subClaim / placeholder) may be
+ * model-authored. But `value` is display/confirmation content and may only
+ * advance from empty→filled for the CURRENT target step (first empty in the
+ * previous board snapshot), plus at most the next adjacent step in the SAME
+ * pointBlock (one-utterance covers two links). Any other empty→filled leap is
+ * treated as model draft leakage and forced back to empty.
+ */
+function collectStep3PlanRefs(plan: any): Step3PlanStepRef[] {
+  const refs: Step3PlanStepRef[] = [];
+  if (!plan || typeof plan !== "object") return refs;
+  if (plan.mode === "total_then_points") {
+    refs.push({
+      kind: "totalClaim",
+      blockIndex: -1,
+      stepIndex: -1,
+      key: "total_claim",
+    });
+  }
+  const blocks = Array.isArray(plan.pointBlocks) ? plan.pointBlocks : [];
+  for (let bi = 0; bi < blocks.length; bi++) {
+    const steps = Array.isArray(blocks[bi]?.steps) ? blocks[bi].steps : [];
+    for (let si = 0; si < steps.length; si++) {
+      refs.push({
+        kind: "step",
+        blockIndex: bi,
+        stepIndex: si,
+        key: String(steps[si]?.key || `${bi}:${si}`),
+      });
+    }
+  }
+  return refs;
+}
+
+function readStep3RefValue(plan: any, ref: Step3PlanStepRef): string {
+  if (!plan || !ref) return "";
+  if (ref.kind === "totalClaim") return String(plan.totalClaim || "");
+  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  return String(step?.value || "");
+}
+
+function readStep3RefPlaceholder(plan: any, ref: Step3PlanStepRef): string {
+  if (!plan || !ref || ref.kind === "totalClaim") return "";
+  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  return String(step?.placeholder || "");
+}
+
+function isStep3RefFilled(plan: any, ref: Step3PlanStepRef): boolean {
+  const value = readStep3RefValue(plan, ref);
+  if (ref.kind === "totalClaim") return isValidStep3StepValue(value);
+  return (
+    isValidStep3StepValue(value) &&
+    !isPlaceholderEchoValue(value, readStep3RefPlaceholder(plan, ref))
+  );
+}
+
+function clearStep3RefValue(plan: any, ref: Step3PlanStepRef): void {
+  if (!plan || !ref) return;
+  if (ref.kind === "totalClaim") {
+    plan.totalClaim = "";
+    return;
+  }
+  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  if (step) step.value = "";
+}
+
+function guardStep3ValueProvenance(plan: any, prevPlan: any): number {
+  if (!plan || !Array.isArray(plan.pointBlocks)) return 0;
+  const refs = collectStep3PlanRefs(plan);
+  if (refs.length === 0) return 0;
+
+  // Target = first step that was empty on the PREVIOUS board (or first step
+  // when there is no previous board yet).
+  let targetIdx = -1;
+  for (let i = 0; i < refs.length; i++) {
+    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
+    if (!wasFilled) {
+      targetIdx = i;
+      break;
+    }
+  }
+  if (targetIdx < 0) return 0; // previous board already fully filled
+
+  const allowed = new Set<number>([targetIdx]);
+  const target = refs[targetIdx];
+  const next = refs[targetIdx + 1];
+  if (
+    next &&
+    target.kind === "step" &&
+    next.kind === "step" &&
+    next.blockIndex === target.blockIndex &&
+    next.stepIndex === target.stepIndex + 1
+  ) {
+    allowed.add(targetIdx + 1);
+  }
+
+  let cleared = 0;
+  for (let i = 0; i < refs.length; i++) {
+    const ref = refs[i];
+    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, ref) : false;
+    const nowFilled = isStep3RefFilled(plan, ref);
+    if (!wasFilled && nowFilled && !allowed.has(i)) {
+      clearStep3RefValue(plan, ref);
+      cleared += 1;
+    }
+  }
+
+  if (cleared > 0) {
+    console.warn(
+      `[Step3Guard] Provenance firewall cleared ${cleared} premature value(s); only target step (+ optional same-block adjacent) may fill this turn.`,
+    );
+  }
+  return cleared;
+}
+
+/** Flat-chain provenance: only first empty + next adjacent may newly fill. */
+function guardFlatStep3ValueProvenance(steps: any[], prevSteps: any[]): number {
+  if (!Array.isArray(steps) || steps.length === 0) return 0;
+  const prevByKey: Record<string, any> = {};
+  (prevSteps || []).forEach((s: any, idx: number) => {
+    const key = String(s?.key || idx);
+    prevByKey[key] = s;
+  });
+
+  let targetIdx = -1;
+  for (let i = 0; i < steps.length; i++) {
+    const key = String(steps[i]?.key || i);
+    const prev = prevByKey[key] || (prevSteps || [])[i];
+    if (!isGenuineStep3StepValue(prev)) {
+      targetIdx = i;
+      break;
+    }
+  }
+  if (targetIdx < 0) return 0;
+
+  const allowed = new Set<number>([targetIdx]);
+  if (targetIdx + 1 < steps.length) allowed.add(targetIdx + 1);
+
+  let cleared = 0;
+  for (let i = 0; i < steps.length; i++) {
+    const key = String(steps[i]?.key || i);
+    const prev = prevByKey[key] || (prevSteps || [])[i];
+    const wasFilled = isGenuineStep3StepValue(prev);
+    const nowFilled = isGenuineStep3StepValue(steps[i]);
+    if (!wasFilled && nowFilled && !allowed.has(i)) {
+      steps[i] = { ...steps[i], value: "" };
+      cleared += 1;
+    }
+  }
+  if (cleared > 0) {
+    console.warn(
+      `[Step3Guard] Flat provenance firewall cleared ${cleared} premature value(s).`,
+    );
+  }
+  return cleared;
+}
+
+function mergeLogicStepValues(prevSteps: any[] = [], nextSteps: any[] = []): any[] {
+  const prevByKey: Record<string, any> = {};
+  prevSteps.forEach((s: any) => {
+    if (s && s.key) prevByKey[s.key] = s;
+  });
+  return nextSteps.map((s: any) => {
+    const prev = s && s.key ? prevByKey[s.key] : undefined;
+    const newVal = s && typeof s.value === "string" ? s.value : "";
+    const prevVal = prev && prev.value ? String(prev.value) : "";
+    const placeholder = String(s?.placeholder || prev?.placeholder || "");
+    const newIsGenuine =
+      newVal &&
+      String(newVal).trim() &&
+      isValidStep3StepValue(newVal) &&
+      !isPlaceholderEchoValue(newVal, placeholder);
+    const prevIsGenuine =
+      prevVal && isValidStep3StepValue(prevVal) && !isPlaceholderEchoValue(prevVal, placeholder);
+    const value = newIsGenuine ? newVal : prevIsGenuine ? prevVal : "";
+    return { ...prev, ...s, value };
+  });
+}
+
+function mergeParagraphPlanValues(prevPlan: any, nextPlan: any): any {
+  if (!nextPlan || !Array.isArray(nextPlan.pointBlocks)) return prevPlan || nextPlan;
+  const prevBlocks = Array.isArray(prevPlan?.pointBlocks) ? prevPlan.pointBlocks : [];
+  const prevById: Record<string, any> = {};
+  prevBlocks.forEach((b: any) => {
+    if (b && b.id) prevById[b.id] = b;
+  });
+  const pointBlocks = nextPlan.pointBlocks.map((block: any, index: number) => {
+    const prev =
+      (block && block.id ? prevById[block.id] : undefined) ||
+      prevBlocks[index];
+    return {
+      ...prev,
+      ...block,
+      steps: mergeLogicStepValues(prev?.steps || [], block.steps || []),
+    };
+  });
+  return {
+    ...prevPlan,
+    ...nextPlan,
+    totalClaim:
+      nextPlan.totalClaim && String(nextPlan.totalClaim).trim()
+        ? nextPlan.totalClaim
+        : prevPlan?.totalClaim || "",
+    optionalShortClosing:
+      nextPlan.optionalShortClosing && String(nextPlan.optionalShortClosing).trim()
+        ? nextPlan.optionalShortClosing
+        : prevPlan?.optionalShortClosing || "",
+    pointBlocks,
+  };
+}
+
+function backfillFirstEmptyStepFromUser(plan: any, userMessage: string): boolean {
+  if (!plan || !isSubstantiveStep3Answer(userMessage)) return false;
+  const pending = findFirstEmptyPlanStep(plan);
+  if (!pending) return false;
+  const step =
+    plan.pointBlocks?.[pending.blockIndex]?.steps?.[pending.stepIndex];
+  if (!step) return false;
+  step.value = String(userMessage).trim();
+  return true;
+}
+
+/**
+ * Prefer the student's raw utterance for THIS turn's target step (first empty
+ * on the previous board). Even if the model already wrote a paraphrase into
+ * that slot, display/confirmation content must come from the student.
+ */
+function applyStudentAnswerToTargetStep(
+  plan: any,
+  prevPlan: any,
+  userMessage: string,
+): boolean {
+  if (!plan || !isSubstantiveStep3Answer(userMessage)) return false;
+  const refs = collectStep3PlanRefs(plan);
+  let targetIdx = -1;
+  for (let i = 0; i < refs.length; i++) {
+    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
+    if (!wasFilled) {
+      targetIdx = i;
+      break;
+    }
+  }
+  if (targetIdx < 0) return false;
+  const ref = refs[targetIdx];
+  const answer = String(userMessage).trim();
+  if (ref.kind === "totalClaim") {
+    plan.totalClaim = answer;
+    return true;
+  }
+  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  if (!step) return false;
+  step.value = answer;
+  return true;
+}
+
+function rebuildFlatStepsFromParagraphPlan(paragraphPlan: any): any[] {
+  const derivedSteps: any[] = [];
+  if (paragraphPlan.totalClaim && String(paragraphPlan.totalClaim).trim()) {
+    derivedSteps.push({
+      key: "total_claim",
+      label: "总观点",
+      placeholder: "",
+      value: paragraphPlan.totalClaim,
+    });
+  }
+  (paragraphPlan.pointBlocks || []).forEach((block: any, index: number) => {
+    const blockLabel = block?.label || `分点${index + 1}`;
+    (block?.steps || []).forEach((step: any) => {
+      derivedSteps.push({
+        key: step?.key || "",
+        label: `${blockLabel} - ${step?.label || ""}`,
+        placeholder: step?.placeholder || "",
+        value: step?.value || "",
+      });
+    });
+  });
+  return derivedSteps;
+}
+
+type ParagraphMode =
+  | "single_point"
+  | "total_then_points"
+  | "direct_points";
+
+type ParagraphModeSignals = {
+  pointCount: number;
+  estimatedCharBudget: number;
+  totalWouldRepeatSubClaims: boolean;
+  bothPointsNeedMajorExpansion: boolean;
+  bodyClaimIsUmbrella: boolean;
+  thesisAlreadyStated: boolean;
+};
+
+function normalizeForOverlap(text: string): string {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenSet(text: string): Set<string> {
+  const norm = normalizeForOverlap(text);
+  if (!norm) return new Set();
+  // Prefer CJK bigrams + latin words so short Chinese phrases still overlap.
+  const tokens = new Set<string>();
+  const latin = norm.match(/[a-z0-9]+/g) || [];
+  latin.forEach((t) => {
+    if (t.length >= 2) tokens.add(t);
+  });
+  const cjk = norm.replace(/[a-z0-9\s]+/g, "");
+  for (let i = 0; i < cjk.length - 1; i++) {
+    tokens.add(cjk.slice(i, i + 2));
+  }
+  if (cjk.length === 1) tokens.add(cjk);
+  return tokens;
+}
+
+function overlapRatio(a: string, b: string): number {
+  const sa = tokenSet(a);
+  const sb = tokenSet(b);
+  if (sa.size === 0 || sb.size === 0) return 0;
+  let hit = 0;
+  for (const t of sa) {
+    if (sb.has(t)) hit += 1;
+  }
+  return hit / Math.min(sa.size, sb.size);
+}
+
+function estimatePlanCharBudget(plan: any): number {
+  let total = String(plan?.totalClaim || "").trim().length;
+  const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+  for (const block of blocks) {
+    total += String(block?.subClaim || "").trim().length;
+    const steps = Array.isArray(block?.steps) ? block.steps : [];
+    // Empty steps still cost budget: assume ~35 chars per planned micro-step.
+    for (const step of steps) {
+      const v = String(step?.value || "").trim();
+      total += v ? v.length : 35;
+    }
+  }
+  total += String(plan?.optionalShortClosing || "").trim().length;
+  return total;
+}
+
+function computeParagraphModeSignals(
+  plan: any,
+  session: any,
+  activeSubpoint: any,
+): ParagraphModeSignals {
+  const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+  const pointCount = blocks.length;
+  const totalClaim = String(plan?.totalClaim || "").trim();
+  const bodyClaim = String(activeSubpoint?.content || "").trim();
+
+  let totalWouldRepeatSubClaims = false;
+  if (totalClaim && pointCount >= 2) {
+    const subClaims = blocks
+      .map((b: any) => String(b?.subClaim || "").trim())
+      .filter(Boolean);
+    const joined = subClaims.join(" ");
+    // High overlap with any single subClaim, or with the joined pair.
+    totalWouldRepeatSubClaims =
+      subClaims.some((sc: string) => overlapRatio(totalClaim, sc) >= 0.55) ||
+      overlapRatio(totalClaim, joined) >= 0.5;
+  }
+
+  const majorCount = blocks.filter(
+    (b: any) => String(b?.role || "").toLowerCase() === "major",
+  ).length;
+  const bothPointsNeedMajorExpansion = pointCount >= 2 && majorCount >= 2;
+
+  // Body claim already acts as an umbrella topic sentence when it mentions
+  // both sub-claims (or is long and connective).
+  let bodyClaimIsUmbrella = false;
+  if (bodyClaim && pointCount >= 2) {
+    const subClaims = blocks
+      .map((b: any) => String(b?.subClaim || "").trim())
+      .filter(Boolean);
+    const coversMost =
+      subClaims.length >= 2 &&
+      subClaims.filter((sc: string) => overlapRatio(bodyClaim, sc) >= 0.35)
+        .length >= 2;
+    const hasConnective =
+      /不仅|而且|既|又|以及|和|与|同时|also|both|and/i.test(bodyClaim);
+    bodyClaimIsUmbrella =
+      coversMost || (hasConnective && bodyClaim.length >= 20);
+  }
+
+  const blueprint =
+    session?.step2?.coachEvaluation?.blueprint ||
+    session?.step2?.blueprint ||
+    null;
+  const thesisAlreadyStated = Boolean(
+    String(blueprint?.position || "").trim() ||
+      String(session?.step2?.coachEvaluation?.suggestedStance || "").trim() ||
+      String(session?.step2?.userStance || "").trim(),
+  );
+
+  return {
+    pointCount,
+    estimatedCharBudget: estimatePlanCharBudget(plan),
+    totalWouldRepeatSubClaims,
+    bothPointsNeedMajorExpansion,
+    bodyClaimIsUmbrella,
+    thesisAlreadyStated,
+  };
+}
+
+function recommendParagraphMode(signals: ParagraphModeSignals): ParagraphMode {
+  if (signals.pointCount <= 1) return "single_point";
+
+  if (
+    signals.totalWouldRepeatSubClaims ||
+    signals.bothPointsNeedMajorExpansion ||
+    signals.bodyClaimIsUmbrella ||
+    signals.thesisAlreadyStated
+  ) {
+    return "direct_points";
+  }
+
+  // ~90-110 English words ≈ ~180-280 Chinese chars of planned content.
+  if (signals.estimatedCharBudget > 260) return "direct_points";
+
+  return "total_then_points";
+}
+
+/**
+ * Correct paragraphPlan.mode after the model emits a plan.
+ * Prefer direct_points for multi-point bodies when a totalClaim would be
+ * redundant / over budget; never invent a totalClaim when upgrading to
+ * total_then_points — leave it empty for the next Socratic turn.
+ */
+function applyParagraphModeCorrection(data: any, session: any): void {
+  if (!data?.progressUpdate?.paragraphPlan) return;
+  const plan = data.progressUpdate.paragraphPlan;
+  if (!Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) return;
+
+  const activeId = session?.step3?.activeSubpointId;
+  const activeSp = (session?.step3?.subpoints || []).find(
+    (sp: any) => sp.id === activeId,
+  );
+
+  const signals = computeParagraphModeSignals(plan, session, activeSp);
+  const recommended = recommendParagraphMode(signals);
+  const current = String(plan.mode || "").trim() as ParagraphMode;
+
+  if (signals.pointCount <= 1) {
+    if (current !== "single_point") {
+      plan.mode = "single_point";
+      plan.diagnosis = `${String(plan.diagnosis || "").trim()} [mode-correction] single_point`.trim();
+      console.warn("[Step3Mode] Forced single_point (pointCount<=1).");
+    }
+    return;
+  }
+
+  if (current === recommended) return;
+
+  plan.mode = recommended;
+  if (recommended === "direct_points") {
+    plan.totalClaim = "";
+  }
+  // total_then_points with empty totalClaim: leave empty for dialogue to fill.
+
+  const reasonBits: string[] = [];
+  if (signals.bothPointsNeedMajorExpansion) reasonBits.push("双 major");
+  if (signals.totalWouldRepeatSubClaims) reasonBits.push("总起重复分点");
+  if (signals.bodyClaimIsUmbrella) reasonBits.push("body claim 已统摄");
+  if (signals.thesisAlreadyStated) reasonBits.push("Step2 立场已给出");
+  if (signals.estimatedCharBudget > 260) reasonBits.push("字数预算紧");
+  const reason = reasonBits.length > 0 ? reasonBits.join("，") : "默认规则";
+
+  plan.diagnosis =
+    `${String(plan.diagnosis || "").trim()} [mode-correction] ${recommended}（${reason}）`.trim();
+  data.progressUpdate.paragraphPlan = plan;
+
+  // Keep flat projection in sync when totalClaim was cleared.
+  if (Array.isArray(data.progressUpdate.step3SubpointSteps)) {
+    data.progressUpdate.step3SubpointSteps =
+      rebuildFlatStepsFromParagraphPlan(plan);
+  }
+
+  console.warn(
+    `[Step3Mode] Corrected mode ${current || "(empty)"} -> ${recommended} (${reason}).`,
+  );
+}
+
+function inferExpectedStep3BodyCount(session: any): number {
+  const clusters = session?.step2?.coachEvaluation?.clustering?.clusters;
+  if (Array.isArray(clusters) && clusters.length > 0) {
+    return clusters.length;
+  }
+
+  const blueprint =
+    session?.step2?.coachEvaluation?.blueprint || session?.step2?.blueprint || {};
+  const bodies = Array.isArray(blueprint?.bodies)
+    ? blueprint.bodies.filter((b: any) =>
+        String(b?.content || b?.title || "").trim().length > 0,
+      )
+    : [];
+  if (bodies.length > 0) return bodies.length;
+
+  const body1 = String(blueprint?.body1 || "").trim();
+  const body2 = String(blueprint?.body2 || "").trim();
+  const bodyCount = (body1 ? 1 : 0) + (body2 ? 1 : 0);
+  if (bodyCount > 0) return bodyCount;
+
+  const userPoints = String(
+    session?.step2?.coachEvaluation?.userPoints || session?.step2?.userPoints || "",
+  );
+  if (/A面[^：:]*[：:]/.test(userPoints) && /B面[^：:]*[：:]/.test(userPoints)) {
+    return 2;
+  }
+  return 0;
+}
+
+/**
+ * Step 3 completion safety net:
+ * 1) Merge prior board values so empty re-emits don't wipe progress.
+ * 2) Backfill the first empty step from the student's current answer when the
+ *    model forgot to write it into paragraphPlan (common last-step miss).
+ * 3) Clear premature step3SubpointCompleted / isCompleted / completion CTA
+ *    while any required step value is still empty.
+ */
+function enforceStep3LogicCompletion(
+  data: any,
+  session: any,
+  userMessage: string,
+  options?: { isHiddenKickoff?: boolean },
+): void {
+  if (!data?.progressUpdate) return;
+
+  const activeId = session?.step3?.activeSubpointId;
+  const activeSp = (session?.step3?.subpoints || []).find(
+    (sp: any) => sp.id === activeId,
+  );
+
+  let plan = data.progressUpdate.paragraphPlan;
+  const prevPlan = activeSp?.paragraphPlan
+    ? JSON.parse(JSON.stringify(activeSp.paragraphPlan))
+    : null;
+
+  if (plan && activeSp?.paragraphPlan) {
+    plan = mergeParagraphPlanValues(activeSp.paragraphPlan, plan);
+    data.progressUpdate.paragraphPlan = plan;
+  } else if (!plan && activeSp?.paragraphPlan) {
+    plan = JSON.parse(JSON.stringify(activeSp.paragraphPlan));
+    data.progressUpdate.paragraphPlan = plan;
+  }
+
+  if (plan) {
+    sanitizeParagraphPlanValues(plan);
+    // Structural firewall: planning drafts must not leak into value fields
+    // for steps the student has not answered this turn.
+    guardStep3ValueProvenance(plan, prevPlan);
+    data.progressUpdate.paragraphPlan = plan;
+  }
+
+  if (Array.isArray(data.progressUpdate.step3SubpointSteps) && activeSp?.structureSteps) {
+    data.progressUpdate.step3SubpointSteps = mergeLogicStepValues(
+      activeSp.structureSteps,
+      data.progressUpdate.step3SubpointSteps,
+    );
+  }
+
+  const skipBackfill =
+    options?.isHiddenKickoff || isKickoffOrInstructionText(userMessage);
+
+  // Kickoff is planning-only: keep mode/blocks/placeholders, wipe every value.
+  // This stops Body 1 from being auto-completed before the student speaks.
+  if (options?.isHiddenKickoff) {
+    if (plan) {
+      clearAllStep3PlanValues(plan);
+      data.progressUpdate.paragraphPlan = plan;
+      data.progressUpdate.step3SubpointSteps =
+        rebuildFlatStepsFromParagraphPlan(plan);
+    } else if (Array.isArray(data.progressUpdate.step3SubpointSteps)) {
+      data.progressUpdate.step3SubpointSteps =
+        data.progressUpdate.step3SubpointSteps.map((s: any) => ({
+          ...s,
+          value: "",
+        }));
+    }
+    data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    if (data.text && textSuggestsStep3Complete(String(data.text || ""))) {
+      const split = splitTwoParts(data.text, 3);
+      data.text = `${(split.part1 || "我们先把这一段的论证结构定下来。").trim()}\n\n---\n\n请先回答我刚才的问题，我们一步一步把论证链填完整。`;
+      console.warn(
+        "[Step3Guard] Kickoff turn: stripped whole-step CTA and cleared all values.",
+      );
+    } else {
+      console.warn(
+        "[Step3Guard] Kickoff turn: cleared all step values (planning draft only).",
+      );
+    }
+    return;
+  }
+
+  if (!plan || !Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) {
+    // Flat-chain fallback: treat step3SubpointSteps as the board.
+    const flat = Array.isArray(data.progressUpdate.step3SubpointSteps)
+      ? data.progressUpdate.step3SubpointSteps
+      : activeSp?.structureSteps || [];
+    if (flat.length === 0) return;
+
+    const flatSanitized = flat.map((s: any) =>
+      isGenuineStep3StepValue(s) ? s : { ...s, value: "" },
+    );
+    guardFlatStep3ValueProvenance(flatSanitized, activeSp?.structureSteps || []);
+    const flatEmpty = flatSanitized.find(
+      (s: any) => !isGenuineStep3StepValue(s),
+    );
+    if (
+      flatEmpty &&
+      isSubstantiveStep3Answer(userMessage) &&
+      !skipBackfill
+    ) {
+      flatEmpty.value = String(userMessage).trim();
+      data.progressUpdate.step3SubpointSteps = flatSanitized;
+    } else {
+      data.progressUpdate.step3SubpointSteps = flatSanitized;
+    }
+    const stillEmpty = flatSanitized.some(
+      (s: any) => !isGenuineStep3StepValue(s),
+    );
+    if (stillEmpty) {
+      data.progressUpdate.step3SubpointCompleted = false;
+      data.progressUpdate.isCompleted = false;
+      if (data.text && textSuggestsStep3Complete(data.text)) {
+        const split = splitTwoParts(data.text, 3);
+        const label = flatEmpty?.label || "下一步";
+        const ask = `这一步「${label}」还没写进论证链。请用一句话把它说清楚，我帮你补上。`;
+        data.text = `${(split.part1 || "我们继续把这条论证链补完整。").trim()}\n\n---\n\n${ask}`;
+        console.warn(
+          "[Step3Guard] Cleared premature completion CTA; flat chain still has empty steps.",
+        );
+      }
+      return;
+    }
+
+    // Flat chain for the active body is filled — still require ALL bodies.
+    if (
+      !isSubpointGenuinelyComplete(activeSp, {
+        currentUserMessage: userMessage,
+        isHiddenKickoff: options?.isHiddenKickoff,
+      })
+    ) {
+      data.progressUpdate.step3SubpointCompleted = false;
+      data.progressUpdate.isCompleted = false;
+      if (data.text && textSuggestsStep3Complete(String(data.text || ""))) {
+        const split = splitTwoParts(data.text, 3);
+        data.text = `${(split.part1 || "这一段的板书看起来齐了。").trim()}\n\n---\n\n请你用自己的话再确认一下这一段的关键推导，我们再往下走。`;
+      }
+      console.warn(
+        "[Step3Guard] Flat chain filled but no student dialogue yet — withholding body completion.",
+      );
+      return;
+    }
+    data.progressUpdate.step3SubpointCompleted = true;
+    finalizeStep3WholeStepCompletion(data, session, activeId, {
+      currentUserMessage: userMessage,
+      isHiddenKickoff: options?.isHiddenKickoff,
+    });
+    return;
+  }
+
+  // Prefer the student's raw words for this turn's target step, then backfill
+  // only if the target is still empty after the model omitted it.
+  if (!skipBackfill && isSubstantiveStep3Answer(userMessage)) {
+    const wroteTarget = applyStudentAnswerToTargetStep(plan, prevPlan, userMessage);
+    if (wroteTarget) {
+      data.progressUpdate.paragraphPlan = plan;
+      data.progressUpdate.step3SubpointSteps =
+        rebuildFlatStepsFromParagraphPlan(plan);
+      console.warn(
+        "[Step3Guard] Wrote student utterance into this turn's target step.",
+      );
+    } else if (!isParagraphPlanFilled(plan)) {
+      const didBackfill = backfillFirstEmptyStepFromUser(plan, userMessage);
+      if (didBackfill) {
+        data.progressUpdate.paragraphPlan = plan;
+        data.progressUpdate.step3SubpointSteps =
+          rebuildFlatStepsFromParagraphPlan(plan);
+        console.warn(
+          "[Step3Guard] Backfilled empty paragraphPlan step from user message.",
+        );
+      }
+    }
+  }
+
+  if (!isParagraphPlanFilled(plan)) {
+    data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    const pending = findFirstEmptyPlanStep(plan);
+    if (data.text && textSuggestsStep3Complete(data.text)) {
+      const split = splitTwoParts(data.text, 3);
+      const ask = pending
+        ? `「${pending.blockLabel}」的「${pending.stepLabel}」还没写进论证链。请用一句话把它说清楚，我帮你补上。`
+        : fallbackNextStep(3, session);
+      data.text = `${(split.part1 || "我们继续把这条论证链补完整。").trim()}\n\n---\n\n${ask}`;
+      console.warn(
+        "[Step3Guard] Cleared premature completion CTA; paragraphPlan still has empty steps.",
+      );
+    }
+    data.progressUpdate.step3SubpointSteps = rebuildFlatStepsFromParagraphPlan(plan);
+    return;
+  }
+
+  // Active subpoint plan is fully filled.
+  if (
+    !isSubpointGenuinelyComplete(
+      { ...activeSp, paragraphPlan: plan },
+      {
+        currentUserMessage: userMessage,
+        isHiddenKickoff: options?.isHiddenKickoff,
+      },
+    )
+  ) {
+    data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    data.progressUpdate.step3SubpointSteps = rebuildFlatStepsFromParagraphPlan(plan);
+    if (data.text && textSuggestsStep3Complete(String(data.text || ""))) {
+      const split = splitTwoParts(data.text, 3);
+      data.text = `${(split.part1 || "这一段的板书看起来齐了。").trim()}\n\n---\n\n请你用自己的话再确认一下这一段的关键推导，我们再往下走。`;
+    }
+    console.warn(
+      "[Step3Guard] paragraphPlan filled but no student dialogue yet — withholding body completion.",
+    );
+    return;
+  }
+
+  data.progressUpdate.step3SubpointCompleted = true;
+  data.progressUpdate.step3SubpointSteps = rebuildFlatStepsFromParagraphPlan(plan);
+  finalizeStep3WholeStepCompletion(data, session, activeId, {
+    currentUserMessage: userMessage,
+    isHiddenKickoff: options?.isHiddenKickoff,
+  });
+}
+
+function applyStepCompletionHeuristic(data: any, stepNum: number, session?: any): void {
   if (!data) return;
 
   let shouldForceComplete = false;
@@ -576,27 +2200,24 @@ function applyStepCompletionHeuristic(data: any, stepNum: number): void {
       shouldForceComplete = true;
     }
   } else if (stepNum === 2) {
-    if (data.text && textSuggestsStep2Complete(data.text)) {
-      shouldForceComplete = true;
-    }
-    if (
-      data.progressUpdate?.paragraphPlan ||
+    const driftedToStep3 =
+      !!data.progressUpdate?.paragraphPlan ||
       (Array.isArray(data.progressUpdate?.step3SubpointSteps) &&
-        data.progressUpdate.step3SubpointSteps.length > 0)
-    ) {
+        data.progressUpdate.step3SubpointSteps.length > 0);
+    if (driftedToStep3) {
       shouldForceComplete = true;
+    } else if (data.text && textSuggestsStep2Complete(data.text)) {
+      // Only force-complete on CTA when already in summary (or this turn sets it).
+      const stage = resolveStep2CurrentStage(data, session);
+      if (stage === "summary") {
+        shouldForceComplete = true;
+      }
     }
   } else if (stepNum === 3) {
-    const t = String(data.text || "");
-    if (
-      t.includes("第三步段落逻辑链构建已全部完成") ||
-      t.includes("进入第四步：逐句写作练习") ||
-      t.includes("进入第四阶段") ||
-      t.includes("进入逐句写作") ||
-      t.includes("进入逐句写作练习")
-    ) {
-      shouldForceComplete = true;
-    }
+    // Do NOT force-complete Step 3 from CTA text alone.
+    // enforceStep3LogicCompletion / finalizeStep3WholeStepCompletion is the
+    // sole authority: every body must be quality-filled on the board.
+    shouldForceComplete = false;
   } else if (data.text) {
     const t = data.text;
     if (
@@ -618,17 +2239,109 @@ function applyStepCompletionHeuristic(data: any, stepNum: number): void {
   }
 }
 
+/** Loose check: does this text end with (or contain near its end) a question mark? */
+function looksLikeQuestionEnding(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  const tail = t.slice(-60);
+  return /[?？]/.test(tail);
+}
+
+/**
+ * Deterministic safety net for the "PROACTIVE MOMENTUM" prompt rule: Part 2
+ * must always be a question or a completion CTA. If the model's response ends
+ * with neither (pure praise/analysis and nothing else), the conversation stalls
+ * and the student sees no forward action — swap in a rule-based fallback
+ * question for the current stage/task instead of leaving it dangling.
+ */
+function enforceStep2Momentum(data: any, session: any): void {
+  if (!data?.progressUpdate) return;
+  const text = String(data.text || "");
+  if (!text.trim()) return;
+  if (data.progressUpdate.isCompleted) return;
+  if (textSuggestsStep2Complete(text)) return;
+
+  const stage = resolveStep2CurrentStage(data, session);
+  if (stage === "summary") return; // summary-stage confirmation wording varies; do not force here.
+
+  const split = splitTwoParts(text, 2);
+  if (!split.ok) return; // malformed split already handled elsewhere; don't risk double-mangling.
+  if (looksLikeQuestionEnding(split.part2)) return;
+
+  const fallback = fallbackNextStep(2, session);
+  data.text = `${split.part1}\n\n---\n\n${fallback}`;
+  console.warn(
+    `[Step2Momentum] Response ended without a question or CTA at stage=${stage}; appended fallback next-step prompt.`,
+  );
+}
+
+function resolveStep2CurrentStage(data: any, session?: any): string {
+  return String(
+    data?.progressUpdate?.step2Data?.currentStage ||
+      session?.step2?.coachEvaluation?.currentStage ||
+      session?.step2?.currentStage ||
+      "explore_A",
+  ).trim();
+}
+
+/**
+ * Step 2 completion gate: unlock jump button only in summary + CTA
+ * (mirrors enforceStep1SlotCompletion). Must run AFTER applyStepCompletionHeuristic
+ * so a mid-explore "进入第三步" hallucination cannot stick.
+ */
+function enforceStep2Completion(data: any, session: any): void {
+  if (!data?.progressUpdate) return;
+
+  const stage = resolveStep2CurrentStage(data, session);
+  const ctaOk = textSuggestsStep2Complete(String(data.text || ""));
+  const driftedToStep3 =
+    !!data.progressUpdate.paragraphPlan ||
+    (Array.isArray(data.progressUpdate.step3SubpointSteps) &&
+      data.progressUpdate.step3SubpointSteps.length > 0);
+
+  if (stage === "summary" && ctaOk) {
+    data.progressUpdate.isCompleted = true;
+    return;
+  }
+
+  // Anti-drift: model leaked Step 3 fields into a Step 2 response — keep complete.
+  if (driftedToStep3) {
+    data.progressUpdate.isCompleted = true;
+    return;
+  }
+
+  if (data.progressUpdate.isCompleted) {
+    data.progressUpdate.isCompleted = false;
+    console.warn(
+      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, ctaOk=${ctaOk})`,
+    );
+  }
+}
+
 function enforceStep1SlotCompletion(data: any, session: any): void {
   if (!data?.progressUpdate) return;
 
   const merged = mergeStep1Evaluation(data.progressUpdate, session);
-  if (!isStep1SlotsComplete(merged)) return;
+  const slotsOk = isStep1SlotsComplete(merged);
+  const ctaOk = textSuggestsStep1Complete(String(data.text || ""));
 
-  data.progressUpdate.isCompleted = true;
+  // Only unlock Step 1 completion when slots are filled AND the coach already
+  // emitted the completion CTA ("进入第二步"). Otherwise compound-type Task B
+  // questions would unlock the jump button too early (Task A alone can already
+  // yield >=2 dimensions).
+  if (slotsOk && ctaOk) {
+    data.progressUpdate.isCompleted = true;
+    // Step 2 fields leaked into a Step 1 response are ignored by the client; strip them.
+    if (data.progressUpdate.step2Data) {
+      delete data.progressUpdate.step2Data;
+    }
+    return;
+  }
 
-  // Step 2 fields leaked into a Step 1 response are ignored by the client; strip them.
-  if (data.progressUpdate.step2Data) {
-    delete data.progressUpdate.step2Data;
+  // Premature-completion guard: clear isCompleted if the model set it while
+  // still asking a follow-up (no completion CTA in this turn's text).
+  if (data.progressUpdate.isCompleted && !ctaOk) {
+    data.progressUpdate.isCompleted = false;
   }
 }
 
@@ -723,33 +2436,68 @@ async function generateContentWithFallback(params: {
 // uncovered sibling dimension is found. State is persisted purely in
 // progressUpdate.step2Data.userPoints (the only Layer-1 field available in real
 // time during explore_A/explore_B) using a "［待裁决：...］" marker.
+//
+// Product rule (ask-then-expand): when two siblings exist and one is already solid,
+// do NOT silently assign 详写/略写. Ask the student which point to detail-write;
+// vague replies fall back to the heuristic default. Only then expand the chosen
+// detail point (or briefly fill an empty minor).
 
-// Marker format: ［待裁决：<dimension>｜<recommendation>］ — the recommendation is
-// embedded so that a short, ambiguous user reply (e.g. "好的"/"都行") can be resolved
-// relative to what was actually recommended, instead of always defaulting to one
-// fixed outcome regardless of which recommendation was proposed.
-const PENDING_RETENTION_MARKER_RE = /［待裁决：([^｜］]+)(?:｜([^］]+))?］/;
+// Marker format (new): ［待裁决：详=<developed>｜略=<uncovered>｜默认=<recommendation>］
+// Legacy format still parsed: ［待裁决：<uncovered>｜<recommendation>］
+const PENDING_RETENTION_MARKER_RE =
+  /［待裁决：(?:详=([^｜］]+)｜略=([^｜］]+)｜默认=([^］]+)|([^｜］]+)(?:｜([^］]+))?)］/;
 
 type RetentionRecommendation = "EXPAND_BOTH" | "KEEP_MINOR" | "DROP";
 
-function extractPendingRetention(
-  userPointsText: string,
-): { dimension: string; recommendation: RetentionRecommendation | null } | null {
+type PendingRetention = {
+  developed: string;
+  uncovered: string;
+  recommendation: RetentionRecommendation | null;
+};
+
+function parseRetentionRecommendation(
+  raw: string | undefined,
+): RetentionRecommendation | null {
+  if (raw === "KEEP_MINOR" || raw === "DROP" || raw === "EXPAND_BOTH") return raw;
+  return null;
+}
+
+function extractPendingRetention(userPointsText: string): PendingRetention | null {
   const match = PENDING_RETENTION_MARKER_RE.exec(String(userPointsText || ""));
   if (!match) return null;
-  const recommendation = match[2] as RetentionRecommendation | undefined;
+  // New format groups: 1=详, 2=略, 3=默认; legacy: 4=uncovered, 5=recommendation
+  if (match[1] && match[2]) {
+    return {
+      developed: match[1].trim(),
+      uncovered: match[2].trim(),
+      recommendation: parseRetentionRecommendation(match[3]),
+    };
+  }
+  const uncovered = String(match[4] || "").trim();
+  if (!uncovered) return null;
   return {
-    dimension: match[1].trim(),
-    recommendation:
-      recommendation === "KEEP_MINOR" || recommendation === "DROP"
-        ? recommendation
-        : null,
+    developed: "已展开的这一点",
+    uncovered,
+    recommendation: parseRetentionRecommendation(match[5]),
   };
 }
 
-// Pure, testable decision table: turns two LLM-judged signals into ONE default
-// recommendation + a short Chinese reason. Kept deterministic (not another LLM
-// call) so behavior is stable and unit-testable without network access.
+function shortRetentionLabel(text: string): string {
+  return String(text || "")
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .replace(/（待补例子）|已展开.*?主论点|已选详写|已选略写|保留-略写|用户放弃|待展开.*$/g, "")
+    .trim()
+    .slice(0, 28);
+}
+
+function isThinRetentionLabel(point: string): boolean {
+  const core = shortRetentionLabel(point);
+  return core.length < 12;
+}
+
+// Pure, testable decision table: heuristic DEFAULT only (used when the student
+ // replies vaguely with "好的"/"你定"). The student is asked to choose 详写/略写
+ // first; this table is the fallback, not the forced assignment.
 function decideStep2Retention(
   developedIsSolid: boolean,
   uncoveredRelevantToQuestion: boolean,
@@ -763,34 +2511,238 @@ function decideStep2Retention(
   if (uncoveredRelevantToQuestion) {
     return {
       recommendation: "KEEP_MINOR",
-      reasonZh: "这一点和题目直接相关，建议保留下来作为略写的补充点",
+      reasonZh: "默认建议：已展开的点作详写，另一点作略写补充",
     };
   }
   return {
     recommendation: "DROP",
-    reasonZh: "这一点和已展开的点比较重复或次要，建议专注写已展开的这一点",
+    reasonZh: "默认建议：专注详写已展开的点，另一点可先放下",
   };
+}
+
+type RetentionChoiceResult = {
+  developedTag: string;
+  uncoveredTag: string;
+  needExpandDetail: string | null;
+  expandMode: "detail" | "minor_brief" | null;
+  allowTransition: boolean;
+  summaryZh: string;
+};
+
+function resolveRetentionUserChoice(params: {
+  userMessage: string;
+  developed: string;
+  uncovered: string;
+  defaultRec: RetentionRecommendation | null;
+}): RetentionChoiceResult {
+  const t = String(params.userMessage || "").trim();
+  const developed = params.developed;
+  const uncovered = params.uncovered;
+  const dShort = shortRetentionLabel(developed);
+  const uShort = shortRetentionLabel(uncovered);
+
+  const wantsBoth = /都写|都要|都展开|两个都|全都|都详|都补充/i.test(t);
+  const wantsDropUncovered =
+    /放弃|不要|不用|算了|只写一个/i.test(t) &&
+    !/都写|都要|都展开/i.test(t);
+  const picksDeveloped =
+    (dShort.length >= 2 &&
+      (t.includes(dShort.slice(0, Math.min(4, dShort.length))) ||
+        answerTouchesSibling(t, developed)) &&
+      /详写|重点|主写|详细|第一个|第\s*1|就这个|这个详/i.test(t)) ||
+    /第一个|第\s*1\s*个|详写第一个/i.test(t);
+  const picksUncovered =
+    (uShort.length >= 2 &&
+      (t.includes(uShort.slice(0, Math.min(4, uShort.length))) ||
+        answerTouchesSibling(t, uncovered)) &&
+      /详写|重点|主写|详细|展开|补充|第二个|第\s*2/i.test(t)) ||
+    /第二个|第\s*2\s*个|详写第二个/i.test(t);
+
+  if (wantsBoth) {
+    return {
+      developedTag: "已展开，作为主论点",
+      uncoveredTag: "待展开详写",
+      needExpandDetail: uncovered,
+      expandMode: "detail",
+      allowTransition: false,
+      summaryZh: "两个都展开",
+    };
+  }
+
+  if (picksUncovered) {
+    return {
+      developedTag: "已选略写",
+      uncoveredTag: "已选详写",
+      needExpandDetail: uncovered,
+      expandMode: "detail",
+      allowTransition: false,
+      summaryZh: `详写『${uShort}』`,
+    };
+  }
+
+  if (picksDeveloped) {
+    const minorThin = isThinRetentionLabel(uncovered);
+    return {
+      developedTag: "已选详写",
+      uncoveredTag: minorThin ? "已选略写（待补一句）" : "已选略写",
+      needExpandDetail: minorThin ? uncovered : null,
+      expandMode: minorThin ? "minor_brief" : null,
+      allowTransition: !minorThin,
+      summaryZh: `详写『${dShort}』、略写『${uShort}』`,
+    };
+  }
+
+  if (wantsDropUncovered) {
+    return {
+      developedTag: "已选详写",
+      uncoveredTag: "用户放弃",
+      needExpandDetail: null,
+      expandMode: null,
+      allowTransition: true,
+      summaryZh: `只详写『${dShort}』`,
+    };
+  }
+
+  // Vague agreement ("好的"/"你定"/…) → heuristic default.
+  const rec = params.defaultRec || "KEEP_MINOR";
+  if (rec === "EXPAND_BOTH") {
+    return {
+      developedTag: "已展开，作为主论点",
+      uncoveredTag: "待展开详写",
+      needExpandDetail: uncovered,
+      expandMode: "detail",
+      allowTransition: false,
+      summaryZh: "默认：两边都补充",
+    };
+  }
+  if (rec === "DROP") {
+    return {
+      developedTag: "已选详写",
+      uncoveredTag: "用户放弃",
+      needExpandDetail: null,
+      expandMode: null,
+      allowTransition: true,
+      summaryZh: `默认：只详写『${dShort}』`,
+    };
+  }
+  const minorThin = isThinRetentionLabel(uncovered);
+  return {
+    developedTag: "已选详写",
+    uncoveredTag: minorThin ? "已选略写（待补一句）" : "已选略写",
+    needExpandDetail: minorThin ? uncovered : null,
+    expandMode: minorThin ? "minor_brief" : null,
+    allowTransition: !minorThin,
+    summaryZh: `默认：详写『${dShort}』、略写『${uShort}』`,
+  };
+}
+
+/** Annotate developed/uncovered labels inside userPoints; fall back to append. */
+function applyRetentionTagsToUserPoints(
+  basePoints: string,
+  developed: string,
+  uncovered: string,
+  developedTag: string,
+  uncoveredTag: string,
+): string {
+  let text = String(basePoints || "")
+    .replace(PENDING_RETENTION_MARKER_RE, "")
+    .trim();
+
+  const tagOne = (source: string, label: string, tag: string): string => {
+    const core = shortRetentionLabel(label);
+    if (core.length < 2) return source;
+    const re = new RegExp(
+      `(${core.slice(0, Math.min(6, core.length)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^；;\\n］]*)`,
+    );
+    if (re.test(source)) {
+      return source.replace(re, (m) => {
+        const cleaned = m
+          .replace(/（已选详写[^）]*）|（已选略写[^）]*）|（保留-略写）|（用户放弃）|（待展开详写）|（已展开，作为主论点）/g, "")
+          .trim();
+        return `${cleaned}（${tag}）`;
+      });
+    }
+    return `${source}；${core}（${tag}）`;
+  };
+
+  text = tagOne(text, developed, developedTag);
+  text = tagOne(text, uncovered, uncoveredTag);
+  return text.replace(/\s{2,}/g, " ").trim();
+}
+
+/**
+ * Extract the current recorded content for a point by label prefix (same
+ * matching strategy as applyRetentionTagsToUserPoints' tagOne), so we can judge
+ * sufficiency against what is ACTUALLY on record after this turn's update —
+ * not just against the raw choice-picking message text.
+ */
+function extractPointContent(source: string, label: string): string {
+  const core = shortRetentionLabel(label);
+  if (core.length < 2) return "";
+  const re = new RegExp(
+    `${core.slice(0, Math.min(6, core.length)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^；;\\n］]*`,
+  );
+  const m = String(source || "").match(re);
+  return m ? m[0] : "";
+}
+
+/** Is the point's on-record content already concrete enough that asking to
+ *  "expand it further" would just repeat what the student already gave? */
+function pointAlreadyHasConcreteContent(source: string, label: string): boolean {
+  const content = extractPointContent(source, label);
+  return !isThinRetentionLabel(content);
+}
+
+function findDevelopedSiblingLabel(params: {
+  priorUserPoints: string;
+  uncovered: string;
+  oldStage: string;
+  studentAnswer: string;
+}): string {
+  const side: "A" | "B" = params.oldStage === "explore_B" ? "B" : "A";
+  const siblings = extractNumberedSiblingPoints(params.priorUserPoints, side);
+  const uncovered = params.uncovered;
+  if (siblings.length >= 2) {
+    const uncoveredSibling =
+      siblings.find(
+        (s) =>
+          s.includes(shortRetentionLabel(uncovered).slice(0, 4)) ||
+          uncovered.includes(shortRetentionLabel(s).slice(0, 4)) ||
+          answerTouchesSibling(uncovered, s),
+      ) || null;
+    const developed =
+      siblings.find(
+        (s) =>
+          s !== uncoveredSibling &&
+          answerTouchesSibling(params.studentAnswer, s),
+      ) ||
+      siblings.find((s) => s !== uncoveredSibling) ||
+      siblings[0];
+    return developed;
+  }
+  if (siblings.length === 1) return siblings[0];
+  return "已展开的这一点";
 }
 
 // Resolves the student's short reply to a pending retention question relative to
 // the recommendation that was actually proposed. An explicit contradiction of the
 // recommendation flips the outcome; anything else (including vague agreement like
 // "好的"/"都行"/"随便") is treated as accepting the recommendation.
+// Kept for verify-script / legacy call sites; prefer resolveRetentionUserChoice.
 function resolvePendingRetentionChoice(
   userMessage: string,
   recommendation: RetentionRecommendation | null,
 ): string {
-  const t = String(userMessage || "");
-  const wantsDrop = /放弃|算了|不用了|不需要|只写|不要|drop|skip/i.test(t);
-  const wantsKeep = /保留|都写|都要|都展开|两个都/i.test(t);
-
-  if (recommendation === "DROP") {
-    // Recommendation was to drop; an explicit "keep" contradicts it.
-    return wantsKeep && !wantsDrop ? "保留-略写" : "用户放弃";
-  }
-  // Recommendation was KEEP_MINOR (or unknown/legacy marker without a recommendation);
-  // an explicit "drop" contradicts it.
-  return wantsDrop ? "用户放弃" : "保留-略写";
+  const result = resolveRetentionUserChoice({
+    userMessage,
+    developed: "已展开的这一点",
+    uncovered: "另一点",
+    defaultRec: recommendation,
+  });
+  if (result.uncoveredTag.includes("放弃")) return "用户放弃";
+  if (result.uncoveredTag.includes("待展开")) return "待展开详写";
+  if (result.developedTag.includes("略写")) return "角色反转-详写另一点";
+  return "保留-略写";
 }
 
 function extractLastCoachQuestion(messages: any[]): string {
@@ -862,13 +2814,19 @@ The student's CURRENT answer was:
 "${studentAnswer}"
 
 Task:
-1. Across the RECENT COACH QUESTIONS WINDOW (not only the last message), did the coach name TWO OR MORE distinct sub-dimensions/sub-angles/scenarios for the same side (e.g. joined by 与/和/、, listed as 『A』『B』, "A以及B", or asked as two numbered expansion prompts)? Set hasMultipleDimensions accordingly.
-2. IMPORTANT: If an earlier coach turn named two dimensions, and a LATER turn only scaffolds ONE of them, still treat this as a multi-dimension case — the sibling dimension remains "named" for coverage purposes.
-3. Combine the student's current answer WITH already-recorded brainstorm points.
+1. Set hasMultipleDimensions=true if EITHER of these is true:
+   a) Across the RECENT COACH QUESTIONS WINDOW (not only the last message), the coach named TWO OR MORE distinct sub-dimensions/sub-angles/scenarios for the same side (e.g. joined by 与/和/、, listed as 『A』『B』, "A以及B", or asked as two numbered expansion prompts); OR
+   b) Already-recorded brainstorm points (priorUserPoints) already list TWO OR MORE distinct points on the SAME side (e.g. "1. ...；2. ...", "A面：X；Y", or two semicolon-separated claims that are not synonyms). Student-named siblings in priorUserPoints count even when the latest coach question only scaffolds one of them.
+2. IMPORTANT: If an earlier coach turn OR priorUserPoints named two dimensions, and a LATER turn only scaffolds ONE of them, still treat this as a multi-dimension case — the sibling dimension remains "named" for coverage purposes.
+3. CRITICAL definition of "covered" vs "uncovered":
+   - A named dimension is COVERED only if (i) the student's CURRENT answer develops it with concrete content, OR (ii) a prior student answer in this explore stage already expanded/confirmed it AFTER the coach specifically asked about that dimension.
+   - Merely appearing as an item in priorUserPoints (e.g. "1. 塑料难降解…；2. 垃圾处理成本高…" from an initial dump) does NOT count as covered for a sibling that was never the focus of a later coach question and never expanded in a later student answer — even if that label already contains some mechanism words (焚烧/填埋 etc.).
+   - Example: priorUserPoints lists two A-side points; coach then only asks for a concrete scene about point 1; student answers about fish poisoning → point 2 is STILL uncovered.
+4. Combine the student's current answer WITH already-recorded brainstorm points under the definition above.
    - If hasMultipleDimensions=true and exactly ONE named sub-dimension is still uncovered, copy that uncovered dimension EXACTLY as a short Chinese phrase into "uncoveredDimension".
    - If all named dimensions are covered, or hasMultipleDimensions=false, set uncoveredDimension="".
-4. ALWAYS judge whether the student's CURRENT answer for the DEVELOPED dimension is already "solid" (includes a concrete scenario/beneficiary/mechanism, could support a full IELTS body paragraph alone) vs "thin" (still vague/generic, one-liner, or only restates an abstract label like "身份认同变弱"). Set developedIsSolid accordingly — even when hasMultipleDimensions=false.
-5. If uncoveredDimension is non-empty, judge whether it directly responds to a core qualifier/contrast in the essay question — set uncoveredRelevantToQuestion=true. Otherwise set uncoveredRelevantToQuestion=false.
+5. ALWAYS judge whether the student's CURRENT answer for the DEVELOPED dimension is already "solid" (includes a concrete scenario/beneficiary/mechanism, could support a full IELTS body paragraph alone) vs "thin" (still vague/generic, one-liner, or only restates an abstract label like "身份认同变弱"). Set developedIsSolid accordingly — even when hasMultipleDimensions=false.
+6. If uncoveredDimension is non-empty, judge whether it directly responds to a core qualifier/contrast in the essay question — set uncoveredRelevantToQuestion=true. Otherwise set uncoveredRelevantToQuestion=false.
 
 Respond with JSON only, matching the schema.
 `;
@@ -895,7 +2853,12 @@ Respond with JSON only, matching the schema.
       },
     });
     const parsed = parseAIResponse(response?.text, null);
-    if (!parsed) return null;
+    if (!parsed) {
+      console.warn(
+        "[Step2RetentionGuard][CALL_FAILED] verification response unparseable (fail-open)",
+      );
+      return null;
+    }
     return {
       hasMultipleDimensions: !!parsed.hasMultipleDimensions,
       uncoveredDimension: String(parsed.uncoveredDimension || "").trim(),
@@ -904,11 +2867,145 @@ Respond with JSON only, matching the schema.
     };
   } catch (e: any) {
     console.warn(
-      "[Step2RetentionGuard] verification call failed (fail-open, no correction applied):",
+      "[Step2RetentionGuard][CALL_FAILED] verification call failed (fail-open, no correction applied):",
       e.message || e,
     );
     return null;
   }
+}
+
+/** Detect verbal side-advance in coach chat text even when currentStage was not flipped.
+ *  Catches text/field desync where the model talks about B-side / stance while leaving
+ *  progressUpdate.step2Data.currentStage unchanged. */
+function textSuggestsExploreSideAdvance(
+  coachText: string,
+  oldStage: string,
+): boolean {
+  const t = String(coachText || "");
+  if (!t.trim()) return false;
+  if (oldStage === "explore_A") {
+    return /接下来\s*(我们)?(来)?看.{0,24}(B面|第二[个项]?任务|措施|解决|另一面|对立面|让步)|我们来看你为\s*B面|进入\s*(B面|第二[个项]?任务|措施)|转向\s*(B面|措施|解决)/i.test(
+      t,
+    );
+  }
+  if (oldStage === "explore_B") {
+    return /接下来\s*(我们)?(来)?(确定|讨论|看).{0,16}(立场|stance)|进入\s*(立场|stance|总结)|我们来确定.{0,8}立场/i.test(
+      t,
+    );
+  }
+  return false;
+}
+
+/**
+ * Deterministic sibling extractor for the active explore side.
+ * Prefer numbered "1. …；2. …" items inside A面/B面 sections.
+ */
+function extractNumberedSiblingPoints(
+  userPoints: string,
+  side: "A" | "B",
+): string[] {
+  const text = String(userPoints || "");
+  if (!text.trim()) return [];
+  const sideRe =
+    side === "A"
+      ? /A面[^：:]*[：:]([\s\S]*?)(?=B面[^：:]*[：:]|$)/
+      : /B面[^：:]*[：:]([\s\S]*)$/;
+  const sectionMatch = text.match(sideRe);
+  const scope = (sectionMatch?.[1] || (side === "A" ? text : "")).trim();
+  if (!scope) return [];
+
+  const numbered = [
+    ...scope.matchAll(/(?:^|[；;\n])\s*\d+[.、．]\s*([^；;\n]+)/g),
+  ]
+    .map((m) => m[1].trim())
+    .filter((s) => s.length >= 4);
+  if (numbered.length >= 2) return numbered;
+
+  const parts = scope
+    .split(/[；;]/)
+    .map((s) => s.replace(/^[A-Za-z]?面[^：:]*[：:]?\s*/, "").trim())
+    .filter((s) => s.length >= 4 && !/待裁决|待补例子/.test(s));
+  return parts.length >= 2 ? parts : [];
+}
+
+/** Fingerprint overlap: does `haystack` develop the sibling label? */
+function answerTouchesSibling(haystack: string, sibling: string): boolean {
+  const h = String(haystack || "");
+  const core = String(sibling || "")
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .trim();
+  if (core.length < 4 || !h.trim()) return false;
+
+  const compact = core.replace(/[，,、；;。．\s\/]+/g, "");
+  // Prefix / near-literal restatement.
+  const needle = compact.slice(0, Math.min(8, compact.length));
+  if (needle.length >= 4 && (h.includes(needle.slice(0, 4)) || h.includes(needle))) {
+    return true;
+  }
+
+  // Chinese bigram/trigram overlap (handles paraphrase expansions).
+  const grams = new Set<string>();
+  for (let i = 0; i < compact.length - 1; i++) {
+    grams.add(compact.slice(i, i + 2));
+    if (i < compact.length - 2) grams.add(compact.slice(i, i + 3));
+  }
+  let hits = 0;
+  for (const g of grams) {
+    if (h.includes(g)) hits += 1;
+  }
+  return hits >= 2;
+}
+
+/**
+ * When LLM coverage says "all covered" but userPoints still has numbered siblings
+ * and the current answer only develops one of them, return the undeveloped sibling.
+ */
+function findUndevelopedNumberedSibling(params: {
+  priorUserPoints: string;
+  studentAnswer: string;
+  oldStage: string;
+  /** The coach's own last question — a much more reliable signal than lexical
+   * overlap with the stored (possibly differently-worded) sibling label for
+   * deciding which sibling THIS answer is actually responding to. */
+  lastCoachQuestion?: string;
+}): string | null {
+  const side: "A" | "B" =
+    params.oldStage === "explore_B" ? "B" : "A";
+  const siblings = extractNumberedSiblingPoints(params.priorUserPoints, side);
+  if (siblings.length < 2) return null;
+
+  const answer = String(params.studentAnswer || "");
+  const touched = siblings.filter((s) => answerTouchesSibling(answer, s));
+  // Current answer develops exactly one sibling → the other is still uncovered.
+  if (touched.length === 1) {
+    const uncovered = siblings.find((s) => s !== touched[0]);
+    return uncovered ? uncovered.replace(/（待补例子）/g, "").trim() : null;
+  }
+  // Current answer's wording doesn't lexically overlap with EITHER stored label
+  // (common when the student paraphrases, e.g. "设置便民回收设施" vs a stored
+  // "个人养成回收习惯" label). Before falling back to a blind positional guess,
+  // check which sibling the coach's OWN last question was actually about — if
+  // it clearly targeted one sibling, this answer is a direct reply to it, so
+  // that sibling is now covered. Only the OTHER sibling can still be flagged,
+  // and only if it is independently thin (no concrete content of its own yet).
+  if (touched.length === 0 && answer.trim().length >= 12 && siblings.length >= 2) {
+    const lastQ = String(params.lastCoachQuestion || "");
+    const questionTargets = siblings.filter((s) => answerTouchesSibling(lastQ, s));
+    if (questionTargets.length === 1) {
+      const targeted = questionTargets[0];
+      const other = siblings.find((s) => s !== targeted);
+      if (other && isThinRetentionLabel(other)) {
+        return other.replace(/（待补例子）/g, "").trim();
+      }
+      // Coach's question targeted `targeted`; this answer covers it, and the
+      // other sibling already has its own solid content — nothing uncovered.
+      return null;
+    }
+    // No reliable question-target signal — fall back to the old positional
+    // guess only as a last resort (lower confidence than the checks above).
+    return siblings[1].replace(/（待补例子）/g, "").trim();
+  }
+  return null;
 }
 
 // Applies the retention guard in-place on `data`. Fails open on any error so a
@@ -920,32 +3017,105 @@ async function applyStep2RetentionGuard(
   messages: any[],
   question: string,
 ): Promise<void> {
-  if (!data?.progressUpdate?.step2Data) return;
+  if (!data?.progressUpdate?.step2Data) {
+    console.log(
+      "[Step2RetentionGuard][SKIP] no step2Data in progressUpdate",
+    );
+    return;
+  }
 
   const oldStage = session?.step2?.coachEvaluation?.currentStage || "explore_A";
   const newStage = data.progressUpdate.step2Data.currentStage;
   const oldUserPoints = session?.step2?.coachEvaluation?.userPoints || "";
+  const coachText = String(data.text || "");
+
+  console.log(
+    `[Step2RetentionGuard] enter oldStage=${oldStage} newStage=${newStage || "(unset)"} userPointsLen=${String(oldUserPoints).length}`,
+  );
 
   const pending = extractPendingRetention(oldUserPoints);
   if (pending) {
-    // This turn is the student's answer to a retention question asked last turn.
-    const choice = resolvePendingRetentionChoice(userMessage, pending.recommendation);
+    // Student is answering the 详写/略写 choice asked last turn.
+    const choice = resolveRetentionUserChoice({
+      userMessage,
+      developed: pending.developed,
+      uncovered: pending.uncovered,
+      defaultRec: pending.recommendation,
+    });
     const basePoints = String(
       data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
-    ).replace(PENDING_RETENTION_MARKER_RE, "").trim();
-    data.progressUpdate.step2Data.userPoints =
-      `${basePoints}；${pending.dimension}（${choice}）`.trim();
+    );
+    data.progressUpdate.step2Data.userPoints = applyRetentionTagsToUserPoints(
+      basePoints,
+      pending.developed,
+      pending.uncovered,
+      choice.developedTag,
+      choice.uncoveredTag,
+    );
+
+    if (choice.needExpandDetail && choice.expandMode) {
+      // Before asking to "expand further", check whether this turn's own answer
+      // (as reflected in the freshly-updated userPoints) already gave concrete
+      // content for that point. If so, asking again would just repeat/contradict
+      // the acknowledgment the model already gave in Part 1 — skip the ask.
+      const alreadySolid = pointAlreadyHasConcreteContent(
+        data.progressUpdate.step2Data.userPoints,
+        choice.needExpandDetail,
+      );
+      if (alreadySolid) {
+        console.log(
+          `[Step2RetentionGuard][PENDING_RESOLVED] ${choice.summaryZh}; content already concrete — skipping redundant expand ask`,
+        );
+        return;
+      }
+
+      // Role chosen (or minor empty) → stay on this side and ask for content.
+      data.progressUpdate.step2Data.currentStage = oldStage;
+      const label = shortRetentionLabel(choice.needExpandDetail);
+      const expandAsk =
+        choice.expandMode === "minor_brief"
+          ? `好的，『${label}』我们留作略写——用一两句话说说它大概是什么情况就行（不用展开成完整场景）。`
+          : `好的，那我们详写『${label}』。请再补充 1-2 句具体场景 / 机制 / 受影响对象，把它写扎实。`;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      data.text = `${part1}\n\n---\n\n${expandAsk}`;
+      console.log(
+        `[Step2RetentionGuard][PENDING_RESOLVED] ${choice.summaryZh}; needExpand=${label} mode=${choice.expandMode}`,
+      );
+      return;
+    }
+
+    // Choice settled and detail already solid → allow transition this turn.
+    console.log(
+      `[Step2RetentionGuard][PENDING_RESOLVED] ${choice.summaryZh}; allowTransition=${choice.allowTransition}`,
+    );
     return;
   }
 
-  const isExploreTransition =
+  const stageTransition =
     (oldStage === "explore_A" && newStage && newStage !== "explore_A") ||
     (oldStage === "explore_B" && newStage && newStage !== "explore_B");
-  if (!isExploreTransition) return;
+  const verbalAdvance = !stageTransition && textSuggestsExploreSideAdvance(coachText, oldStage);
+  const isExploreTransition = stageTransition || verbalAdvance;
+  if (!isExploreTransition) {
+    console.log(
+      `[Step2RetentionGuard][NO_TRANSITION] oldStage=${oldStage} newStage=${newStage || "(unset)"} verbalAdvance=false — guard not applicable`,
+    );
+    return;
+  }
+  if (verbalAdvance) {
+    console.warn(
+      `[Step2RetentionGuard][VERBAL_ADVANCE] text suggests side advance while currentStage stayed ${oldStage} (newStage=${newStage || "(unset)"})`,
+    );
+  }
 
   const lastCoachQuestion = extractLastCoachQuestion(messages);
   const coachQuestionsWindow = extractCoachQuestionsWindow(messages, 4);
-  if (!coachQuestionsWindow) return;
+  if (!coachQuestionsWindow) {
+    console.warn(
+      "[Step2RetentionGuard][SKIP] coachQuestionsWindow empty — cannot verify coverage",
+    );
+    return;
+  }
 
   const check = await checkStep2DimensionCoverage({
     question,
@@ -954,9 +3124,42 @@ async function applyStep2RetentionGuard(
     studentAnswer: userMessage,
     priorUserPoints: oldUserPoints,
   });
-  if (!check?.hasMultipleDimensions || !check.uncoveredDimension) {
+
+  // Deterministic fallback: LLM often treats "listed in userPoints" as covered.
+  const heuristicUncovered = findUndevelopedNumberedSibling({
+    priorUserPoints: oldUserPoints,
+    studentAnswer: userMessage,
+    oldStage,
+    lastCoachQuestion,
+  });
+
+  let effectiveCheck = check;
+  if (
+    heuristicUncovered &&
+    (!check || !check.hasMultipleDimensions || !check.uncoveredDimension)
+  ) {
+    console.warn(
+      `[Step2RetentionGuard][HEURISTIC_UNCOVERED] LLM missed sibling; using "${heuristicUncovered}"`,
+    );
+    effectiveCheck = {
+      hasMultipleDimensions: true,
+      uncoveredDimension: heuristicUncovered,
+      developedIsSolid: check ? check.developedIsSolid : true,
+      uncoveredRelevantToQuestion: check
+        ? check.uncoveredRelevantToQuestion
+        : true,
+    };
+  }
+
+  if (!effectiveCheck) {
+    console.warn(
+      "[Step2RetentionGuard][NO_TRIGGER] coverage check returned null (call failed or unparseable)",
+    );
+    return;
+  }
+  if (!effectiveCheck.hasMultipleDimensions || !effectiveCheck.uncoveredDimension) {
     // Tag thin developed points so summary does not claim "完整性极高".
-    if (check && check.developedIsSolid === false) {
+    if (effectiveCheck.developedIsSolid === false) {
       const basePoints = String(
         data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
       ).trim();
@@ -964,40 +3167,52 @@ async function applyStep2RetentionGuard(
         data.progressUpdate.step2Data.userPoints = `${basePoints}（待补例子）`;
       }
     }
+    console.log(
+      `[Step2RetentionGuard][NO_TRIGGER] hasMultipleDimensions=${effectiveCheck.hasMultipleDimensions} uncoveredDimension="${effectiveCheck.uncoveredDimension || ""}" developedIsSolid=${effectiveCheck.developedIsSolid}`,
+    );
     return;
   }
 
   const { recommendation, reasonZh } = decideStep2Retention(
-    check.developedIsSolid,
-    check.uncoveredRelevantToQuestion,
+    effectiveCheck.developedIsSolid,
+    effectiveCheck.uncoveredRelevantToQuestion,
   );
 
-  // Revert the transition and fold a recommendation-driven retention question
-  // into this same turn, instead of an open-ended "which do you prefer" ask.
+  const uncovered = effectiveCheck.uncoveredDimension;
+  const developed = findDevelopedSiblingLabel({
+    priorUserPoints: oldUserPoints,
+    uncovered,
+    oldStage,
+    studentAnswer: userMessage,
+  });
+  const dShort = shortRetentionLabel(developed);
+  const uShort = shortRetentionLabel(uncovered);
+
+  // Revert the transition; ask the student to choose 详写/略写 (or expand both
+  // when the developed point is still thin).
   data.progressUpdate.step2Data.currentStage = oldStage;
-  const split = splitTwoParts(data.text, 1);
-  const part1 = (split.part1 || data.text || "").trim();
-  const uncovered = check.uncoveredDimension;
+  const part1 = safeOverridePart1(String(data.text || ""));
 
   let retentionQuestion: string;
   if (recommendation === "EXPAND_BOTH") {
-    retentionQuestion = `我们先记录下这一点（${reasonZh}）。你之前还提到『${uncovered}』——能否也补充 1-2 句，让这一维度也有具体内容？`;
-  } else if (recommendation === "KEEP_MINOR") {
-    retentionQuestion = `这一点已经足够扎实，可以独立支撑一段。${reasonZh}——建议把『${uncovered}』保留下来作为一个略写的补充点（Step 3 会详写这一点、略写『${uncovered}』，控制在 90-110 词内）。如果你想专注只写这一点，回复"放弃${uncovered}"即可。`;
+    retentionQuestion = `我们先记录下这一点（${reasonZh}）。你之前还提到『${uShort}』——能否也补充 1-2 句，让这一维度也有具体内容？若你其实想先选定哪个详写、哪个略写，也可以直接告诉我。`;
   } else {
-    retentionQuestion = `这一点已经足够扎实，可以独立支撑一段。${reasonZh}——建议专注写这一点就好。如果你还是想把『${uncovered}』也简单提一句，回复"保留${uncovered}"即可。`;
+    retentionQuestion =
+      `目前这两点都有了：\n① 『${dShort}』\n② 『${uShort}』\n` +
+      `一篇主体段通常详写一个、略写一个（控制在 90-110 词）。你想选哪一个重点详写？另一个简单带一句就好。\n` +
+      `也可以说「两个都展开」，或回复「你定」（${reasonZh}）。`;
   }
   data.text = `${part1}\n\n---\n\n${retentionQuestion}`;
 
   const basePoints = String(
     data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
   ).trim();
-  const thinTag = check.developedIsSolid ? "" : "（待补例子）";
+  const thinTag = effectiveCheck.developedIsSolid ? "" : "（待补例子）";
   data.progressUpdate.step2Data.userPoints =
-    `${basePoints}${thinTag} ［待裁决：${uncovered}｜${recommendation}］`.trim();
+    `${basePoints}${thinTag} ［待裁决：详=${developed}｜略=${uncovered}｜默认=${recommendation}］`.trim();
 
   console.warn(
-    `[Step2RetentionGuard] Reverted transition ${oldStage}->${newStage}; uncovered="${uncovered}"; recommendation=${recommendation}`,
+    `[Step2RetentionGuard][REVERTED] ${oldStage}->${newStage || "(verbal)"}; developed="${dShort}"; uncovered="${uShort}"; default=${recommendation}; via=${stageTransition ? "stage" : "verbal"}`,
   );
 }
 
@@ -1034,6 +3249,12 @@ const INTERNAL_JARGON_REPLACEMENTS: [RegExp, string][] = [
   [/\bisCompleted\b/gi, ""],
   [/\buserPoints\b/gi, ""],
   [/\bblueprint\b/gi, "文章蓝图"],
+  // Memory digests (internal only)
+  [/\bsourceHash\b/gi, ""],
+  [/\bopenGaps\b/gi, ""],
+  [/\bstep1Digest\b/gi, ""],
+  [/\bstep2Digest\b/gi, ""],
+  [/\bstep3Digest\b/gi, ""],
   // English role names -> Chinese (when leaked as raw words)
   [/\bmajor\b/gi, "详写"],
   [/\bminor\b/gi, "略写"],
@@ -1358,8 +3579,15 @@ async function startServer() {
   // Coach API - Dynamic Chat with AI Coach
   app.post("/api/coach/chat", async (req, res) => {
     try {
-      const { question, step, messages, stepContext, session, userMessage } =
-        req.body;
+      const {
+        question,
+        step,
+        messages,
+        stepContext,
+        session,
+        userMessage,
+        isHiddenKickoff,
+      } = req.body;
       if (!question || !step || !userMessage) {
         res
           .status(400)
@@ -1444,11 +3672,26 @@ async function startServer() {
       const questionBrief = buildQuestionBrief(question, knownQuestionType);
       const questionBriefStr = formatQuestionBriefForPrompt(questionBrief);
 
+      // Resolve cross-step digests: reuse when sourceHash matches, else rebuild.
+      // boardOverrides are folded into Step1 hash via getMergedStep1Eval.
+      const { memory: resolvedMemory, rebuilt: memoryRebuilt } = resolveSessionMemory(
+        session,
+        question,
+      );
+      if (memoryRebuilt.length > 0) {
+        console.log(
+          `[MemoryDigest] Rebuilt: ${memoryRebuilt.join(", ")} (sourceHash mismatch or first build)`,
+        );
+      }
+      const memoryDigestStr = formatMemoryDigestsForPrompt(resolvedMemory);
+
       let contextStr = "No previous step data available yet.";
       if (session) {
         let step1Summary = "";
-        if (step1Notes) {
-          step1Summary += `User's Actual Notes/Stance: "${step1Notes}"\n`;
+        // Prefer raw student words (chat + notes) as a separate, unprocessed block so
+        // later steps can expand from the student's own phrasing, not only AI labels.
+        if (step1Notes && step1Notes !== "Not provided") {
+          step1Summary += `Student's own words from Step 1 (unprocessed — prefer these phrasings when expanding):\n"${step1Notes}"\n`;
         }
         if (step1Eval) {
           const step1Dims = (step1Eval.suggestedDimensions || [])
@@ -1466,6 +3709,19 @@ async function startServer() {
         }
         if (step2Eval) {
           step2Summary += `Coach Evaluation:\n- Current Stage: ${step2Eval.currentStage || "explore_A"}\n- User Stance: ${step2Eval.userStance || step2Stance}\n- User Points: ${step2Eval.userPoints || step2Points}\n- Coach Critique: ${step2Eval.critique}\n- Recommended Stance: ${step2Eval.suggestedStance}\n- Recommended Points: ${step2Eval.suggestedPoints}`;
+          const blueprint = step2Eval.blueprint || session?.step2?.blueprint;
+          if (blueprint && typeof blueprint === "object") {
+            const position = String(blueprint.position || "").trim();
+            const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
+            const body1 =
+              String(bodies[0]?.content || bodies[0]?.title || blueprint.body1 || "").trim();
+            const body2 =
+              String(bodies[1]?.content || bodies[1]?.title || blueprint.body2 || "").trim();
+            step2Summary += `\n- Overall Thesis/Position: ${position || "Not provided"}`;
+            step2Summary += `\n- Planned Body Paragraphs:`;
+            step2Summary += `\n  Body 1: ${body1 || "Not provided"}`;
+            step2Summary += `\n  Body 2: ${body2 || "Not provided"}`;
+          }
         }
         if (!step2Summary) {
           step2Summary = "Not provided";
@@ -1477,6 +3733,8 @@ Question:
 ${question}
 
 ${questionBriefStr}
+
+${memoryDigestStr}
 
 Known user ideas & Coach Diagnostics:
 
@@ -1490,10 +3748,12 @@ ${step2Summary}
 - Paragraph Drafts: ${step3Draft || "Not provided"}
 - Subpoint logic chains: ${JSON.stringify(step3Subpoints)}
 - Active Subpoint (= starting claim for this turn): ${activeStep3Claim || "Not selected / not provided"}
+- Active Subpoint belongs to: ${activeStep3Subpoint?.targetBody || "Unknown"}
 - Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. Start diagnosis and paragraphPlan directly. Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
+- Mode hint: If Step 2 blueprint already gives an overall thesis/position AND this body claim already umbrella-covers two sub-points, prefer direct_points (no separate totalClaim) for multi-point bodies.
 
 Current objective:
-Review the context above and the current step's instructions. Organize and develop the existing ideas. Keep full consistency with the established positions.
+Review the context above and the current step's instructions. Organize and develop the existing ideas. Keep full consistency with the established positions. Prefer memory digests' filled/openGaps over re-deriving what is already known.
 =====================================
 `;
       } else {
@@ -1503,6 +3763,8 @@ Question:
 ${question}
 
 ${questionBriefStr}
+
+${memoryDigestStr}
 =====================================
 `;
       }
@@ -1532,6 +3794,10 @@ ${questionBriefStr}
   - If the student's answer is off-target for the current slot, FIRST name the mismatch in one short sentence, THEN guide the correction. Do NOT open with empty praise like "非常准确/精准地抓住了/完美".
   - Example: student restates background as coreIssue -> "你说的是题目背景现象，还不是写作任务焦点。请改成：这道题真正要你回答的是什么？"
 
+  Board-authority rule (CRITICAL — right-side diagnosis board may be user-edited):
+  - The Coach Evaluation values in ContextSummary (Question Type / Core Issue / Constraints / Suggested Dimensions) are the SOURCE OF TRUTH for already-filled slots, including any student edits on the board.
+  - When a slot already has a non-empty value in ContextSummary, treat it as filled. Do NOT overwrite it in progressUpdate with a different AI-preferred wording unless the student explicitly asks to change it in chat.
+  - If the student edited dimensions on the board (ContextSummary already lists them), continue from those labels; do not silently replace or "improve" them.
   Per-slot feedback — no spoiler (CRITICAL):
   - When validating ONE filled slot while the NEXT slot is still missing, Part 1 must confirm ONLY what the student just answered for that slot (≤1 short sentence). Part 2 asks the first still-missing slot.
   - correctType filled, coreIssue missing -> confirm the type label only (e.g. "**Two-part**，判断正确。"). FORBIDDEN in Part 1: enumerating sub-questions ("第一…第二…"), paraphrasing the essay prompt, stating causes/evaluation/stance tasks, or previewing questionBrief writingDestination/taskMap content. Treat "explaining what the two parts ask" as coreIssue content — the student must say it in Q2 first; you may echo it briefly only AFTER they answer coreIssue.
@@ -1562,8 +3828,12 @@ ${questionBriefStr}
   - This is the mirror-image of the global FILLED_SHALLOW follow-up rule: there, thin answers get ONE depth follow-up; here, answers that are ALREADY too deep get pulled back up to a label, never pushed deeper.
 
   suggestedDimensions anti-fabrication rule (CRITICAL — do not pad to hit the count):
-  - Every dimension you write into progressUpdate MUST be extractable from the student's own words (this turn or earlier). You MAY split one sentence into 2 labels if the student named 2 distinct factors (e.g. "经济发展" AND "方便沟通/商业活动" are 2 real factors in one sentence -> 2 legitimate labels). You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach the 2~4 target count.
-  - VIOLATION (do NOT do this): student's message only describes ONE causal chain — economic development -> communication convenience -> people learn the dominant language -> native language de-emphasized. Extracting "经济与商贸发展" and "沟通便利度" from it is fine (2 real factors), but then ALSO adding "文化身份认同" (never mentioned) as a 3rd dimension to look more thorough is FABRICATION and FORBIDDEN.
+  - Every dimension you write into progressUpdate MUST be extractable from the student's own words (this turn or earlier). You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach the 2~4 target count.
+  - Causal-chain vs parallel-angles test (CRITICAL — decide split vs collapse BEFORE writing labels):
+    - Ask: if I remove factor A, does factor B still stand alone as an independent cause/angle that could support its own paragraph? If YES -> may record 2 labels. If NO (B is only A's consequence, middle step, restatement, or the next link in the same narrative) -> collapse into ONE abstract label covering the whole chain.
+    - Parallel OK example: student says "一是经济发展，二是教育制度偏向主流语言" — two independent causes -> 2 labels (e.g. "经济发展" + "教育制度").
+    - VIOLATION (do NOT do this): student says "经济文化交流增多之后，强势文化流入，对本国文化的冲击". This is ONE causal chain (A→B→C), NOT two parallel angles. Record ONE label (e.g. "经济全球化冲击" / "强势文化冲击"); do NOT split into "经济角度" + "强势文化角度", and do NOT praise it as "两个角度".
+    - Fabrication VIOLATION (do NOT do this): student's message only describes ONE causal chain — economic development -> communication convenience -> people learn the dominant language -> native language de-emphasized. Collapsing that chain into ONE label (e.g. "经济与沟通便利驱动") is correct; ALSO adding "文化身份认同" (never mentioned) as an extra dimension to look more thorough is FABRICATION and FORBIDDEN.
   - Sufficiency gate: if the student's message truly yields only ONE genuine dimension, do NOT fabricate a second one and do NOT mark the step complete yet. Ask ONE follow-up offering TWO neutral candidate angle NAMES only (not content, not analysis) they have not covered, e.g. "除了[已给维度]，你觉得还可以从哪个角度补充？比如社会文化、教育制度这类角度，你选一个或换一个都可以。" This follows the global anti-loop guard: at most ONE such follow-up for this slot; after that, accept whatever the student gives (even if still just 1) and do not keep asking.
   - Feedback proportionality: Part 1's confirmation must match what was ACTUALLY given. Do NOT describe a single causal chain as if the student did rich "多维度分析" (e.g. do not say "从经济、商业、沟通效率等多个角度精准指出了底层逻辑" when they only gave one line of reasoning). State plainly what was recorded, nothing more.
 
@@ -1579,6 +3849,10 @@ ${questionBriefStr}
   - Tag each recorded dimension with which task(s) it covers using a short natural-language suffix so Step 2 can anchor correctly later, e.g. "经济发展（原因+评价均适用）" or "身份认同（评价）". Do not use raw field/stage names (taskMap, explore_A/B) as the tag text — and never expose this tagging logic to the student either.
   - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), prefer at least 2 distinct angles before moving to the next task/slot. If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？") before moving on — do not silently transition to the next task with only 1 angle recorded for the current one. Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on (do not fabricate a 2nd to force the count).
   - Sequencing with the global sufficiency gate above: after BOTH tasks have been asked (each following Per-task sufficiency), if the TOTAL distinct dimension count is still below 2, apply the sufficiency-gate follow-up (max ONE extra question) as a final top-up — do not fabricate to skip this.
+  - Continuation-signal routing (CRITICAL — student may still be finishing the previous task after you already asked the next one):
+    - If your previous question already moved to Task B (or the next slot), but the student's CURRENT message signals they are still continuing the previous task — e.g. "还没说完" / "我接着说" / "继续刚才" / "等一下" / "先补充一下" / "还有一个原因" / or they clearly keep elaborating causes when you just asked for evaluation angles — then route this turn's content into the PREVIOUS task/slot (Task A / prior slot). Do NOT treat it as an answer to the new question.
+    - Silently merge the continuation into the correct prior slot's suggestedDimensions (apply the causal-chain vs parallel-angles test). Do NOT scold, do NOT re-ask the already-advanced question in the same turn, and do NOT pretend they answered Task B.
+    - After recording the continuation, you MAY briefly acknowledge and then either stay on the prior task (if still under-filled per Per-task sufficiency) or re-ask the next-task question once.
 
   Critical skip rule (Step1-specific example of slot reuse):
   - A scope qualifier (entirely / completely / only / always / 完全 / 彻底 / 只 / 仅 / 必须 / 始终) that appears in the coreIssue answer IS the constraint. Recognizing it verbally in your feedback is NOT enough.
@@ -1607,7 +3881,8 @@ ${questionBriefStr}
   - Part 1: ONE short confirmation + compact structured summary (题型、核心议题、关键限定、建议维度). No long restatement. You MAY briefly echo writingDestination in structural terms only.
   - Part 2: explicit CTA telling the student to click the 【下一步】 button to enter Step 2. Part 2 MUST include the phrase "进入第二步".
   - Structural preview ONLY (optional, one short clause): e.g. "下面我们按：原因段 → 评价段 来梳理" — using taskMap labels, NEVER attach a recommended stance or preferred conclusion (FORBIDDEN: "建议弊大于利" / "多数稳妥路径是…").
-  - CRITICAL: In the SAME response when all 4 slots are filled, you MUST set progressUpdate.isCompleted: true.
+  - CRITICAL: In the SAME response when all 4 slots are filled AND you are emitting the completion CTA above, you MUST set progressUpdate.isCompleted: true.
+  - FORBIDDEN: Do NOT set isCompleted: true while still asking Task A/Task B dimension questions, a sufficiency follow-up, or any other missing-slot question. Mid-flow questions (even after Task A already has 2 angles) must keep isCompleted: false.
   - FORBIDDEN after Step 1 completion: Do NOT ask Step 2 questions (stance, blueprint, body paragraphs, thesis) while still in Step 1. Those belong only in Step 2.
   - Do NOT populate progressUpdate.step2Data while step=1.
 `;
@@ -1631,13 +3906,23 @@ ${questionBriefStr}
 
   Cross-stage extraction rule (CRITICAL):
   - Before you ask any stage question, check whether the student's CURRENT message already contains content from later stages.
-  - If the current message already includes both A-side and B-side points, do NOT force another explore question; move directly toward stance.
-  - You may skip forward to "stance" when evidence is sufficient. Do NOT jump directly to "summary" unless stance is also explicit and blueprint-ready.
+  - If the current message already includes both A-side and B-side points, do NOT force another explore question; move directly toward stance (or summary when requiresStance=false).
+  - When INTERNAL questionBrief.requiresStance=true: you may skip forward to "stance" when evidence is sufficient. Do NOT jump directly to "summary" unless stance is also explicit and blueprint-ready.
+  - When INTERNAL questionBrief.requiresStance=false: NEVER enter "stance". After explore_B is sufficient, go directly to "summary". Do NOT ask the student to choose a personal stance / agree-disagree option — the essay does not require one (typical what/why/how / Problem-Solution / many Two-part prompts). For blueprint.position / userStance, write a neutral overview sentence that names the two tasks (e.g. "本文先解释禁用必要性，再提出其他减塑措施"), NOT an agree/disagree judgment.
+
+  Stance-skip rule (CRITICAL — driven by questionBrief.requiresStance):
+  - requiresStance=true (Agree/Disagree, Discuss Both Views, Positive/Negative, outweigh-style Adv/Dis): keep the four-stage flow explore_A → explore_B → stance → summary.
+  - requiresStance=false (Problem/Solution, pure what/why Two-part, discuss-only Adv/Dis without judgment ask): three-stage flow explore_A → explore_B → summary. Skip stage "stance" entirely. FORBIDDEN: inventing agree/disagree options, "老师帮我推荐一个", or asking "你最终更倾向于哪种立场" when the prompt never asked for a personal opinion.
 
   Dimension-aware questioning rule (CRITICAL):
-  - If Step 1 already provides suggestedDimensions in context, your question must explicitly anchor to those dimensions first, then ask for concrete expansion.
+  - If Step 1 already provides suggestedDimensions in context, your question must explicitly anchor to those dimensions first, then ask for concrete expansion (场景 / 机制 / 受益或受影响对象).
   - Prefer "沿着你刚才的这个维度，我们把它展开到具体场景/人群/机制" over generic repeats.
   - Use generic fallback only when no relevant dimension exists in context.
+  - FORBIDDEN when suggestedDimensions is non-empty in ContextSummary (Step1 already converged these):
+    1) Re-asking a dimension inventory: "可以从哪些角度切入" / "有哪些方面" / "请列出维度" / "还可以从哪些角度".
+    2) Re-confirming question type / correctType (e.g. "这是什么题型").
+    3) Re-confirming coreIssue / writing task (e.g. "这道题真正要你回答的是什么").
+    Step 2 only expands concrete content under known dimensions; it must NOT re-open Step 1's convergence slots.
 
   Dual readiness check (CRITICAL — do not conflate):
   - logicValid: the claim itself is a valid result/judgment for the question (e.g. "身份认同变弱" can already be a valid negative impact of cultural loss). Do NOT force deeper abstract philosophy.
@@ -1645,32 +3930,43 @@ ${questionBriefStr}
   - A point may be logicValid=true but exampleReady=false. In that case, ask for a concrete example/scene, NOT a deeper "why".
   - Only treat a body as fully ready when BOTH are true, OR the student explicitly chooses to keep a thin point and you tag it "（待补例子）" in userPoints.
 
-  Depth follow-up style (CRITICAL):
+  Depth follow-up style (CRITICAL — this is a RESCUE mechanism, NOT the default first-ask style):
+  - Scope: the "two concrete candidate directions" technique below applies ONLY on the SECOND ask for the SAME point/slot — i.e. only after the student has already given one shallow/stuck answer for THIS specific point. It is a fallback, not how you should phrase your first question about any new dimension/sub-point.
+  - First ask for a NEW dimension/sub-point (CRITICAL — anti-spoiler): ask an OPEN, direction-only question naming the dimension itself (e.g. "政府层面具体可以通过什么方式来管控企业？"). Do NOT append example answers/mechanisms in the same question ("比如，是对A征税，还是推广B" is FORBIDDEN here) — that pre-fills near-final answers before the student has tried. Concrete "比如 X / Y" examples are reserved for the follow-up-after-stuck case below.
   - FORBIDDEN open prompt after the student says they don't know how to expand: "请谈谈你的看法 / 请用一两句话展开".
-  - REQUIRED: offer exactly TWO concrete candidate directions (场景 / 后果 / 受益对象) and let the student pick or fill one. Do NOT write a full ready-made sentence for them.
+  - REQUIRED (only at this follow-up point, after one shallow answer): offer exactly TWO concrete candidate directions (场景 / 后果 / 受益对象) and let the student pick or fill one. Do NOT write a full ready-made sentence for them.
   - Candidate directions MUST be neutral: do NOT imply which direction is easier, safer, or higher-scoring. You may privately consult questionBrief.candidateDirectionSeeds, but never present them as preferred answers.
   - If the student's claim is already a direct result of the essay phenomenon (e.g. cultural loss → weaker identity), acknowledge logicValid=true, then only ask for a scene if exampleReady is still false.
 
-  Compact feedback rule (CRITICAL, explore stages):
-  - Part 1 MUST be one short confirmation in this shape: "很好，目前我们记录到：[用户原话要点]。"
-  - FORBIDDEN: renumbering, bold restating, or multi-bullet paraphrase of what the student just said.
+  Compact feedback rule (CRITICAL, explore stages — a CONSTRAINT, not a literal template; see INTENT CLASSIFICATION BEFORE FORMAT above for which intent this applies to):
+  - When intent = NEW CONTENT: Part 1 must be ONE short, natural-sounding acknowledgment of what the student gave — brief, not a data-dump confirmation. Wording may vary; "很好，目前我们记录到：..." is one example phrasing among many, not a mandatory opener.
+  - No-spoiler acknowledgment (CRITICAL): Part 1 may name WHICH dimension/point the student's answer belongs to, but must NOT explain WHY it works, walk through its causal mechanism, or spell out the reasoning chain on the student's behalf (e.g. FORBIDDEN: "...能有效倒逼企业从源头上减少塑料的使用" / "...极大增强了措施的可操作性" as an added analysis the student never said). That reasoning is the student's own thinking-practice, not something to hand them pre-packaged. Keep the acknowledgment to confirming receipt + which slot it fills; save analysis for your own internal evaluation, not the chat text.
+  - FORBIDDEN regardless of phrasing: renumbering, bold restating, or multi-bullet paraphrase of what the student just said.
   - Do NOT invent empty numbered list items (never output a bare "1." with no content).
+  - When intent = ASKING FOR YOUR JUDGMENT/OPINION (see INTENT CLASSIFICATION rule): do NOT use this confirmation shape at all — answer directly as a recommendation instead.
 
   Dimension Coverage & Retention Rule (CRITICAL — prevents silently dropping sibling dimensions):
   - MANDATORY FIRST STEP before you decide anything else about transitioning: re-read ALL of your own coach questions in the CURRENT explore stage in "Previous Conversation Logs" (not only the last line). If an earlier turn named TWO OR MORE dimensions and a later turn only scaffolds one of them, the sibling dimension is STILL named and must be checked for coverage.
-  - Also check progressUpdate.step2Data.userPoints / prior user messages on this side for any dimension the student already named but has not developed.
+  - Also check progressUpdate.step2Data.userPoints / prior user messages on this side for any dimension the student already named but has not developed. Student-named siblings in userPoints (e.g. "1. 塑料难降解…；2. 垃圾处理成本高") count as multi-dimension even if your latest question only asked about one of them.
+  - Listing a point in userPoints ≠ confirming/expanding that point. A sibling that was only dumped in an initial list and never individually asked about remains uncovered.
+  - Sibling confirmation before leave (CRITICAL): before leaving the current explore stage, every distinct point already recorded in userPoints for THIS side must have been individually addressed in at least one coach turn (depth follow-up OR brief confirmation ask). If userPoints lists "1. X；2. Y" and you only followed up on X, you MUST NOT transition yet — next ask about Y (or apply the retention question for Y), even if Y's label already contains some mechanism words.
   - If YES to multi-dimension naming, and the student's current answer (+ recorded points) only develops ONE of those named sub-dimensions, this is an "uncovered dimension" case. This check runs BEFORE the sufficiency gate below and BEFORE any depth follow-up decision.
   - If NO (only one dimension was ever named, or the "other" one is just a synonym of the developed one), skip this rule entirely and proceed with the normal sufficiency-gated transition below.
   - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient OR is tagged （待补例子）.
-  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED (stay in the current explore stage) and fold exactly ONE retention question into your reply. Do NOT ask an open-ended "which do you prefer" question — you must EVALUATE first and state ONE default recommendation with a reason, then give the student a single override phrase:
-    - Developed point still thin (missing concrete scenario/beneficiary/mechanism) -> default recommendation is to keep BOTH; ask for 1-2 sentences on the uncovered dimension too. (No override phrase needed here — this is just a request for more content.)
-    - Developed point already solid enough alone to carry a full 90-110 word paragraph -> evaluate whether the uncovered dimension directly answers a core qualifier/contrast in the essay question (e.g. "entirely", "highly beneficial") or is more of a repetition/peripheral detail of the developed point:
-      - If it directly answers a core qualifier/contrast -> default recommendation is KEEP as a brief ("略写"/minor) supporting point. State the reason (e.g. "这一点和题目直接相关"), then add: "如果你想专注只写[已展开点]，回复'放弃[未展开点]'即可。"
-      - If it is repetitive/peripheral -> default recommendation is DROP it and focus on the developed point. State the reason (e.g. "这一点和已展开的点比较重复"), then add: "如果你还是想把[未展开点]也简单提一句，回复'保留[未展开点]'即可。"
-    - Both dimensions already have enough material -> default recommendation is to keep BOTH; tell the student Step 3 will assign one point as 详写 and the other as 略写 to stay within the 90-110 word budget.
-    - Example (mirrors a real case, KEEP branch): your own question named both "面对面互动" and "教师监督"; the student only develops "教师监督" (with a concrete beneficiary: young/low-self-control kids). This point alone is solid, and "面对面互动" also directly answers the essay's "entirely/replace" contrast, so your reply should read like: "『教师监督』这一点已经足够扎实，可以独立支撑一段。『面对面互动』和题目直接相关，建议保留下来作为一个略写的补充点。如果你想专注只写监管，回复'放弃面对面互动'即可。" and currentStage stays on the current explore stage this turn.
-  - On the NEXT turn, interpret the student's reply RELATIVE TO the specific default recommendation you proposed (do not always assume the same fixed outcome): a vague agreement ("好的"/"随便"/"都行") means ACCEPT the recommendation you gave; an explicit contradiction (e.g. saying "放弃" when you recommended keeping, or "保留"/"都要" when you recommended dropping) means the OPPOSITE of your recommendation. Then immediately record the decision and advance currentStage per the normal transition rule — do not ask about the same uncovered dimension again (anti-loop: at most ONE retention question per side).
-  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "B面：教师监督（已展开，作为主论点）；面对面互动（保留-略写）" or "...（用户放弃）" or "...（待补例子）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+  - Anti-loop vs retention precedence (CRITICAL): the "at most ONE depth follow-up per point" anti-loop rule caps follow-ups WITHIN a single developed point. It does NOT authorize skipping a sibling named dimension, and it does NOT override this Retention Rule. After accepting a thin developed point (with （待补例子） if needed), you MUST still check for uncovered siblings before transitioning; if one remains, ask the retention question and keep currentStage unchanged.
+  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, do NOT silently assign 详写/略写 for the student, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED and ask the student to CHOOSE which point to detail-write:
+    - Present both points briefly (① developed / ② uncovered).
+    - Ask: which one should be 详写 (detail), and which 略写 (brief)? Mention they can also say「两个都展开」or「你定」.
+    - Do NOT push a forced KEEP/DROP recommendation as the main ask. A soft default may be mentioned only as the「你定」fallback.
+    - Example: "目前这两点都有了：①『生态危害』②『垃圾处理成本』。你想选哪一个重点详写？另一个简单带一句就好。"
+  - When the developed point is still thin: ask for 1-2 sentences on the uncovered dimension too (both need content before a 详写/略写 choice is meaningful).
+  - On the NEXT turn, interpret the student's reply as a ROLE CHOICE (not a veto of your assignment):
+    - Explicit pick of point ① or ② as 详写 → tag that point 已选详写 and the other 已选略写. If the chosen 详写 point still lacks a concrete scene/mechanism, ask ONE expansion question for it before leaving this side. If the chosen 略写 point is only an empty label, ask ONE brief "一两句话说明" question; otherwise do not depth-follow-up the 略写 point.
+    - 「两个都展开」→ expand the still-thin/uncovered sibling next.
+    - 「放弃/只要一个」→ tag the other as 用户放弃 and proceed.
+    - Vague agreement ("好的"/"随便"/"你定") → apply the soft default (usually: already-developed point = 详写, sibling = 略写) and then follow the same expand-if-needed rule above.
+    - Anti-loop: at most ONE 详写/略写 choice question per side; after the choice is recorded, do not re-ask the same choice.
+  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "A面：生态危害（已选详写）；垃圾处理成本高（已选略写）" or "...（用户放弃）" or "...（待补例子）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
 
   1. Stage "explore_A": Explore Side A / Task 1 (按上面的题型映射)
      - Preferred question: quote a Step1 dimension and ask for concrete scenarios/target groups/mechanism.
@@ -1682,13 +3978,13 @@ ${questionBriefStr}
        - IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: "explore_B".
        - Transition to "explore_B" ONLY when Side A content is enough to illustrate as a claim (not merely an echo/label of a Step1 dimension).
        - If it is NOT sufficient (only a repeated label or one-liner without any concrete angle), STAY in "explore_A" and ask ONE depth follow-up with TWO concrete candidate directions. Keep currentStage: "explore_A".
-       - After that single follow-up, accept whatever is given, tag （待补例子） if still thin, and transition (anti-loop: at most ONE follow-up per point).
+       - After that single follow-up, accept whatever is given for THAT point, tag （待补例子） if still thin. Anti-loop caps follow-ups WITHIN a single point — it does NOT authorize skipping a sibling named dimension. Before transitioning, still apply the Dimension Coverage & Retention Rule; if an uncovered sibling remains, ask the retention question and keep currentStage: "explore_A" instead of transitioning.
      - Real-time Save: Put Side A brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "explore_B" when the sufficiency gate above passes.
      - Content-completeness boundary (apply before recording):
        - If user answer is only a label repeat (or too shallow) with no concrete scenario/mechanism/target-group detail, ask ONE specific follow-up with TWO candidate directions and DO NOT invent details for them.
        - Each slot/point can trigger at most ONE depth follow-up. After one follow-up, accept and move forward even if concise, but if still thin append "（待补例子）" in userPoints.
        - If user answer is already complete, you may refine wording (language polish) but must not add new factual content.
-     - Feedback format MUST be concise: "很好，目前我们记录到：[用户已给出的点]。"
+     - Feedback: apply the Compact feedback rule above (concise natural acknowledgment per intent — not a fixed phrase).
 
   2. Stage "explore_B": Explore Side B / Task 2 (按上面的题型映射)
      - Preferred question: quote a Step1 dimension and ask for concrete expansion of THIS side/task.
@@ -1698,18 +3994,22 @@ ${questionBriefStr}
      - Allowed Actions: Only ask about, validate, and record Side B / Task 2 points.
      - Next Stage Transition (sufficiency-gated):
        - FIRST apply the Dimension Coverage & Retention Rule's mandatory first step above. If it triggers, keep currentStage: "explore_B" this turn and ask the retention question instead of transitioning; only transition on the following turn after the student answers.
-       - IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition. Set currentStage: "stance".
-       - Transition to "stance" ONLY when Side B content is enough to illustrate as a claim (not merely an echo/label of a Step1 dimension).
+       - IF SUFFICIENT (exampleReady=true, or logicValid=true after one follow-up with （待补例子） tag) AND the retention rule did NOT trigger: briefly acknowledge and transition.
+         - If questionBrief.requiresStance=true: Set currentStage: "stance".
+         - If questionBrief.requiresStance=false: Set currentStage: "summary" (skip stance entirely). Fill userStance / blueprint.position with a neutral task overview, not a personal judgment.
+       - Transition to "stance" ONLY when requiresStance=true AND Side B content is enough to illustrate as a claim (not merely an echo/label of a Step1 dimension).
+       - Transition to "summary" (skipping stance) when requiresStance=false AND Side B content is enough.
        - If it is NOT sufficient, STAY in "explore_B" and ask ONE depth follow-up with TWO concrete candidate directions. Keep currentStage: "explore_B".
-       - After that single follow-up, accept whatever is given, tag （待补例子） if still thin, and transition (anti-loop: at most ONE follow-up per point).
-     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "stance" when the sufficiency gate above passes.
+       - After that single follow-up, accept whatever is given for THAT point, tag （待补例子） if still thin. Anti-loop caps follow-ups WITHIN a single point — it does NOT authorize skipping a sibling named dimension. Before transitioning, still apply the Dimension Coverage & Retention Rule; if an uncovered sibling remains, ask the retention question and keep currentStage: "explore_B" instead of transitioning.
+     - Real-time Save: Accumulate both Side A and Side B brainstormed points inside progressUpdate.step2Data.userPoints, using the status-tag format from the Dimension Coverage & Retention Rule when a retention decision applies. Only set currentStage: "stance" when requiresStance=true and the sufficiency gate above passes; when requiresStance=false set currentStage: "summary" instead.
      - Content-completeness boundary (apply before recording):
        - If user answer only repeats known labels without new concrete info, ask ONE specific follow-up with TWO candidate directions and DO NOT auto-fill concrete expansion by yourself.
        - You MUST NOT introduce new mechanism/scenario/beneficiary details that the user never said.
        - If user answer is complete, language polish is allowed without adding new facts.
-     - Feedback format MUST be concise: "很好，目前我们记录到：[用户已给出的点]。"
+     - Feedback: apply the Compact feedback rule above (concise natural acknowledgment per intent — not a fixed phrase).
 
   3. Stage "stance": Determine overall stance & formulate stance sentence
+     - ONLY enter this stage when questionBrief.requiresStance=true. If requiresStance=false, this stage does not exist — go to "summary" from explore_B.
      - Default Target Question (Agree/Disagree style): "结合刚才想到的这些内容，你最终更倾向于哪一种立场？\n① 完全同意\n② 部分同意\n③ 完全不同意\n\n请告诉我序号，并用一两句话（中文即可）描述你对这道题目的具体立场。"
      - For Positive / Negative (or outweigh-style) questions, use: "结合刚才的利弊点，你最终更倾向于哪一种立场？\n① 完全积极\n② 利大于弊\n③ 弊大于利\n④ 完全消极\n\n请告诉我序号，并用一两句话说明理由。"
      - Wording rule: call ②/③ "带让步的立场". NEVER call 弊大于利 / 利大于弊 a "折中立场".
@@ -1723,8 +4023,9 @@ ${questionBriefStr}
      - Allowed Actions: Once in "summary", you must evaluate the layout and structure of the planned Body paragraphs based on the brainstormed points.
        - **Strict Constraint**: Do NOT generate 4+ body paragraphs. In IELTS Task 2, an essay should strictly contain **only 2 or 3 Body Paragraphs (主体段)**.
        - You must analyze the brainstormed points (Side A and Side B) and determine how they should be mapped into these 2-3 body paragraphs. Specifically, decide whether certain points should be combined into a single paragraph (e.g. combined under a unified theme), kept separate (e.g. Side A in Body 1, Side B in Body 2), or dropped entirely if they are weak or redundant.
-       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "保留-略写", "用户放弃", "待补例子"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
-         - A point tagged "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point (not promoted to its own body paragraph, not silently dropped).
+       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "已选详写", "已选略写", "保留-略写", "用户放弃", "待补例子"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
+         - A point tagged "已选详写" / "已展开，作为主论点" MUST be mapped as the major/detail point of its body paragraph.
+         - A point tagged "已选略写" / "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point (not promoted to its own body paragraph, not silently dropped).
          - A point tagged "用户放弃" MUST be listed in clustering.outliers with a suggestion noting the student already chose to drop it during brainstorming.
          - A point tagged "待补例子" MUST NOT be described as "完整性极高". Mark Completeness as "待补充具体例子", and either ask one short example question before finishing OR clearly note that Step 3 should start by adding a concrete scene.
        - **AI Paragraph Layout Evaluation**:
@@ -1826,19 +4127,28 @@ ${questionBriefStr}
     1. Prefer ONE 'major' (2-3 steps) + ONE 'minor' (1-2 steps) only when one point is genuinely secondary.
        If both points are clearly co-equal (e.g., two parallel beneficiary groups / two parallel functions) and still controllable in length, you SHOULD keep BOTH as 'major' with concise steps.
        Do NOT mechanically force major+minor for symmetric two-point claims.
-    2. Prefer 'direct_points' (drop the total claim) when a separate topic sentence would push the paragraph over budget or merely repeat the sub-claims.
-    3. Use 'total_then_points' only when a short total claim is worth its word cost; then keep each point tighter.
+    2. DEFAULT for multi-point: prefer 'direct_points' (drop the total claim) — especially when both points are major, when a separate topic sentence would push the paragraph over budget, when the total claim would merely repeat the sub-claims, or when the Active Subpoint / Step 2 body claim already umbrella-covers both points.
+    3. Use 'total_then_points' ONLY when a short total claim is genuinely worth its word cost (e.g. the two sub-points need an explicit unifying bridge that the body claim does not already provide); then keep each point tighter.
   - Recommended shapes for a 2-point body within budget:
-    - 分点1(major:解释/机制) + 分点2(minor:简短举例或影响)
-    - 总起(简短) + 分点1(简短举例) + 分点2(论证)
+    - 分点1(major:解释/机制) + 分点2(minor:简短举例或影响)   ← preferred default (direct_points)
+    - 分点1(major) + 分点2(major, concise)                 ← preferred for symmetric dual-major
+    - 总起(简短) + 分点1(简短举例) + 分点2(论证)           ← only when a unifying total claim is needed
 
   STEP B — CHOOSE PARAGRAPH MODE (only decides ordering of the plan you already diagnosed):
-  - If MULTI-POINT, choose one paragraph mode:
-    1. 'total_then_points': one concise total claim first, then develop each internal sub-claim. Best when a general topic sentence is needed to unify several related points.
-       Example shape: Claim 总 -> 分点1 + 解释 -> 分点2 + 举例/影响.
-    2. 'direct_points': skip the total claim and directly develop two or more sub-claims. Best when the total claim would be repetitive or the paragraph should move quickly into concrete sub-arguments.
+  - If MULTI-POINT, choose one paragraph mode. Default bias: 'direct_points' first.
+    1. 'direct_points' (DEFAULT for most 2-point bodies): skip the total claim and directly develop two or more sub-claims. Use this when:
+       - both points are major / need real expansion, OR
+       - the total claim would merely restate the two subClaims, OR
+       - the Active Subpoint content / Step 2 body claim already acts as the paragraph topic sentence, OR
+       - Step 2 blueprint already stated an overall thesis/position and another totalClaim would feel repetitive, OR
+       - word budget is tight.
        Example shape: 分点1 + 解释 -> 分点2 + 举例 + 影响.
+       Example (prefer direct_points): "线上学习既能帮偏远地区学生，也能给在职人员灵活时间" — two parallel scenes; no extra total claim needed.
+    2. 'total_then_points' (EXCEPTION, not the default): one concise total claim first, then develop each internal sub-claim. Use ONLY when a general topic sentence is needed to unify several related points whose relationship is not already clear from the body claim.
+       Example shape: Claim 总 -> 分点1 + 解释 -> 分点2 + 举例/影响.
+       Example (prefer total_then_points): two abstract mechanisms that need a short bridge before either can stand alone.
   - If SINGLE-POINT, use mode 'single_point' with exactly ONE pointBlock.
+  - CRITICAL: when mode is 'direct_points', leave totalClaim empty ("") and do NOT ask the student for a separate 总起句 in chat. Walk straight into the first pointBlock's first step.
 
   STEP C — FOR EACH pointBlock, pick an internal reasoning shape (this is where the flat schemes live now):
   - 'subClaim': the exact sub-claim being developed.
@@ -1884,10 +4194,10 @@ ${questionBriefStr}
 
   - When a student selects or inputs their starting subpoint, you MUST, ON YOUR VERY FIRST RESPONSE for that subpoint:
     1. Evaluate how many internal points it contains (write the technical diagnosis to progressUpdate.paragraphPlan.diagnosis only — do NOT echo raw field names in chat text).
-    2. If it is multi-point, decide 'total_then_points' vs 'direct_points' yourself (JSON only). Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; proceed with your recommended plan.
+    2. If it is multi-point, decide 'direct_points' vs 'total_then_points' yourself (JSON only), using the LENGTH BUDGET / STEP B signals: word budget, whether a totalClaim would only restate the subClaims, whether the Active Subpoint / Step 2 body claim already umbrella-covers both points, and whether Step 2 blueprint already stated an overall thesis. Default to 'direct_points' unless a unifying total claim is clearly needed. Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; proceed with your recommended plan.
     3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (JSON only). For symmetric co-equal two-point claims, default to dual-major unless budget pressure is obvious.
-    4. In Part 1, give the student a short plain-language summary (1–2 Chinese sentences) of the plan — e.g. "这句话其实包含两个方向：A和B，我们打算详细展开A，再简单带一下B" or "我们先给一个总起句，再分别展开这两个方向". Do NOT literally say mode names, field names, or English enum values (see NO INTERNAL JARGON rule).
-    5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "总观点", "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
+    4. In Part 1, give the student a short plain-language summary (1–2 Chinese sentences) of the plan — e.g. "这句话其实包含两个方向：A和B，我们打算详细展开A，再简单带一下B" or (only when total_then_points is truly needed) "我们先给一个总起句，再分别展开这两个方向". Prefer summaries that jump straight into the two directions when mode is direct_points. Do NOT literally say mode names, field names, or English enum values (see NO INTERNAL JARGON rule).
+    5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Include a "总观点" flat step ONLY when mode is total_then_points and totalClaim is non-empty. Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
     6. Different subpoints in the same essay may use different paragraph modes and expansion strategies. Decide each independently.
     7. End Part 1 with a low-friction override invitation in natural Chinese (e.g. "如果你想换一种展开顺序/角度，直接说，我马上按你的版本改"). Keep it short and non-technical.
 
@@ -1896,7 +4206,7 @@ ${questionBriefStr}
   - MINIMIZE robotic labels in all dialogue text. Instead, use the custom step labels of the chosen scheme (e.g., "让步承认", "转折反驳", etc.).
   - CRITICAL: Evaluate Paragraph Structure FIRST before formulating any logic chain.
     - When a student selects or inputs their starting subpoint (e.g., "传统课堂在提供教师监督、促进 student 互动与社交发展方面具有独特优势"), analyze whether this subpoint contains multiple separate supporting points (e.g., Point 1: 教师监督, Point 2: 社交发展).
-    - If it is multi-point, identify each internal point, choose 'total_then_points' or 'direct_points', and assign role/strategy for each point. Proceed with your recommended plan instead of asking the student to choose unless the decision is truly unclear.
+    - If it is multi-point, identify each internal point, choose 'direct_points' (default) or 'total_then_points' (only when a unifying total claim is needed), and assign role/strategy for each point. Proceed with your recommended plan instead of asking the student to choose unless the decision is truly unclear.
     - If the original subpoint is single-point, use a normal single-chain plan and still emit paragraphPlan with one pointBlock.
 
   - Recommend reasoning strategies rather than let users pick.
@@ -1921,7 +4231,7 @@ ${questionBriefStr}
 
   ## Step-by-Step Socratic Guidance Sequence (每次交互只进一个微小步伐，只问一个具体问题):
 
-  This sequence is PLAN-AGNOSTIC. If 'paragraphPlan' exists, walk through its optional totalClaim and each pointBlock's nested steps, ONE micro-step per turn, in order. If no paragraphPlan exists, fall back to the flattened 'step3SubpointSteps'.
+  This sequence is PLAN-AGNOSTIC. If 'paragraphPlan' exists, walk through its optional totalClaim (ONLY when mode is 'total_then_points' AND totalClaim is non-empty / still missing) and each pointBlock's nested steps, ONE micro-step per turn, in order. If mode is 'direct_points', SKIP totalClaim entirely — do NOT ask for a 总起句; start with the first empty pointBlock step. If no paragraphPlan exists, fall back to the flattened 'step3SubpointSteps'.
 
   1. 进入 Step 3:
      - 若 ContextSummary 中 "Active Subpoint (= starting claim)" 已存在且不是空值：
@@ -1935,13 +4245,15 @@ ${questionBriefStr}
      - 若包含多个可独立展开的支撑点（例如：行为监管 + 同伴互动 / 教师监督 + 促进社交）：
        - 在 Part 1 用大白话指出这几个支撑点分别是什么（例如“监管”和“社交互动”两个方向）。
        - 在 progressUpdate 中写入完整 paragraphPlan（含 mode、详略分配）；聊天区只说人话摘要，不点名 total_then_points / direct_points 等内部模式名。
+       - 默认倾向 direct_points：若选了 direct_points，Part 2 直接问第一个分点的第一个展开步骤，禁止再问“先写一句总起句”。
        - 不要让学生在方案 A/B 之间做选择。
       - 仅当 claim 为空、过短、或本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
      - 然后立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`（JSON），Part 1 最多 1–2 句用户向摘要。
-     - *数据同步*: 把已确认的总观点或第一个子观点写入对应 plan field/step value。
+     - *数据同步*: 把已确认的总观点（仅 total_then_points）或第一个子观点写入对应 plan field/step value。
 
   3. 逐步推进阶段 (Step-by-Step Progression — repeat for EACH planned micro-step):
      - 每一轮只针对【当前未完成的那一个 pointBlock step】提出一个具体的苏格拉底式问题，使用该 pointBlock 和 nested step 的中文 label。
+     - 若 mode 是 direct_points：永远不要把 totalClaim 当作待填步骤来追问。
      - 引导话术随 step 含义自然变化，例如：
        - 若当前 step 是“让步承认”: "在坚持你的观点前，对立面其实也有合理之处。你愿意先承认哪一点？"
        - 若当前 step 是“具体机制”: "这个动因具体是通过什么样的链条/机制起作用的？"
@@ -1978,6 +4290,11 @@ ${questionBriefStr}
 
   DECIDING COMPLETION:
   - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段 \`paragraphPlan.pointBlocks[].steps[]\` 的所有必要 \`value\` 均已填满时，才可将其设为 true；只要还有空步骤就必须保持 false。
+  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` is confirmed student content for the board/summary — it must be derived from what the student actually said. Each turn, write \`value\` ONLY for the step the student is answering NOW (the first still-empty step, or that step + the next adjacent step in the SAME pointBlock if one utterance covers both links). Leave all later empty steps empty even if you already know how you would guide them.
+  - CRITICAL — KICKOFF / FIRST PLANNING TURN: When the student has not yet answered any Step 3 question (opening turn), you may emit the paragraphPlan skeleton (mode, pointBlocks, labels, placeholders) but EVERY \`steps[].value\` MUST be an empty string. FORBIDDEN: pre-filling values from your planning draft on the opening turn.
+  - CRITICAL — NO PLACEHOLDER-ECHO (this causes silent premature completion): \`steps[].value\` MUST be the STUDENT's own words from THIS conversation. It is FORBIDDEN to copy your own \`placeholder\`（"例如：..." hint）text into \`value\` — verbatim or with only the "例如：" prefix stripped — for any step the student has not actually answered yet. A step whose \`value\` is empty MUST stay empty (do not pre-fill it with your example) until the student genuinely answers it in the dialogue.
+  - CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \`step3SubpointCompleted: true\`, every planned \`steps[].value\` MUST already contain the student's content (including the final step). FORBIDDEN: emitting a completion summary / "进入第四步" CTA while any step value is still empty OR still just your own placeholder echo — that leaves the right-side board unfinished and hides the jump button.
+  - If the student's current message answers the last empty step, you MUST write that answer into the corresponding \`steps[].value\` in this turn BEFORE marking completed. Do not only acknowledge it in chat text.
   - 不要仅凭"方案已规划好/刚开场"就把 \`step3SubpointCompleted\` 或 'isCompleted' 设为 true。规划完成 ≠ 逻辑链填写完成。
   - 'isCompleted'（整个 Step 3 完成）只在你确认所有主体段都各自完成后才可设为 true；否则一律为 false。界面会依据每个主体段的实际填写情况把控整体解锁，不要提前解锁。
   - 如果所有主体段都完成了，在回复最后明确引导：“第三步段落逻辑链构建已全部完成！请点击下方按钮进入第四步：逐句写作练习。”并设 isCompleted = true。
@@ -2037,8 +4354,15 @@ ${stepGuidelines}
 - Match the current step's context. Help them improve.
 - Keep the tone encouraging, professional, and tutor-like. Use ONLY Chinese for explanations and guidance.
 - CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time. In explore stages, do NOT renumber or paraphrase the student's answer into a long structured summary.
-- INTERNAL-ONLY RULE (CRITICAL, applies to all steps): Internal brief / pre-analysis fields (questionBrief, writingDestination, taskMap, hasHardQualifiers, candidateDirectionSeeds, evalNote) may ONLY decide what to ask, whether to ask, and whether content is sufficient. They MUST NEVER appear in student-facing text as the Coach's preferred answers, recommended stance, preferred causes, or ready-made conclusions. Coach core value = guided practice; do NOT force the Coach's opinions onto the student.
+- INTERNAL-ONLY RULE (CRITICAL, applies to all steps): Internal brief / pre-analysis fields (questionBrief, writingDestination, taskMap, hasHardQualifiers, requiresStance, candidateDirectionSeeds, evalNote) may ONLY decide what to ask, whether to ask, and whether content is sufficient. They MUST NEVER appear in student-facing text as the Coach's preferred answers, recommended stance, preferred causes, or ready-made conclusions. Coach core value = guided practice; do NOT force the Coach's opinions onto the student.
 - NATURAL LANGUAGE & CONTINUITY RULE (CRITICAL, applies to all steps): Every question you ask (except the very first question of a brand-new step) MUST read as a natural continuation of the conversation, not an isolated template. Any example wording given in these guidelines (e.g. "ask something like: '...'") is illustrative ONLY — rephrase it in your own natural words, referencing what the student just said/the topic just discussed, rather than reproducing the example sentence structure verbatim. NEVER turn an internal bookkeeping check (e.g. "is this dimension reusable", "does this cover both tasks", "is there a hard qualifier") into the literal question you ask the student — that logic must stay silent in progressUpdate; the student-facing question must be about the essay CONTENT itself, phrased the way a real human tutor would continue the dialogue.
+- INTENT CLASSIFICATION BEFORE FORMAT (CRITICAL, applies to all steps — read this BEFORE any stage-specific "feedback format" instruction below): Before writing Part 1, first classify the SEMANTIC INTENT of the student's last message. Any "feedback format" / "confirmation shape" instruction elsewhere in this prompt describes a CONSTRAINT (be concise; do not renumber or bullet-restate; do not invent empty list items), NOT a literal sentence you must reproduce — pick whichever intent below actually matches, and let your wording follow from it:
+  1) NEW CONTENT (brainstorm answer, new fact, new example): briefly acknowledge what they gave, in your own words, one natural sentence. No fixed opening phrase is required — "很好，目前我们记录到：..." is only ONE possible way to phrase this, not a mandatory template.
+  2) ASKING FOR YOUR JUDGMENT/OPINION (e.g. "你觉得哪个更容易展开", "你选", "哪个更好写", "你觉得呢"): this is NOT new content to log and NOT a vague agreement — answer it directly as a recommendation. State your pick and the reason together in ONE natural flowing statement (do not open with a "已确定为..." announcement and then separately justify it in a second block).
+  3) SIMPLE ACKNOWLEDGEMENT/FILLER ("好的", "嗯", "对", "继续"): a short, natural acceptance, referencing what happens next — do not restate their filler word back at them.
+  4) CORRECTION/PUSHBACK on something you just said or proposed: acknowledge the correction first, then adjust and continue — do not defend your earlier suggestion.
+  5) CONTINUING A PREVIOUS THOUGHT (e.g. "还没说完", "补充一下刚才的"): treat it as additional content for the PREVIOUS question/slot, not a new topic.
+  Any literal example sentence written elsewhere in this prompt (for any of the above) is illustrative of TONE only — never reproduce it verbatim when the actual situation differs from the example. This rule does NOT apply to CTA phrases explicitly marked "MUST include the phrase ..." (e.g. step-completion transitions) — those remain literal because downstream code parses them.
 - CONTEXT-FIRST RULE (CRITICAL): Before asking for new ideas: 1. Review existing user ideas. 2. Determine whether they can be organized, grouped, compared, or developed. 3. Prefer using existing ideas. 4. Only ask for additional ideas when meaningful progress cannot be made from existing information.
 - SLOT REUSE RULE (CRITICAL, applies to all steps):
   - Before asking any new question, first scan: (a) Previous Steps Context, (b) conversation history, (c) current user message.
@@ -2056,7 +4380,8 @@ ${stepGuidelines}
     - Step 1: correctType, coreIssue, constraints, suggestedDimensions, step1Data, slot
     - Step 2: currentStage, explore_A, explore_B, stance, summary, userPoints, clustering, outliers, blueprint, KEEP_MINOR, DROP, EXPAND_BOTH
     - Step 3: paragraphPlan, pointBlock, total_then_points, direct_points, single_point, step3SubpointSteps, expansionStrategy, major, minor
-    - Internal brief: questionBrief, writingDestination, taskMap, hasHardQualifiers, candidateDirectionSeeds, evalNote, recommendedStance, easyCauses
+    - Internal brief: questionBrief, writingDestination, taskMap, hasHardQualifiers, requiresStance, candidateDirectionSeeds, evalNote, recommendedStance, easyCauses
+    - Memory digests: memory, sourceHash, openGaps, step1Digest, step2Digest, step3Digest
     - Global: progressUpdate, isCompleted, JSON, schema, enum
   - ALLOWED: natural Chinese that conveys the SAME meaning (题型、关键限定、A面/B面、详写/略写、先总起再分点、两个方向…).
   - When you make an internal decision, write it to progressUpdate silently; in text, give at most 1–2 sentences of user-facing summary, then immediately ask the next concrete question.
@@ -2551,10 +4876,18 @@ Student says:
       // Step 2 prompt and the model silently drops an uncovered sibling dimension.
       if (currentStepNum === 2 && data?.progressUpdate) {
         await applyStep2RetentionGuard(data, session, userMessage, messages, question);
+        applyNoStanceGate(question, data, session);
+        enforceStep2Momentum(data, session);
       }
 
       // Heuristic + anti-drift completion (runs AFTER backfill text repair & slot check)
-      applyStepCompletionHeuristic(data, currentStepNum);
+      applyStepCompletionHeuristic(data, currentStepNum, session);
+
+      // Step 2 completion gate MUST run after the heuristic so mid-explore
+      // isCompleted:true (model or CTA hallucination) cannot unlock the jump button.
+      if (currentStepNum === 2 && data?.progressUpdate) {
+        enforceStep2Completion(data, session);
+      }
 
       // Step 3 data-contract guard: the UI/CoachChat treat paragraphPlan as the
       // authoritative grouped structure. The model is instructed to always emit it,
@@ -2672,6 +5005,22 @@ Student says:
         data.progressUpdate.step3SubpointSteps = derivedSteps;
       }
 
+      // Step 3 mode correction: prefer direct_points when a totalClaim would be
+      // redundant / over budget. Runs AFTER projection cleanup so totalClaim
+      // clearing also rebuilds the flat step list, and BEFORE completion guard.
+      if (currentStepNum === 3 && data?.progressUpdate?.paragraphPlan) {
+        applyParagraphModeCorrection(data, session);
+      }
+
+      // Step 3 completion safety net: merge prior values, backfill a missed last
+      // step from the user message, and clear premature completion CTA / flags
+      // while any required step value is still empty.
+      if (currentStepNum === 3 && data?.progressUpdate) {
+        enforceStep3LogicCompletion(data, session, userMessage, {
+          isHiddenKickoff: Boolean(isHiddenKickoff),
+        });
+      }
+
       if (typeof data?.text === "string") {
         const cleanedText = stripInternalJargonFromChatText(data.text);
         if (cleanedText !== data.text) {
@@ -2681,6 +5030,17 @@ Student says:
           data.text = cleanedText;
         }
       }
+
+      // Persist refreshed digests after all guards mutated progressUpdate.
+      // Client merges progressUpdate.memory into session.memory.
+      if (!data.progressUpdate || typeof data.progressUpdate !== "object") {
+        data.progressUpdate = {};
+      }
+      data.progressUpdate.memory = refreshMemoryAfterProgress(
+        session,
+        question,
+        data.progressUpdate,
+      );
 
       res.json(data);
     } catch (error: any) {

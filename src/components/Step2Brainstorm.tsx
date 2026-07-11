@@ -4,6 +4,41 @@ import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Award, Layers
 import { Topic, PracticeSession, Dimension } from '../types';
 import CoachChat from './CoachChat';
 
+/** Strip internal retention/thinness markers before showing userPoints in the Blueprint UI. */
+function stripStep2InternalTags(text: string): string {
+  return String(text || '')
+    .replace(/［待裁决：[^\］]*］/g, '')
+    .replace(/（待补例子）/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * Split explore-stage userPoints into Body 1 / Body 2 for the Blueprint fallback.
+ * Prefer A面/B面 markers; never dump the whole string into Body 1 via split('\\n')[0].
+ */
+function splitUserPointsForBlueprint(userPoints: string): { body1: string; body2: string } {
+  const cleaned = stripStep2InternalTags(userPoints);
+  if (!cleaned) return { body1: '', body2: '' };
+
+  const aMatch = cleaned.match(/A面[^：:]*[：:]([\s\S]*?)(?=B面[^：:]*[：:]|$)/);
+  const bMatch = cleaned.match(/B面[^：:]*[：:]([\s\S]*)$/);
+  if (aMatch || bMatch) {
+    return {
+      body1: stripStep2InternalTags((aMatch?.[1] || '').replace(/^[；;，,\s]+|[；;，,\s]+$/g, '')),
+      body2: stripStep2InternalTags((bMatch?.[1] || '').replace(/^[；;，,\s]+|[；;，,\s]+$/g, '')),
+    };
+  }
+
+  const byNewline = cleaned.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  if (byNewline.length >= 2) {
+    return { body1: byNewline[0], body2: byNewline.slice(1).join('；') };
+  }
+
+  // Single-side explore content (no B面 yet): keep everything in Body 1.
+  return { body1: cleaned, body2: '' };
+}
+
 interface Step2BrainstormProps {
   topic: Topic;
   session: PracticeSession;
@@ -199,6 +234,10 @@ export default function Step2Brainstorm({
     clustering: undefined as any,
   } : null);
 
+  const pointsForBlueprint = splitUserPointsForBlueprint(
+    String(evalData?.userPoints || session.step2.userPoints || ''),
+  );
+
   let previousNotes = "";
   if (eval1) {
     previousNotes = `题型判定：${eval1.correctType}\n核心争议：${eval1.coreIssue}${eval1.constraints && eval1.constraints.length > 0 ? `\n关键限定：${eval1.constraints.join('、')}` : ''}`;
@@ -235,6 +274,10 @@ ${topic.question}
     const dimensionsText = step1SuggestedDimensions.length > 0
       ? step1SuggestedDimensions.join('、')
       : "";
+    // Prefer the first Step1 dimension as the expansion anchor (strip task tags like "（原因）").
+    const firstDimension = step1SuggestedDimensions[0]
+      ? step1SuggestedDimensions[0].replace(/[（(][^）)]*[）)]/g, "").trim()
+      : "";
 
     const contextLines = [
       issueText ? `核心争议：${issueText}` : "",
@@ -243,11 +286,16 @@ ${topic.question}
       userNotes ? `我的审题想法：${userNotes}` : "",
     ].filter(Boolean);
 
-    return `这是第二步的开场，我还没有说任何话，请不要假装在回应我说过的内容。${
+    const contextPrefix =
       contextLines.length > 0
         ? `请直接结合我第一步的审题结论（${contextLines.join('；')}），`
-        : "请直接结合这道题目本身，"
-    }给我一个高质量、有针对性的发散问题（Explore-A 阶段），引导我先谈这个立场下最值得展开的具体支持论据或正面好处；不要泛泛而问，要让问题贴合这道题目和已知信息。`;
+        : "请直接结合这道题目本身，";
+
+    if (firstDimension) {
+      return `这是第二步的开场，我还没有说任何话，请不要假装在回应我说过的内容。${contextPrefix}直接进入 Explore-A：点名第一步已确认的维度「${firstDimension}」，只问一个具体展开问题——场景 / 机制 / 受益或受影响对象（三选一即可）。FORBIDDEN：禁止再问「可以从哪些角度切入」「有哪些方面」「请列出维度」等清单式问题；禁止再确认题型或核心议题。问题要短、自然、贴合题目。`;
+    }
+
+    return `这是第二步的开场，我还没有说任何话，请不要假装在回应我说过的内容。${contextPrefix}给我一个高质量、有针对性的发散问题（Explore-A 阶段），引导我先谈这个立场下最值得展开的具体支持论据或正面好处；不要泛泛而问，要让问题贴合这道题目和已知信息。FORBIDDEN：禁止再问「可以从哪些角度切入」「有哪些方面」等清单式问题；禁止再确认题型或核心议题。`;
   })();
 
   return (
@@ -283,7 +331,7 @@ ${topic.question}
                   <div className="text-left">
                     <h4 className="font-sans font-bold text-emerald-900 text-xs">🎉 观点与分论点通关！</h4>
                     <p className="font-sans text-[11px] text-emerald-700 leading-normal">
-                      AI Coach 已判定你的观点与分论点设计合格，即将为你<strong>自动切换</strong>到下一步论证拆解...
+                      AI Coach 已判定你的观点与分论点设计合格。点击下方按钮，进入下一步论证拆解。
                     </p>
                   </div>
                 </div>
@@ -366,13 +414,26 @@ ${topic.question}
           ) : evalData ? (
             <div className="space-y-5 animate-fade-in">
               {/* Socratic Stage Progress Indicator */}
-              <div className="grid grid-cols-4 gap-1.5 text-center bg-slate-50 border border-slate-200/50 p-2.5 rounded-xl">
-                {[
-                  { id: 'explore_A', label: '1. A面优势' },
-                  { id: 'explore_B', label: '2. B面不可替代' },
-                  { id: 'stance', label: '3. 明确立场' },
-                  { id: 'summary', label: '4. 蓝图生成' },
-                ].map((st) => {
+              {(() => {
+                // requiresStance is stamped server-side every Step2 turn (applyNoStanceGate);
+                // default to true (show 4 stages) until the server has told us otherwise,
+                // so we never hide a stage the essay might actually need.
+                const requiresStance = (evalData as any)?.requiresStance !== false;
+                const stages = requiresStance
+                  ? [
+                      { id: 'explore_A', label: '1. A面优势' },
+                      { id: 'explore_B', label: '2. B面不可替代' },
+                      { id: 'stance', label: '3. 明确立场' },
+                      { id: 'summary', label: '4. 蓝图生成' },
+                    ]
+                  : [
+                      { id: 'explore_A', label: '1. 第一任务' },
+                      { id: 'explore_B', label: '2. 第二任务' },
+                      { id: 'summary', label: '3. 蓝图生成' },
+                    ];
+                return (
+              <div className={`grid ${requiresStance ? 'grid-cols-4' : 'grid-cols-3'} gap-1.5 text-center bg-slate-50 border border-slate-200/50 p-2.5 rounded-xl`}>
+                {stages.map((st) => {
                   const currentStage = (evalData as any)?.currentStage || 'explore_A';
                   const isCurrent = currentStage === st.id;
                   const isCompleted = session.step2.isCompleted || (
@@ -396,6 +457,8 @@ ${topic.question}
                   );
                 })}
               </div>
+                );
+              })()}
 
               <div className="flex items-center justify-between border-b border-slate-200/60 pb-3">
                 <div className="flex items-center gap-1.5 font-bold font-sans text-sm">
@@ -428,11 +491,19 @@ ${topic.question}
                     </p>
                   </div>
 
-                  {/* 立场 (Position) */}
+                  {/* 立场 / 概述 (Position or Overview) */}
                   <div className="space-y-1">
-                    <span className="text-[9px] font-bold text-slate-400 uppercase">全文立场 (Overall Position)</span>
+                    <span className="text-[9px] font-bold text-slate-400 uppercase">
+                      {(() => {
+                        const pos = String(evalData.blueprint?.position || evalData.userStance || '');
+                        const looksOverview = /本文按题目|先写「|两个任务|先解释|再提出|再写「/.test(pos);
+                        return looksOverview
+                          ? '总体概述 (Overview)'
+                          : '全文立场 (Overall Position)';
+                      })()}
+                    </span>
                     <p className={`text-xs leading-relaxed ${evalData.blueprint?.position || evalData.userStance ? 'text-slate-900 font-bold' : 'text-slate-400 italic'}`}>
-                      {evalData.blueprint?.position || evalData.userStance || "⏳ 正在提取并总结你的立场..."}
+                      {evalData.blueprint?.position || evalData.userStance || "⏳ 正在整理全文概述 / 立场..."}
                     </p>
                   </div>
 
@@ -451,16 +522,16 @@ ${topic.question}
                       {/* Body Paragraph 1 */}
                       <div className="space-y-1 bg-white p-2.5 rounded border border-slate-200/60 shadow-3xs">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 1 (第一主体段核心分论点)</span>
-                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body1 || evalData.userPoints ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
-                          {evalData.blueprint?.body1 || (evalData.userPoints ? evalData.userPoints.split('\n')[0] : "⏳ 正在总结主体段 1 的核心观点...")}
+                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body1 || pointsForBlueprint.body1 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
+                          {evalData.blueprint?.body1 || pointsForBlueprint.body1 || "⏳ 正在总结主体段 1 的核心观点..."}
                         </p>
                       </div>
 
                       {/* Body Paragraph 2 */}
                       <div className="space-y-1 bg-white p-2.5 rounded border border-slate-200/60 shadow-3xs">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 2 (第二主体段核心分论点)</span>
-                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body2 || evalData.userPoints ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
-                          {evalData.blueprint?.body2 || (evalData.userPoints && evalData.userPoints.split('\n')[1] ? evalData.userPoints.split('\n')[1] : "⏳ 正在总结主体段 2 的核心观点...")}
+                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body2 || pointsForBlueprint.body2 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
+                          {evalData.blueprint?.body2 || pointsForBlueprint.body2 || "⏳ 正在总结主体段 2 的核心观点..."}
                         </p>
                       </div>
                     </>
