@@ -10,13 +10,10 @@ import {
   Layers,
   HelpCircle,
   Sparkles,
+  RotateCcw,
 } from "lucide-react";
 import { Topic, PracticeSession } from "../types";
 import CoachChat from "./CoachChat";
-import {
-  canSelectSubpoint,
-  isStep3FullyComplete,
-} from "../utils/step3Quality";
 
 type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
 
@@ -36,6 +33,7 @@ export default function Step3Drafting({
   const [activeTab, setActiveTab] = useState<
     "step1" | "step2" | "step3" | "step4"
   >("step3");
+  const [showClearBoardConfirm, setShowClearBoardConfirm] = useState(false);
   const hasAutoSelectedRef = useRef(false);
 
   const subpointsStr =
@@ -194,25 +192,6 @@ export default function Step3Drafting({
     });
   }, [onUpdateSession, session.step3, subpoints]);
 
-  // If session points at a later body while earlier ones are incomplete, reset
-  // to the first incomplete body (sequential lock).
-  useEffect(() => {
-    const activeId = session.step3.activeSubpointId;
-    if (!activeId || subpoints.length === 0) return;
-    if (canSelectSubpoint(subpoints, activeId)) return;
-    const firstAllowed =
-      subpoints.find((sp) => canSelectSubpoint(subpoints, sp.id))?.id ||
-      subpoints[0].id;
-    if (firstAllowed && firstAllowed !== activeId) {
-      onUpdateSession({
-        step3: {
-          ...session.step3,
-          activeSubpointId: firstAllowed,
-        },
-      });
-    }
-  }, [session.step3.activeSubpointId, subpoints, onUpdateSession, session.step3]);
-
   const activeSubpoint = subpoints.find(
     (s) => s.id === session.step3.activeSubpointId,
   );
@@ -220,8 +199,8 @@ export default function Step3Drafting({
     ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先判断这是单点还是多点论点，用大白话简要说明结构安排，然后直接开始第一个具体问题；结构细节写入系统即可，不要在对话里提字段名。`
     : "";
 
-  // Board quality is authoritative — never unlock from a stale isCompleted flag alone.
-  const isStep3Finished = isStep3FullyComplete(session, subpoints);
+  // Server is the sole authority for whole-step unlock (via progressUpdate.step3Ui).
+  const isStep3Finished = !!session.step3.isCompleted;
 
   const strategyLabel: Record<string, string> = {
     explanation: "解释",
@@ -237,14 +216,44 @@ export default function Step3Drafting({
     direct_points: "分点直写型",
   };
 
-  const isStepAvailable = (
-    steps: { value?: string }[],
-    idx: number,
-  ) => !!steps[idx]?.value || idx === 0 || !!steps[idx - 1]?.value;
-
   const welcomeMessage = `【第三步：段落论证起草 ✍️】
 欢迎进入第三步！我们来为每一个主体段落 (Body Paragraph) 构建一个逻辑闭环。
 我会从第一个主体段落开始，你可以随时在右侧顶部切换到其他主体段落。`;
+
+  const handleClearActiveBoard = () => {
+    const activeId = session.step3.activeSubpointId;
+    if (!activeId) return;
+
+    const resetSubpoints = subpoints.map((sp) => {
+      if (sp.id !== activeId) return sp;
+      return {
+        ...sp,
+        paragraphPlan: undefined,
+        structureSteps: undefined,
+        claim: undefined,
+        reason: undefined,
+        supportType: undefined,
+        supportContent: undefined,
+        impact: undefined,
+        mechanism: undefined,
+        result: undefined,
+        draft: undefined,
+        hint: undefined,
+        transitionChecks: undefined,
+        sufficiencyCheck: undefined,
+        isCompleted: false,
+      };
+    });
+
+    onUpdateSession({
+      step3: {
+        ...session.step3,
+        subpoints: resetSubpoints,
+        isCompleted: false,
+      },
+    });
+    setShowClearBoardConfirm(false);
+  };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
@@ -262,7 +271,7 @@ export default function Step3Drafting({
           kickoffPrompt={kickoffPrompt}
           kickoffContextKey={activeSubpoint?.id || ''}
         >
-          {/* Coach Controls / Action bar - Auto-progression upon AI completion */}
+          {/* Manual click-to-jump — same pattern as Step1/Step2; unlocks with body checkmarks */}
           {isStep3Finished && (
             <div className="mt-4 border-t border-emerald-100 pt-3.5 animate-fade-in">
               <div className="bg-emerald-50 border border-emerald-200/80 rounded-xl p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-xs">
@@ -321,7 +330,7 @@ export default function Step3Drafting({
             </button>
             <div className="h-4 w-px bg-slate-200 shrink-0 mx-0.5"></div>
             {subpoints.map((sp, idx) => {
-              const tabSelectable = canSelectSubpoint(subpoints, sp.id);
+              const tabSelectable = sp.selectable !== false;
               return (
               <button
                 key={sp.id}
@@ -366,7 +375,7 @@ export default function Step3Drafting({
               </div>
               <div className="w-full max-w-md space-y-3">
                 {subpoints.map((subpoint, idx) => {
-                  const selectable = canSelectSubpoint(subpoints, subpoint.id);
+                  const selectable = subpoint.selectable !== false;
                   return (
                   <button
                     key={subpoint.id}
@@ -462,9 +471,45 @@ export default function Step3Drafting({
 
               {/* Socratic logic chain flow chart */}
               <div className="space-y-4">
-                <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                  🔗 论证链条构建状态（Logic Chain Flow）
-                </span>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                    🔗 论证链条构建状态（Logic Chain Flow）
+                  </span>
+                  {showClearBoardConfirm ? (
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-[10px] text-rose-700 font-sans font-medium">
+                        清空当前主体段看板？
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleClearActiveBoard}
+                        className="text-[10px] font-bold text-white bg-rose-600 hover:bg-rose-700 px-2 py-1 rounded-md transition"
+                      >
+                        确认
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowClearBoardConfirm(false)}
+                        className="text-[10px] font-semibold text-slate-500 hover:text-slate-700 px-1.5 py-1 transition"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowClearBoardConfirm(true)}
+                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-rose-700 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-rose-50 hover:border-rose-200 transition shrink-0"
+                      title="清空当前主体段的逻辑链看板数据"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>清空看板</span>
+                    </button>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-400 leading-relaxed -mt-2">
+                  仅清除右侧逻辑链与诊断数据；中心句保留。如需从头对话，请用左侧「清空并重新对话」。
+                </p>
 
                 {activeSubpoint.paragraphPlan ? (
                   <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
@@ -518,7 +563,6 @@ export default function Step3Drafting({
                           <div className="space-y-2">
                             {block.steps.map((step, idx, arr) => {
                               const iconChar = step.key.charAt(0).toUpperCase();
-                              const available = isStepAvailable(arr, idx);
                               return (
                                 <div key={step.key} className="flex gap-2.5">
                                   <div className="flex flex-col items-center shrink-0">
@@ -535,15 +579,15 @@ export default function Step3Drafting({
                                     <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">
                                       {step.label}
                                     </span>
-                                    {step.value ? (
-                                      <p className="text-slate-700 font-semibold text-[11px] mt-0.5 leading-relaxed bg-slate-50 border border-slate-150 rounded-lg p-2">
-                                        {step.value}
-                                      </p>
-                                    ) : (
-                                      <p className="text-slate-400 text-[11px] italic mt-0.5">
-                                        {available ? step.placeholder : "等待上一步构建完成后开启..."}
-                                      </p>
-                                    )}
+                                    <p
+                                      className={`text-[11px] mt-0.5 leading-relaxed bg-slate-50 border border-slate-150 rounded-lg p-2 min-h-[2rem] ${
+                                        step.value
+                                          ? "text-slate-700 font-semibold"
+                                          : "text-transparent"
+                                      }`}
+                                    >
+                                      {step.value || "\u00a0"}
+                                    </p>
                                   </div>
                                 </div>
                               );
@@ -568,30 +612,25 @@ export default function Step3Drafting({
                       {
                         key: "claim",
                         label: "核心观点 (Claim)",
-                        placeholder: "思考并回答 Coach 的第一个问题以建立一句话核心观点...",
                         value: activeSubpoint.claim
                       },
                       {
                         key: "reason",
                         label: "展开原因 (Reason)",
-                        placeholder: activeSubpoint.claim ? "为什么？思考并回答该观点是如何在逻辑上成立的..." : "等待核心观点建立后开启...",
                         value: activeSubpoint.reason
                       },
                       {
                         key: "support",
                         label: `支撑展开 (${activeSubpoint.supportType ? (activeSubpoint.supportType === 'example' ? 'Example / 举例' : activeSubpoint.supportType === 'mechanism' ? 'Mechanism / 机制' : 'Scenario / 场景') : 'Support'})`,
-                        placeholder: activeSubpoint.reason ? "在 Coach 推荐的论证策略指导下，思考并回答具体佐证内容..." : "等待原因展开后开启...",
                         value: activeSubpoint.supportContent
                       },
                       {
                         key: "impact",
                         label: "推导结果 (Impact)",
-                        placeholder: activeSubpoint.supportContent ? "思考并回答这种优势/佐证最终会产生什么重大影响或长远结果..." : "等待支撑展开后开启...",
                         value: activeSubpoint.impact
                       }
                     ]).map((step, idx, arr) => {
                       const iconChar = step.key.charAt(0).toUpperCase();
-                      const available = isStepAvailable(arr, idx);
                       return (
                         <div key={step.key} className="flex gap-3">
                           <div className="flex flex-col items-center shrink-0">
@@ -604,13 +643,15 @@ export default function Step3Drafting({
                           </div>
                           <div className="flex-1 min-w-0">
                             <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">Step {idx + 1}: {step.label}</span>
-                            {step.value ? (
-                              <p className="text-slate-800 font-bold text-xs mt-0.5 leading-relaxed bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs">{step.value}</p>
-                            ) : (
-                              <p className="text-slate-400 text-xs italic mt-0.5">
-                                {available ? step.placeholder : "等待上一步构建完成后开启..."}
-                              </p>
-                            )}
+                            <p
+                              className={`text-xs mt-0.5 leading-relaxed bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs min-h-[2.25rem] ${
+                                step.value
+                                  ? "text-slate-800 font-bold"
+                                  : "text-transparent"
+                              }`}
+                            >
+                              {step.value || "\u00a0"}
+                            </p>
                           </div>
                         </div>
                       );
@@ -726,24 +767,15 @@ export default function Step3Drafting({
           )}
         </div>
 
-        {/* Action Footer for Step 3 */}
+        {/* Status footer — jump CTA lives in left CoachChat only (same as Step1/Step2) */}
         <div className="p-4 bg-slate-50 border-t border-slate-200 shrink-0 flex items-center justify-between gap-3 min-h-[64px]">
           <div className="text-[11px] text-slate-500">
             {isStep3Finished ? (
-              <span className="text-emerald-600 font-bold">🎉 两个核心分论点逻辑链已全部构建完成！</span>
+              <span className="text-emerald-600 font-bold">🎉 两个核心分论点逻辑链已全部构建完成！请点击左侧「立即跳转」进入第四步。</span>
             ) : (
               <span>{activeSubpoint ? "按照提示语与 AI 互动来推进你的论证流程。" : "请在上方先选择一个分论点开启论证流程。"}</span>
             )}
           </div>
-          {isStep3Finished && (
-            <button
-              onClick={onNextStep}
-              className="inline-flex items-center justify-center gap-1.5 rounded-lg px-4 py-2 font-sans text-xs font-semibold text-white shadow-md bg-emerald-600 hover:bg-emerald-700 animate-pulse ring-4 ring-emerald-100 transition-all shrink-0"
-            >
-              <span>进入第四步：逐句写作练习</span>
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
-          )}
         </div>
       </div>
     </div>

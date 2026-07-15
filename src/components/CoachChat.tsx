@@ -2,20 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
-import {
-  applyStudentAnswerToTargetStep,
-  clearAllStep3PlanValues,
-  isKickoffOrInstructionText,
-  isParagraphPlanQualityFilled,
-  isPlaceholderEchoValue,
-  isStep3FullyComplete,
-  isSubpointGenuinelyComplete,
-  isValidStep3StepValue,
-  guardStep3ValueProvenance,
-  guardFlatStep3ValueProvenance,
-  sanitizeParagraphPlanValues,
-  sanitizeStructureStepsValues,
-} from '../utils/step3Quality';
 
 interface CoachChatProps {
   topic: Topic;
@@ -137,61 +123,6 @@ export default function CoachChat({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory, loading, children]);
 
-  const mergeLogicSteps = (prevSteps: any[] = [], nextSteps: any[] = []) => {
-    const prevByKey: Record<string, any> = {};
-    prevSteps.forEach((s: any) => {
-      if (s && s.key) prevByKey[s.key] = s;
-    });
-
-    return nextSteps.map((s: any) => {
-      const prev = s && s.key ? prevByKey[s.key] : undefined;
-      const newVal = s && typeof s.value === 'string' ? s.value : '';
-      const value =
-        newVal && newVal.trim()
-          ? newVal
-          : prev && prev.value
-          ? prev.value
-          : newVal;
-      return { ...prev, ...s, value };
-    });
-  };
-
-  const mergeParagraphPlan = (prevPlan: any, nextPlan: any) => {
-    if (!nextPlan || !Array.isArray(nextPlan.pointBlocks)) return prevPlan;
-
-    const prevBlocks = Array.isArray(prevPlan?.pointBlocks)
-      ? prevPlan.pointBlocks
-      : [];
-    const prevById: Record<string, any> = {};
-    prevBlocks.forEach((b: any) => {
-      if (b && b.id) prevById[b.id] = b;
-    });
-
-    const pointBlocks = nextPlan.pointBlocks.map((block: any) => {
-      const prev = block && block.id ? prevById[block.id] : undefined;
-      return {
-        ...prev,
-        ...block,
-        steps: mergeLogicSteps(prev?.steps || [], block.steps || []),
-      };
-    });
-
-    return {
-      ...prevPlan,
-      ...nextPlan,
-      totalClaim:
-        nextPlan.totalClaim && String(nextPlan.totalClaim).trim()
-          ? nextPlan.totalClaim
-          : prevPlan?.totalClaim || nextPlan.totalClaim,
-      // Preserve the closing from a prior turn when the new turn sends empty.
-      optionalShortClosing:
-        nextPlan.optionalShortClosing && String(nextPlan.optionalShortClosing).trim()
-          ? nextPlan.optionalShortClosing
-          : prevPlan?.optionalShortClosing || '',
-      pointBlocks,
-    };
-  };
-
   const buildDraftFromParagraphPlan = (plan: any) => {
     if (!plan || !Array.isArray(plan.pointBlocks)) return '';
 
@@ -222,62 +153,6 @@ export default function CoachChat({
     }
 
     return parts.join('\n\n');
-  };
-
-  // A subpoint's logic chain only counts as "complete" once every planned
-  // step actually carries a value. This is the client-side guard that stops
-  // the model from prematurely unlocking Step 4 (or auto-advancing the tab)
-  // while the paragraphPlan still has empty steps.
-  const isParagraphPlanFilled = (plan: any) => isParagraphPlanQualityFilled(plan);
-
-  const isSubpointLogicComplete = (sp: any) =>
-    isSubpointGenuinelyComplete(sp);
-
-  const isSubstantiveStep3Answer = (msg: string) => {
-    const t = String(msg || '').trim();
-    if (t.length < 4) return false;
-    if (isKickoffOrInstructionText(t)) return false;
-    return !/^(对|是|是的|对的|好的|嗯|明白|好|继续|下一步|ok|okay|yes)$/i.test(t);
-  };
-
-  // If the model forgot to write the student's answer into the first empty
-  // board step (common on the final link), backfill it from this turn's message.
-  const backfillFirstEmptyStepFromUser = (
-    sp: any,
-    userMessage: string,
-    skipBackfill?: boolean,
-  ) => {
-    if (!sp || skipBackfill || !isSubstantiveStep3Answer(userMessage)) return false;
-    const answer = String(userMessage).trim();
-
-    // Treat a placeholder-echo (model copied its own "例如：..." hint into
-    // value) the same as empty — it is not the student's actual answer.
-    const needsFill = (step: any) =>
-      !isValidStep3StepValue(String(step?.value || '')) ||
-      isPlaceholderEchoValue(String(step?.value || ''), String(step?.placeholder || ''));
-
-    if (sp.paragraphPlan && Array.isArray(sp.paragraphPlan.pointBlocks)) {
-      for (const block of sp.paragraphPlan.pointBlocks) {
-        if (!Array.isArray(block?.steps)) continue;
-        for (const step of block.steps) {
-          if (needsFill(step)) {
-            step.value = answer;
-            return true;
-          }
-        }
-      }
-    }
-
-    if (Array.isArray(sp.structureSteps)) {
-      for (const step of sp.structureSteps) {
-        if (needsFill(step)) {
-          step.value = answer;
-          return true;
-        }
-      }
-    }
-
-    return false;
   };
 
   const sendUserMessage = async (
@@ -475,15 +350,31 @@ export default function CoachChat({
           }
         }
         
-        // Handle real-time sync for Step 3 (even if stepKey 3 is not fully completed yet)
+        // Step 3 is a dumb client projection: the server has already merged,
+        // sanitized, gated and completed the board before returning progressUpdate.
         if (stepKey === 'step3') {
           const currentStep3 = sessionUpdates.step3 || session.step3;
           const currentSubpoints = currentStep3.subpoints || [];
           const activeId = activeSubpointIdAtSend || currentStep3.activeSubpointId || session.step3?.activeSubpointId;
-          
+          const step3Ui = data.progressUpdate.step3Ui;
+          const uiById = new Map(
+            (Array.isArray(step3Ui?.bodies) ? step3Ui.bodies : []).map(
+              (body: any) => [String(body.id), body],
+            ),
+          );
+
           const updatedSubpoints = currentSubpoints.map((sp: any) => {
+            const uiBody: any = uiById.get(String(sp.id));
+            const updatedSp = {
+              ...sp,
+              ...(uiBody
+                ? {
+                    isCompleted: !!uiBody.isCompleted,
+                    selectable: !!uiBody.selectable,
+                  }
+                : {}),
+            };
             if (sp.id === activeId) {
-              const updatedSp = { ...sp };
               if (data.progressUpdate.currentSubpointHint) {
                 updatedSp.hint = data.progressUpdate.currentSubpointHint;
               }
@@ -509,63 +400,14 @@ export default function CoachChat({
                 updatedSp.result = data.progressUpdate.step3SubpointResult;
               }
               if (data.progressUpdate.paragraphPlan) {
-                const prevPlanSnapshot = updatedSp.paragraphPlan
-                  ? JSON.parse(JSON.stringify(updatedSp.paragraphPlan))
-                  : null;
-                updatedSp.paragraphPlan = mergeParagraphPlan(
-                  updatedSp.paragraphPlan,
-                  data.progressUpdate.paragraphPlan,
-                );
-                sanitizeParagraphPlanValues(updatedSp.paragraphPlan);
-                // Same provenance firewall as the server: planning drafts must
-                // not leak into later empty value slots in this turn.
-                guardStep3ValueProvenance(updatedSp.paragraphPlan, prevPlanSnapshot);
-                if (hiddenUserMessage) {
-                  // Kickoff = planning draft only; never confirm values.
-                  clearAllStep3PlanValues(updatedSp.paragraphPlan);
-                } else if (isSubstantiveStep3Answer(textToSend)) {
-                  applyStudentAnswerToTargetStep(
-                    updatedSp.paragraphPlan,
-                    prevPlanSnapshot,
-                    textToSend,
-                  );
-                }
+                updatedSp.paragraphPlan = data.progressUpdate.paragraphPlan;
               }
               if (
                 Array.isArray(data.progressUpdate.step3SubpointSteps) &&
                 data.progressUpdate.step3SubpointSteps.length > 0
               ) {
-                // structureSteps from the model is the authoritative shape/order of the
-                // chosen logic chain. Preserve previously captured values (matched by key)
-                // when an incoming entry's value is empty, so a re-declaration turn does
-                // not wipe progress.
-                const prevFlat = updatedSp.structureSteps || [];
-                updatedSp.structureSteps = sanitizeStructureStepsValues(
-                  mergeLogicSteps(
-                    prevFlat,
-                    data.progressUpdate.step3SubpointSteps,
-                  ),
-                );
-                guardFlatStep3ValueProvenance(updatedSp.structureSteps, prevFlat);
-                if (hiddenUserMessage) {
-                  updatedSp.structureSteps = updatedSp.structureSteps.map(
-                    (s: any) => ({ ...s, value: "" }),
-                  );
-                }
-              } else if (updatedSp.structureSteps) {
-                updatedSp.structureSteps = sanitizeStructureStepsValues(
-                  updatedSp.structureSteps,
-                );
-              }
-
-              // Safety net: if the board still has an empty step but the student
-              // just answered it, write the answer in before the completion gate.
-              if (!isSubpointLogicComplete(updatedSp)) {
-                backfillFirstEmptyStepFromUser(
-                  updatedSp,
-                  textToSend,
-                  hiddenUserMessage,
-                );
+                updatedSp.structureSteps =
+                  data.progressUpdate.step3SubpointSteps;
               }
 
               if (data.progressUpdate.step3SubpointCompletenessChecks) {
@@ -577,21 +419,12 @@ export default function CoachChat({
               if (data.progressUpdate.step3SubpointSufficiencyCheck) {
                 updatedSp.sufficiencyCheck = data.progressUpdate.step3SubpointSufficiencyCheck;
               }
-              // Completion gate: board fullness is authoritative.
-              // - Explicit false keeps it incomplete (server premature-completion guard).
-              // - Explicit true OR omitted: mark complete only when every planned
-              //   step has a value (after the backfill safety net above).
-              if (data.progressUpdate.step3SubpointCompleted === false || hiddenUserMessage) {
-                updatedSp.isCompleted = false;
-              } else {
-                updatedSp.isCompleted = isSubpointGenuinelyComplete(updatedSp, {
-                  currentUserMessage: hiddenUserMessage ? '' : textToSend,
-                  isHiddenKickoff: hiddenUserMessage,
-                });
+              if (!uiBody && typeof data.progressUpdate.step3SubpointCompleted === 'boolean') {
+                updatedSp.isCompleted =
+                  !!data.progressUpdate.step3SubpointCompleted;
               }
-              return updatedSp;
             }
-            return sp;
+            return updatedSp;
           });
 
           // Construct the combined draft of the active subpoint. paragraphPlan is
@@ -626,57 +459,23 @@ export default function CoachChat({
             subpointDraft = parts.join('\n\n');
           }
 
-          const finalSubpoints = updatedSubpoints.map((sp: any) => {
-            // Re-validate EVERY body: board quality + real student dialogue.
-            const withDraft =
-              sp.id === activeId ? { ...sp, draft: subpointDraft } : { ...sp };
-            const genuine = isSubpointGenuinelyComplete(withDraft, {
-              currentUserMessage:
-                sp.id === activeId && !hiddenUserMessage ? textToSend : undefined,
-              isHiddenKickoff: hiddenUserMessage && sp.id === activeId,
-            });
-            return {
-              ...withDraft,
-              isCompleted: genuine,
-            };
-          });
-
-          // If all subpoints are completed, we can also auto-complete Step 3.
-          // Note: per-subpoint isCompleted is now gated on the logic chain being
-          // actually filled, so this cannot flip true while steps are empty.
-          const provisionalStep3 = {
-            ...currentStep3,
-            subpoints: finalSubpoints,
-          };
-          const allSubpointsDone = isStep3FullyComplete(
-            { ...session, step3: provisionalStep3 },
-            finalSubpoints,
+          const finalSubpoints = updatedSubpoints.map((sp: any) =>
+            sp.id === activeId ? { ...sp, draft: subpointDraft } : sp,
           );
-
-          // Plan A auto-advance: when the CURRENT body just became complete and
-          // another body still needs work, move the active tab to the next
-          // incomplete body so its (empty) chat auto-fires a fresh kickoff. The
-          // completed body keeps its own chatHistory/paragraphPlan intact.
-          let nextActiveSubpointId = currentStep3.activeSubpointId || activeId;
-          const activeJustCompleted = finalSubpoints.find(
-            (sp: any) => sp.id === activeId,
-          )?.isCompleted;
-          if (activeJustCompleted && !allSubpointsDone) {
-            const nextIncomplete = finalSubpoints.find((sp: any) => !sp.isCompleted);
-            if (nextIncomplete) {
-              nextActiveSubpointId = nextIncomplete.id;
-            }
-          }
 
           sessionUpdates = {
             ...sessionUpdates,
             step3: {
               ...currentStep3,
               subpoints: finalSubpoints,
-              activeSubpointId: nextActiveSubpointId,
-              // Only complete the whole step when EVERY body is genuinely done.
-              // Do not trust a stray model isCompleted:true mid-flow.
-              isCompleted: allSubpointsDone
+              activeSubpointId:
+                step3Ui?.nextActiveSubpointId ||
+                currentStep3.activeSubpointId ||
+                activeId,
+              isCompleted:
+                typeof step3Ui?.isStep3Finished === 'boolean'
+                  ? step3Ui.isStep3Finished
+                  : !!data.progressUpdate.isCompleted,
             }
           };
         }

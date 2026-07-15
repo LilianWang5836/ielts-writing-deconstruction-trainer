@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { motion } from 'motion/react';
 import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Award, Layers, Sparkles } from 'lucide-react';
 import { Topic, PracticeSession, Dimension } from '../types';
@@ -238,6 +238,49 @@ export default function Step2Brainstorm({
     String(evalData?.userPoints || session.step2.userPoints || ''),
   );
 
+  // Jump button: prefer server isCompleted; also unlock for stuck sessions where
+  // the coach already said "进入第三步" and the blueprint already has real content
+  // (covers the stance→summary currentStage desync without waiting for another turn).
+  const showNextStepButton = useMemo(() => {
+    if (session.step2.isCompleted) return true;
+    const history = session.step2.chatHistory || [];
+    const ctaOk = history.some(
+      (m) =>
+        m.sender === 'ai' &&
+        typeof m.text === 'string' &&
+        (m.text.includes('进入第三步') ||
+          m.text.includes('进入第三阶段') ||
+          /进入\s*Step\s*3/i.test(m.text) ||
+          (m.text.includes('下一步') && m.text.includes('第三步'))),
+    );
+    if (!ctaOk) return false;
+    const blueprint = (evalData as any)?.blueprint || {};
+    const stance = String(
+      blueprint.position || evalData?.userStance || session.step2.userStance || '',
+    ).trim();
+    if (!stance) return false;
+    const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
+    const filledBodies = bodies.filter(
+      (b: any) => String(b?.content || b?.title || '').trim(),
+    ).length;
+    const legacyBodies =
+      (String(blueprint.body1 || pointsForBlueprint.body1 || '').trim() ? 1 : 0) +
+      (String(blueprint.body2 || pointsForBlueprint.body2 || '').trim() ? 1 : 0);
+    const clusterCount = Array.isArray((evalData as any)?.clustering?.clusters)
+      ? (evalData as any).clustering.clusters.filter((c: any) =>
+          String(c?.content || c?.theme || '').trim(),
+        ).length
+      : 0;
+    return Math.max(filledBodies, legacyBodies, clusterCount) >= 2;
+  }, [
+    session.step2.isCompleted,
+    session.step2.chatHistory,
+    session.step2.userStance,
+    evalData,
+    pointsForBlueprint.body1,
+    pointsForBlueprint.body2,
+  ]);
+
   let previousNotes = "";
   if (eval1) {
     previousNotes = `题型判定：${eval1.correctType}\n核心争议：${eval1.coreIssue}${eval1.constraints && eval1.constraints.length > 0 ? `\n关键限定：${eval1.constraints.join('、')}` : ''}`;
@@ -320,8 +363,8 @@ ${topic.question}
             </div>
           )}
 
-          {/* Coach Controls / Action bar - Auto-progression upon AI completion */}
-          {session.step2.isCompleted && (
+          {/* Coach Controls / Action bar — unlock with isCompleted or CTA+blueprint */}
+          {showNextStepButton && (
             <div className="mt-4 border-t border-emerald-100 pt-3.5 animate-fade-in">
               <div className="bg-emerald-50 border border-emerald-200/80 rounded-xl p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-xs">
                 <div className="flex items-center gap-2.5">
@@ -331,7 +374,7 @@ ${topic.question}
                   <div className="text-left">
                     <h4 className="font-sans font-bold text-emerald-900 text-xs">🎉 观点与分论点通关！</h4>
                     <p className="font-sans text-[11px] text-emerald-700 leading-normal">
-                      AI Coach 已判定你的观点与分论点设计合格。点击下方按钮，进入下一步论证拆解。
+                      AI Coach 已判定你的观点与分论点设计合格。点击下方【立即跳转】，进入下一步论证拆解。
                     </p>
                   </div>
                 </div>

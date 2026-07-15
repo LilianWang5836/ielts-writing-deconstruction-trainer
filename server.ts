@@ -4,6 +4,14 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { jsonrepair } from "jsonrepair";
+import {
+  mergeLogicStepValues,
+  mergeParagraphPlanPreserveBlocks,
+  restoreFrozenFlatSteps,
+  restoreFrozenParagraphPlanValues,
+  isStep3Confirmed,
+  normalizeStep3Status,
+} from "./src/utils/step3Quality.ts";
 
 dotenv.config();
 
@@ -702,7 +710,7 @@ function buildStep3Digest(session: any, question: string): any {
       for (const step of block?.steps || []) {
         totalStepCount += 1;
         const label = String(step?.label || step?.key || "step").trim();
-        if (isGenuineStep3StepValue(step)) {
+        if (isStep3Confirmed(step)) {
           filledStepCount += 1;
           filled.push(`${blockLabel}:${label}`);
         } else {
@@ -714,7 +722,7 @@ function buildStep3Digest(session: any, question: string): any {
     for (const step of active.structureSteps) {
       totalStepCount += 1;
       const label = String(step?.label || step?.key || "step").trim();
-      if (isGenuineStep3StepValue(step)) {
+      if (isStep3Confirmed(step)) {
         filledStepCount += 1;
         filled.push(label);
       } else {
@@ -1230,12 +1238,62 @@ function isPlaceholderEchoValue(value: string, placeholder: string): boolean {
   return v === p;
 }
 
+/** True when two step values are the same answer copied twice (model prefill leak). */
+function areNearDuplicateStep3Values(a: string, b: string): boolean {
+  const na = normalizeForEchoCompare(a);
+  const nb = normalizeForEchoCompare(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 12 && nb.length >= 12 && (na.includes(nb) || nb.includes(na))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when a student's current answer substantially covers a model-authored
+ * adjacent value. This is deliberately broader than exact duplicate detection:
+ * it catches light paraphrases such as "跨时区消息不能及时回复" being written into
+ * a second slot after the student's full sentence already said the same thing.
+ */
+function doesStep3AnswerCoverValue(answer: string, value: string): boolean {
+  const a = normalizeForEchoCompare(answer);
+  const v = normalizeForEchoCompare(value);
+  if (a.length < 12 || v.length < 12) return false;
+  if (a.includes(v) || v.includes(a)) return true;
+
+  const bigrams = (text: string): Set<string> => {
+    const result = new Set<string>();
+    for (let i = 0; i < text.length - 1; i++) result.add(text.slice(i, i + 2));
+    return result;
+  };
+  const answerBigrams = bigrams(a);
+  const valueBigrams = bigrams(v);
+  let shared = 0;
+  for (const gram of valueBigrams) {
+    if (answerBigrams.has(gram)) shared += 1;
+  }
+  const smaller = Math.min(answerBigrams.size, valueBigrams.size);
+  return shared >= 8 && smaller > 0 && shared / smaller >= 0.4;
+}
+
 function isGenuineStep3StepValue(step: any): boolean {
   if (!step) return false;
   const v = String(step.value || "");
   if (!isValidStep3StepValue(v)) return false;
   if (isPlaceholderEchoValue(v, String(step.placeholder || ""))) return false;
   return true;
+}
+
+function ensureDraftStatus(step: any): void {
+  if (!step || typeof step !== "object") return;
+  if (!isGenuineStep3StepValue(step)) {
+    step.status = "";
+    return;
+  }
+  if (normalizeStep3Status(step.status) !== "confirmed") {
+    step.status = "draft";
+  }
 }
 
 function sanitizeParagraphPlanValues(plan: any): void {
@@ -1246,30 +1304,161 @@ function sanitizeParagraphPlanValues(plan: any): void {
   if (!Array.isArray(plan.pointBlocks)) return;
   for (const block of plan.pointBlocks) {
     if (!Array.isArray(block?.steps)) continue;
-    for (const step of block.steps) {
+    for (let i = 0; i < block.steps.length; i++) {
+      const step = block.steps[i];
       if (!isGenuineStep3StepValue(step)) {
         step.value = "";
+        step.status = "";
+        continue;
+      }
+      ensureDraftStatus(step);
+      const previous = i > 0 ? block.steps[i - 1] : null;
+      if (
+        previous &&
+        isGenuineStep3StepValue(previous) &&
+        areNearDuplicateStep3Values(
+          String(previous.value || ""),
+          String(step.value || ""),
+        )
+      ) {
+        step.value = "";
+        step.status = "";
+        console.warn(
+          "[Step3Guard] Cleared an existing adjacent duplicate value from paragraphPlan.",
+        );
       }
     }
   }
+}
+
+/**
+ * If one student answer already covers two adjacent OPEN slots, collapse them
+ * into one board slot instead of storing a paraphrase twice. The retained slot
+ * keeps the first key so React and downstream progress remain stable.
+ *
+ * Confirmed slots are never merged. If the second slot adds distinct content,
+ * it remains separate and the normal per-slot completion gate still applies.
+ */
+function collapseCoveredAdjacentStep3Slots(
+  plan: any,
+  prevPlan: any,
+  userMessage: string,
+): boolean {
+  if (
+    !plan ||
+    !prevPlan ||
+    !Array.isArray(plan.pointBlocks) ||
+    !Array.isArray(prevPlan.pointBlocks) ||
+    !isSubstantiveStep3Answer(userMessage)
+  ) {
+    return false;
+  }
+  if (
+    prevPlan.mode === "total_then_points" &&
+    !isValidStep3StepValue(String(prevPlan.totalClaim || ""))
+  ) {
+    return false;
+  }
+
+  // Only the first previously-open (not-confirmed) slot is the current target.
+  // Never collapse a later pair that the student was not answering.
+  for (let bi = 0; bi < prevPlan.pointBlocks.length; bi++) {
+    const prevBlock = prevPlan.pointBlocks[bi];
+    const prevSteps = Array.isArray(prevBlock?.steps) ? prevBlock.steps : [];
+    for (let si = 0; si < prevSteps.length; si++) {
+      const prevTarget = prevSteps[si];
+      if (isStep3Confirmed(prevTarget)) continue;
+
+      const prevNext = prevSteps[si + 1];
+      if (!prevNext || isStep3Confirmed(prevNext)) return false;
+      const block =
+        plan.pointBlocks.find(
+          (candidate: any) =>
+            candidate?.id &&
+            prevBlock?.id &&
+            String(candidate.id) === String(prevBlock.id),
+        ) || plan.pointBlocks[bi];
+      const steps = Array.isArray(block?.steps) ? block.steps : [];
+      const targetIndex = steps.findIndex(
+        (step: any, index: number) =>
+          (prevTarget?.key && String(step?.key) === String(prevTarget.key)) ||
+          (!prevTarget?.key && index === si),
+      );
+      const nextIndex = steps.findIndex(
+        (step: any, index: number) =>
+          (prevNext?.key && String(step?.key) === String(prevNext.key)) ||
+          (!prevNext?.key && index === si + 1),
+      );
+      // The model may already have performed the legal structural merge.
+      if (targetIndex >= 0 && nextIndex < 0) return false;
+      if (targetIndex < 0 || nextIndex !== targetIndex + 1) return false;
+
+      const target = steps[targetIndex];
+      const next = steps[nextIndex];
+      if (!isGenuineStep3StepValue(target) || !isGenuineStep3StepValue(next)) {
+        return false;
+      }
+      // Merge only when the TWO slot values themselves are near-duplicates.
+      // One utterance covering two DISTINCT links must keep both slots filled.
+      if (
+        !doesStep3AnswerCoverValue(
+          String(target.value || ""),
+          String(next.value || ""),
+        ) &&
+        !areNearDuplicateStep3Values(
+          String(target.value || ""),
+          String(next.value || ""),
+        )
+      ) {
+        return false;
+      }
+
+      const targetLabel = String(target.label || prevTarget?.label || "展开").trim();
+      const nextLabel = String(next.label || prevNext?.label || "").trim();
+      const modelAlreadyRelabeled =
+        targetLabel &&
+        String(prevTarget?.label || "").trim() &&
+        targetLabel !== String(prevTarget.label).trim();
+      if (!modelAlreadyRelabeled && nextLabel && !targetLabel.includes(nextLabel)) {
+        target.label = `${targetLabel} / ${nextLabel}`;
+      }
+      // Preserve the first key. Keep the richer of the two values (usually the
+      // student's full utterance when the model already split it).
+      target.key = String(prevTarget?.key || target.key || `${bi}:${si}`);
+      const targetVal = String(target.value || "").trim();
+      const nextVal = String(next.value || "").trim();
+      const userVal = String(userMessage || "").trim();
+      target.value =
+        userVal.length >= Math.max(targetVal.length, nextVal.length)
+          ? userVal
+          : targetVal.length >= nextVal.length
+            ? targetVal
+            : nextVal;
+      if (String(target.status || "") !== "confirmed") {
+        target.status = "draft";
+      }
+      steps.splice(nextIndex, 1);
+      console.warn(
+        `[Step3Guard] Collapsed adjacent open slots ${String(prevTarget?.key || si)} + ${String(prevNext?.key || si + 1)} because one student answer covered both.`,
+      );
+      return true;
+    }
+  }
+  return false;
 }
 
 function isParagraphPlanFilled(plan: any): boolean {
   if (!plan || !Array.isArray(plan.pointBlocks) || plan.pointBlocks.length === 0) {
     return false;
   }
-  if (
-    plan.mode === "total_then_points" &&
-    String(plan.totalClaim || "").trim() &&
-    !isValidStep3StepValue(String(plan.totalClaim))
-  ) {
-    return false;
+  if (plan.mode === "total_then_points") {
+    if (!isValidStep3StepValue(String(plan.totalClaim || ""))) return false;
   }
   return plan.pointBlocks.every(
     (block: any) =>
       Array.isArray(block?.steps) &&
       block.steps.length > 0 &&
-      block.steps.every((step: any) => isGenuineStep3StepValue(step)),
+      block.steps.every((step: any) => isStep3Confirmed(step)),
   );
 }
 
@@ -1278,7 +1467,7 @@ function isSubpointQualityComplete(sp: any): boolean {
   if (!sp) return false;
   if (sp.paragraphPlan) return isParagraphPlanFilled(sp.paragraphPlan);
   if (Array.isArray(sp.structureSteps) && sp.structureSteps.length > 0) {
-    return sp.structureSteps.every((s: any) => isGenuineStep3StepValue(s));
+    return sp.structureSteps.every((s: any) => isStep3Confirmed(s));
   }
   return false;
 }
@@ -1310,7 +1499,7 @@ function isSubpointGenuinelyComplete(
   return !!msg && isSubstantiveStep3Answer(msg) && !isKickoffOrInstructionText(msg);
 }
 
-/** Keep plan structure (mode/blocks/placeholders) but wipe every value. */
+/** Keep plan structure (mode/blocks/placeholders) but wipe every value/status. */
 function clearAllStep3PlanValues(plan: any): void {
   if (!plan || typeof plan !== "object") return;
   plan.totalClaim = "";
@@ -1318,7 +1507,10 @@ function clearAllStep3PlanValues(plan: any): void {
   for (const block of plan.pointBlocks) {
     if (!Array.isArray(block?.steps)) continue;
     for (const step of block.steps) {
-      if (step && typeof step === "object") step.value = "";
+      if (step && typeof step === "object") {
+        step.value = "";
+        step.status = "";
+      }
     }
   }
 }
@@ -1413,6 +1605,85 @@ function finalizeStep3WholeStepCompletion(
   }
 }
 
+/**
+ * Authoritative Step 3 UI progress for the client (dumb renderer).
+ * Client must not recompute selectable / whole-step finished / next tab.
+ */
+function attachStep3UiProgress(
+  data: any,
+  session: any,
+  activeId: string | undefined,
+  options?: { currentUserMessage?: string; isHiddenKickoff?: boolean },
+): void {
+  if (!data?.progressUpdate) return;
+
+  const subpoints = Array.isArray(session?.step3?.subpoints)
+    ? session.step3.subpoints
+    : [];
+  const plan = data.progressUpdate.paragraphPlan;
+  const flat = Array.isArray(data.progressUpdate.step3SubpointSteps)
+    ? data.progressUpdate.step3SubpointSteps
+    : null;
+
+  const bodies = subpoints.map((sp: any) => {
+    let isCompleted = false;
+    if (sp?.id === activeId) {
+      if (options?.isHiddenKickoff) {
+        isCompleted = false;
+      } else if (typeof data.progressUpdate.step3SubpointCompleted === "boolean") {
+        isCompleted = !!data.progressUpdate.step3SubpointCompleted;
+      } else {
+        const mergedSp = {
+          ...sp,
+          ...(plan ? { paragraphPlan: plan } : {}),
+          ...(flat ? { structureSteps: flat } : {}),
+        };
+        isCompleted = isSubpointGenuinelyComplete(mergedSp, {
+          currentUserMessage: options?.currentUserMessage,
+          isHiddenKickoff: options?.isHiddenKickoff,
+        });
+      }
+    } else {
+      isCompleted = isSubpointGenuinelyComplete(sp);
+    }
+    return { id: String(sp?.id || ""), isCompleted };
+  });
+
+  const bodiesWithSelectable = bodies.map((b: any, idx: number) => {
+    let selectable = true;
+    for (let i = 0; i < idx; i++) {
+      if (!bodies[i].isCompleted) {
+        selectable = false;
+        break;
+      }
+    }
+    return { ...b, selectable };
+  });
+
+  const expectedBodyCount = inferExpectedStep3BodyCount(session);
+  const isStep3Finished =
+    bodiesWithSelectable.length > 0 &&
+    (expectedBodyCount <= 0 || bodiesWithSelectable.length >= expectedBodyCount) &&
+    bodiesWithSelectable.every((b: any) => b.isCompleted);
+
+  let nextActiveSubpointId = activeId || bodiesWithSelectable[0]?.id || "";
+  const activeJustCompleted = bodiesWithSelectable.find(
+    (b: any) => b.id === activeId,
+  )?.isCompleted;
+  if (activeJustCompleted && !isStep3Finished) {
+    const nextIncomplete = bodiesWithSelectable.find((b: any) => !b.isCompleted);
+    if (nextIncomplete) nextActiveSubpointId = nextIncomplete.id;
+  }
+
+  data.progressUpdate.step3Ui = {
+    bodies: bodiesWithSelectable,
+    isStep3Finished,
+    nextActiveSubpointId,
+  };
+  // Keep whole-step flag aligned with the UI contract.
+  data.progressUpdate.isCompleted = isStep3Finished;
+}
+
 function findFirstEmptyPlanStep(
   plan: any,
 ): { blockLabel: string; stepLabel: string; blockIndex: number; stepIndex: number } | null {
@@ -1421,7 +1692,7 @@ function findFirstEmptyPlanStep(
     const block = plan.pointBlocks[bi];
     const steps = Array.isArray(block?.steps) ? block.steps : [];
     for (let si = 0; si < steps.length; si++) {
-      if (!isGenuineStep3StepValue(steps[si])) {
+      if (!isStep3Confirmed(steps[si])) {
         return {
           blockLabel: String(block?.label || `分点${bi + 1}`),
           stepLabel: String(steps[si]?.label || "展开"),
@@ -1480,23 +1751,34 @@ function collectStep3PlanRefs(plan: any): Step3PlanStepRef[] {
 function readStep3RefValue(plan: any, ref: Step3PlanStepRef): string {
   if (!plan || !ref) return "";
   if (ref.kind === "totalClaim") return String(plan.totalClaim || "");
-  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  const steps = plan.pointBlocks?.[ref.blockIndex]?.steps;
+  const step =
+    (Array.isArray(steps) &&
+      steps.find((candidate: any) => String(candidate?.key || "") === ref.key)) ||
+    steps?.[ref.stepIndex];
   return String(step?.value || "");
 }
 
 function readStep3RefPlaceholder(plan: any, ref: Step3PlanStepRef): string {
   if (!plan || !ref || ref.kind === "totalClaim") return "";
-  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  const steps = plan.pointBlocks?.[ref.blockIndex]?.steps;
+  const step =
+    (Array.isArray(steps) &&
+      steps.find((candidate: any) => String(candidate?.key || "") === ref.key)) ||
+    steps?.[ref.stepIndex];
   return String(step?.placeholder || "");
 }
 
 function isStep3RefFilled(plan: any, ref: Step3PlanStepRef): boolean {
-  const value = readStep3RefValue(plan, ref);
-  if (ref.kind === "totalClaim") return isValidStep3StepValue(value);
-  return (
-    isValidStep3StepValue(value) &&
-    !isPlaceholderEchoValue(value, readStep3RefPlaceholder(plan, ref))
-  );
+  if (ref.kind === "totalClaim") {
+    return isValidStep3StepValue(readStep3RefValue(plan, ref));
+  }
+  const steps = plan.pointBlocks?.[ref.blockIndex]?.steps;
+  const step =
+    (Array.isArray(steps) &&
+      steps.find((candidate: any) => String(candidate?.key || "") === ref.key)) ||
+    steps?.[ref.stepIndex];
+  return isStep3Confirmed(step);
 }
 
 function clearStep3RefValue(plan: any, ref: Step3PlanStepRef): void {
@@ -1505,8 +1787,33 @@ function clearStep3RefValue(plan: any, ref: Step3PlanStepRef): void {
     plan.totalClaim = "";
     return;
   }
-  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
-  if (step) step.value = "";
+  const steps = plan.pointBlocks?.[ref.blockIndex]?.steps;
+  const step =
+    (Array.isArray(steps) &&
+      steps.find((candidate: any) => String(candidate?.key || "") === ref.key)) ||
+    steps?.[ref.stepIndex];
+  if (step) {
+    step.value = "";
+    step.status = "";
+  }
+}
+
+function wereStep3RefsAdjacentInPreviousPlan(
+  prevPlan: any,
+  target: Step3PlanStepRef,
+  next: Step3PlanStepRef,
+): boolean {
+  if (!prevPlan || target.kind !== "step" || next.kind !== "step") return false;
+  if (target.blockIndex !== next.blockIndex) return false;
+  const steps = prevPlan.pointBlocks?.[target.blockIndex]?.steps;
+  if (!Array.isArray(steps)) return false;
+  const targetIndex = steps.findIndex(
+    (step: any) => String(step?.key || "") === target.key,
+  );
+  const nextIndex = steps.findIndex(
+    (step: any) => String(step?.key || "") === next.key,
+  );
+  return targetIndex >= 0 && nextIndex === targetIndex + 1;
 }
 
 function guardStep3ValueProvenance(plan: any, prevPlan: any): number {
@@ -1514,37 +1821,132 @@ function guardStep3ValueProvenance(plan: any, prevPlan: any): number {
   const refs = collectStep3PlanRefs(plan);
   if (refs.length === 0) return 0;
 
-  // Target = first step that was empty on the PREVIOUS board (or first step
-  // when there is no previous board yet).
+  // Target = first step that was NOT confirmed on the PREVIOUS board.
   let targetIdx = -1;
   for (let i = 0; i < refs.length; i++) {
-    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
-    if (!wasFilled) {
+    const wasConfirmed = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
+    if (!wasConfirmed) {
       targetIdx = i;
       break;
     }
   }
-  if (targetIdx < 0) return 0; // previous board already fully filled
+  if (targetIdx < 0) return 0; // previous board already fully confirmed
 
   const allowed = new Set<number>([targetIdx]);
   const target = refs[targetIdx];
   const next = refs[targetIdx + 1];
+  let repairedShiftedRewrite = false;
   if (
     next &&
     target.kind === "step" &&
     next.kind === "step" &&
     next.blockIndex === target.blockIndex &&
-    next.stepIndex === target.stepIndex + 1
+    next.stepIndex === target.stepIndex + 1 &&
+    (!prevPlan || wereStep3RefsAdjacentInPreviousPlan(prevPlan, target, next))
   ) {
-    allowed.add(targetIdx + 1);
+    const targetVal = readStep3RefValue(plan, target);
+    const nextVal = readStep3RefValue(plan, next);
+    const prevTargetVal = readStep3RefValue(prevPlan, target);
+    const prevNextVal = readStep3RefValue(prevPlan, next);
+    const targetValueChanged =
+      normalizeForEchoCompare(targetVal) !== normalizeForEchoCompare(prevTargetVal);
+    const prevTargetWasDraft =
+      isGenuineStep3StepValue({
+        value: prevTargetVal,
+        placeholder: readStep3RefPlaceholder(prevPlan, target),
+      }) && !isStep3RefFilled(prevPlan, target);
+    const nextWasEmpty = !isGenuineStep3StepValue({
+      value: prevNextVal,
+      placeholder: readStep3RefPlaceholder(prevPlan, next),
+    });
+    const nextNowGenuine = isGenuineStep3StepValue({
+      value: nextVal,
+      placeholder: readStep3RefPlaceholder(plan, next),
+    });
+
+    // A common model error during draft -> confirmed is to leave the draft in
+    // the target and write its polished replacement into the next slot. This
+    // is not a two-link answer: the current target was never updated. Move the
+    // rewrite back onto the target and leave the next slot empty.
+    if (
+      prevTargetWasDraft &&
+      !targetValueChanged &&
+      nextWasEmpty &&
+      nextNowGenuine
+    ) {
+      const targetSteps = plan.pointBlocks?.[target.blockIndex]?.steps;
+      const targetStep =
+        (Array.isArray(targetSteps) &&
+          targetSteps.find(
+            (candidate: any) => String(candidate?.key || "") === target.key,
+          )) ||
+        targetSteps?.[target.stepIndex];
+      const nextStep =
+        (Array.isArray(targetSteps) &&
+          targetSteps.find(
+            (candidate: any) => String(candidate?.key || "") === next.key,
+          )) ||
+        targetSteps?.[next.stepIndex];
+      if (targetStep && nextStep) {
+        targetStep.value = nextVal;
+        targetStep.status =
+          normalizeStep3Status(targetStep.status) === "confirmed" ||
+          normalizeStep3Status(nextStep.status) === "confirmed"
+            ? "confirmed"
+            : "draft";
+        clearStep3RefValue(plan, next);
+        repairedShiftedRewrite = true;
+        console.warn(
+          "[Step3Guard] Moved a misplaced draft rewrite from the adjacent slot back to the current target.",
+        );
+      }
+    }
+
+    // Adjacent fill is only for one utterance covering two DISTINCT links.
+    // The target itself must also have changed this turn; otherwise a newly
+    // filled next slot is a shifted rewrite or an unsupported progression.
+    if (
+      !repairedShiftedRewrite &&
+      targetValueChanged &&
+      isGenuineStep3StepValue({
+        value: targetVal,
+        placeholder: readStep3RefPlaceholder(plan, target),
+      }) &&
+      nextNowGenuine &&
+      !areNearDuplicateStep3Values(targetVal, nextVal)
+    ) {
+      allowed.add(targetIdx + 1);
+    } else if (!repairedShiftedRewrite && nextNowGenuine) {
+      console.warn(
+        "[Step3Guard] Rejected adjacent fill: the current target was not updated or the next value duplicates it.",
+      );
+    }
   }
 
   let cleared = 0;
   for (let i = 0; i < refs.length; i++) {
     const ref = refs[i];
-    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, ref) : false;
-    const nowFilled = isStep3RefFilled(plan, ref);
-    if (!wasFilled && nowFilled && !allowed.has(i)) {
+    if (prevPlan && isStep3RefFilled(prevPlan, ref)) continue;
+    const prevStep =
+      ref.kind === "step"
+        ? prevPlan?.pointBlocks?.[ref.blockIndex]?.steps?.find(
+            (s: any) => String(s?.key || "") === ref.key,
+          ) || prevPlan?.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex]
+        : null;
+    const wasGenuine =
+      ref.kind === "totalClaim"
+        ? !!(prevPlan && isValidStep3StepValue(String(prevPlan.totalClaim || "")))
+        : isGenuineStep3StepValue(prevStep);
+    const nowGenuine =
+      ref.kind === "totalClaim"
+        ? isValidStep3StepValue(readStep3RefValue(plan, ref))
+        : isGenuineStep3StepValue(
+            plan.pointBlocks?.[ref.blockIndex]?.steps?.find(
+              (s: any) => String(s?.key || "") === ref.key,
+            ) || plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex],
+          );
+    // Allow updating an already-draft target; only clear leaps into new slots.
+    if (!wasGenuine && nowGenuine && !allowed.has(i)) {
       clearStep3RefValue(plan, ref);
       cleared += 1;
     }
@@ -1558,7 +1960,7 @@ function guardStep3ValueProvenance(plan: any, prevPlan: any): number {
   return cleared;
 }
 
-/** Flat-chain provenance: only first empty + next adjacent may newly fill. */
+/** Flat-chain provenance: only first not-confirmed + next adjacent may newly fill. */
 function guardFlatStep3ValueProvenance(steps: any[], prevSteps: any[]): number {
   if (!Array.isArray(steps) || steps.length === 0) return 0;
   const prevByKey: Record<string, any> = {};
@@ -1571,7 +1973,7 @@ function guardFlatStep3ValueProvenance(steps: any[], prevSteps: any[]): number {
   for (let i = 0; i < steps.length; i++) {
     const key = String(steps[i]?.key || i);
     const prev = prevByKey[key] || (prevSteps || [])[i];
-    if (!isGenuineStep3StepValue(prev)) {
+    if (!isStep3Confirmed(prev)) {
       targetIdx = i;
       break;
     }
@@ -1579,16 +1981,27 @@ function guardFlatStep3ValueProvenance(steps: any[], prevSteps: any[]): number {
   if (targetIdx < 0) return 0;
 
   const allowed = new Set<number>([targetIdx]);
-  if (targetIdx + 1 < steps.length) allowed.add(targetIdx + 1);
+  if (targetIdx + 1 < steps.length) {
+    const targetVal = String(steps[targetIdx]?.value || "");
+    const nextVal = String(steps[targetIdx + 1]?.value || "");
+    if (!areNearDuplicateStep3Values(targetVal, nextVal)) {
+      allowed.add(targetIdx + 1);
+    } else if (isGenuineStep3StepValue(steps[targetIdx + 1])) {
+      console.warn(
+        "[Step3Guard] Flat: rejected adjacent fill — near-duplicate of target.",
+      );
+    }
+  }
 
   let cleared = 0;
   for (let i = 0; i < steps.length; i++) {
     const key = String(steps[i]?.key || i);
     const prev = prevByKey[key] || (prevSteps || [])[i];
-    const wasFilled = isGenuineStep3StepValue(prev);
-    const nowFilled = isGenuineStep3StepValue(steps[i]);
-    if (!wasFilled && nowFilled && !allowed.has(i)) {
-      steps[i] = { ...steps[i], value: "" };
+    if (isStep3Confirmed(prev)) continue;
+    const wasGenuine = isGenuineStep3StepValue(prev);
+    const nowGenuine = isGenuineStep3StepValue(steps[i]);
+    if (!wasGenuine && nowGenuine && !allowed.has(i)) {
+      steps[i] = { ...steps[i], value: "", status: "" };
       cleared += 1;
     }
   }
@@ -1600,75 +2013,14 @@ function guardFlatStep3ValueProvenance(steps: any[], prevSteps: any[]): number {
   return cleared;
 }
 
-function mergeLogicStepValues(prevSteps: any[] = [], nextSteps: any[] = []): any[] {
-  const prevByKey: Record<string, any> = {};
-  prevSteps.forEach((s: any) => {
-    if (s && s.key) prevByKey[s.key] = s;
-  });
-  return nextSteps.map((s: any) => {
-    const prev = s && s.key ? prevByKey[s.key] : undefined;
-    const newVal = s && typeof s.value === "string" ? s.value : "";
-    const prevVal = prev && prev.value ? String(prev.value) : "";
-    const placeholder = String(s?.placeholder || prev?.placeholder || "");
-    const newIsGenuine =
-      newVal &&
-      String(newVal).trim() &&
-      isValidStep3StepValue(newVal) &&
-      !isPlaceholderEchoValue(newVal, placeholder);
-    const prevIsGenuine =
-      prevVal && isValidStep3StepValue(prevVal) && !isPlaceholderEchoValue(prevVal, placeholder);
-    const value = newIsGenuine ? newVal : prevIsGenuine ? prevVal : "";
-    return { ...prev, ...s, value };
-  });
-}
-
 function mergeParagraphPlanValues(prevPlan: any, nextPlan: any): any {
-  if (!nextPlan || !Array.isArray(nextPlan.pointBlocks)) return prevPlan || nextPlan;
-  const prevBlocks = Array.isArray(prevPlan?.pointBlocks) ? prevPlan.pointBlocks : [];
-  const prevById: Record<string, any> = {};
-  prevBlocks.forEach((b: any) => {
-    if (b && b.id) prevById[b.id] = b;
-  });
-  const pointBlocks = nextPlan.pointBlocks.map((block: any, index: number) => {
-    const prev =
-      (block && block.id ? prevById[block.id] : undefined) ||
-      prevBlocks[index];
-    return {
-      ...prev,
-      ...block,
-      steps: mergeLogicStepValues(prev?.steps || [], block.steps || []),
-    };
-  });
-  return {
-    ...prevPlan,
-    ...nextPlan,
-    totalClaim:
-      nextPlan.totalClaim && String(nextPlan.totalClaim).trim()
-        ? nextPlan.totalClaim
-        : prevPlan?.totalClaim || "",
-    optionalShortClosing:
-      nextPlan.optionalShortClosing && String(nextPlan.optionalShortClosing).trim()
-        ? nextPlan.optionalShortClosing
-        : prevPlan?.optionalShortClosing || "",
-    pointBlocks,
-  };
-}
-
-function backfillFirstEmptyStepFromUser(plan: any, userMessage: string): boolean {
-  if (!plan || !isSubstantiveStep3Answer(userMessage)) return false;
-  const pending = findFirstEmptyPlanStep(plan);
-  if (!pending) return false;
-  const step =
-    plan.pointBlocks?.[pending.blockIndex]?.steps?.[pending.stepIndex];
-  if (!step) return false;
-  step.value = String(userMessage).trim();
-  return true;
+  return mergeParagraphPlanPreserveBlocks(prevPlan, nextPlan);
 }
 
 /**
- * Prefer the student's raw utterance for THIS turn's target step (first empty
- * on the previous board). Even if the model already wrote a paraphrase into
- * that slot, display/confirmation content must come from the student.
+ * Backfill only when the model left the open target completely empty.
+ * Do NOT overwrite a model rewrite of a draft slot — polish is allowed while
+ * status is still draft; confirmation is gated by resolveStep3StepConfirmation.
  */
 function applyStudentAnswerToTargetStep(
   plan: any,
@@ -1679,8 +2031,8 @@ function applyStudentAnswerToTargetStep(
   const refs = collectStep3PlanRefs(plan);
   let targetIdx = -1;
   for (let i = 0; i < refs.length; i++) {
-    const wasFilled = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
-    if (!wasFilled) {
+    const wasConfirmed = prevPlan ? isStep3RefFilled(prevPlan, refs[i]) : false;
+    if (!wasConfirmed) {
       targetIdx = i;
       break;
     }
@@ -1689,12 +2041,19 @@ function applyStudentAnswerToTargetStep(
   const ref = refs[targetIdx];
   const answer = String(userMessage).trim();
   if (ref.kind === "totalClaim") {
+    if (isValidStep3StepValue(String(plan.totalClaim || ""))) return false;
     plan.totalClaim = answer;
     return true;
   }
-  const step = plan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  const steps = plan.pointBlocks?.[ref.blockIndex]?.steps;
+  const step =
+    (Array.isArray(steps) &&
+      steps.find((candidate: any) => String(candidate?.key || "") === ref.key)) ||
+    steps?.[ref.stepIndex];
   if (!step) return false;
+  if (isGenuineStep3StepValue(step)) return false;
   step.value = answer;
+  step.status = "draft";
   return true;
 }
 
@@ -1706,6 +2065,7 @@ function rebuildFlatStepsFromParagraphPlan(paragraphPlan: any): any[] {
       label: "总观点",
       placeholder: "",
       value: paragraphPlan.totalClaim,
+      status: "confirmed",
     });
   }
   (paragraphPlan.pointBlocks || []).forEach((block: any, index: number) => {
@@ -1716,10 +2076,97 @@ function rebuildFlatStepsFromParagraphPlan(paragraphPlan: any): any[] {
         label: `${blockLabel} - ${step?.label || ""}`,
         placeholder: step?.placeholder || "",
         value: step?.value || "",
+        status: normalizeStep3Status(step?.status),
       });
     });
   });
   return derivedSteps;
+}
+
+function collectStudentStep3Corpus(
+  activeSp: any,
+  currentUserMessage: string,
+): string {
+  const parts: string[] = [];
+  const hist = Array.isArray(activeSp?.chatHistory) ? activeSp.chatHistory : [];
+  for (const m of hist) {
+    if (m?.sender !== "user") continue;
+    const t = String(m?.text || "").trim();
+    if (t && isSubstantiveStep3Answer(t)) parts.push(t);
+  }
+  const msg = String(currentUserMessage || "").trim();
+  if (msg && isSubstantiveStep3Answer(msg) && !isKickoffOrInstructionText(msg)) {
+    parts.push(msg);
+  }
+  return parts.join("\n");
+}
+
+function isConfirmContentSubstantive(value: string): boolean {
+  const t = String(value || "").trim();
+  if (t.length < 8) return false;
+  return isSubstantiveStep3Answer(t);
+}
+
+/**
+ * Model may propose status=confirmed; server only demotes invalid proposals.
+ * Never upgrades draft→confirmed on its own.
+ * Option A on failure: keep value, force status back to draft.
+ */
+function resolveStep3StepConfirmation(
+  plan: any,
+  activeSp: any,
+  userMessage: string,
+): number {
+  if (!plan || !Array.isArray(plan.pointBlocks)) return 0;
+  const corpus = collectStudentStep3Corpus(activeSp, userMessage);
+  let demoted = 0;
+
+  for (const block of plan.pointBlocks) {
+    const steps = Array.isArray(block?.steps) ? block.steps : [];
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (normalizeStep3Status(step?.status) !== "confirmed") {
+        if (isGenuineStep3StepValue(step)) ensureDraftStatus(step);
+        continue;
+      }
+
+      let rejectReason = "";
+      if (!isGenuineStep3StepValue(step)) {
+        rejectReason = "empty-or-invalid-value";
+      } else if (!isConfirmContentSubstantive(String(step.value || ""))) {
+        rejectReason = "too-thin";
+      } else {
+        for (let j = 0; j < steps.length; j++) {
+          if (j === i || !isStep3Confirmed(steps[j])) continue;
+          if (
+            areNearDuplicateStep3Values(
+              String(step.value || ""),
+              String(steps[j].value || ""),
+            )
+          ) {
+            rejectReason = "near-duplicate-of-confirmed-sibling";
+            break;
+          }
+        }
+      }
+      if (
+        !rejectReason &&
+        corpus &&
+        !doesStep3AnswerCoverValue(corpus, String(step.value || ""))
+      ) {
+        rejectReason = "not-grounded-in-student-corpus";
+      }
+
+      if (rejectReason) {
+        step.status = "draft";
+        demoted += 1;
+        console.warn(
+          `[Step3Guard] Demoted confirm→draft for step ${String(step.key || i)} (${rejectReason}).`,
+        );
+      }
+    }
+  }
+  return demoted;
 }
 
 type ParagraphMode =
@@ -1959,14 +2406,6 @@ function inferExpectedStep3BodyCount(session: any): number {
   return 0;
 }
 
-/**
- * Step 3 completion safety net:
- * 1) Merge prior board values so empty re-emits don't wipe progress.
- * 2) Backfill the first empty step from the student's current answer when the
- *    model forgot to write it into paragraphPlan (common last-step miss).
- * 3) Clear premature step3SubpointCompleted / isCompleted / completion CTA
- *    while any required step value is still empty.
- */
 function enforceStep3LogicCompletion(
   data: any,
   session: any,
@@ -1980,6 +2419,32 @@ function enforceStep3LogicCompletion(
     (sp: any) => sp.id === activeId,
   );
 
+  try {
+    enforceStep3LogicCompletionInner(data, session, userMessage, options, activeId, activeSp);
+  } finally {
+    attachStep3UiProgress(data, session, activeId, {
+      currentUserMessage: userMessage,
+      isHiddenKickoff: options?.isHiddenKickoff,
+    });
+  }
+}
+
+/**
+ * Step 3 completion safety net:
+ * 1) Merge prior board values so empty re-emits don't wipe progress.
+ * 2) Backfill the first empty step from the student's current answer when the
+ *    model forgot to write it into paragraphPlan (common last-step miss).
+ * 3) Clear premature step3SubpointCompleted / isCompleted / completion CTA
+ *    while any required step value is still empty.
+ */
+function enforceStep3LogicCompletionInner(
+  data: any,
+  session: any,
+  userMessage: string,
+  options: { isHiddenKickoff?: boolean } | undefined,
+  activeId: string | undefined,
+  activeSp: any,
+): void {
   let plan = data.progressUpdate.paragraphPlan;
   const prevPlan = activeSp?.paragraphPlan
     ? JSON.parse(JSON.stringify(activeSp.paragraphPlan))
@@ -1994,18 +2459,22 @@ function enforceStep3LogicCompletion(
   }
 
   if (plan) {
+    collapseCoveredAdjacentStep3Slots(plan, prevPlan, userMessage);
     sanitizeParagraphPlanValues(plan);
     // Structural firewall: planning drafts must not leak into value fields
     // for steps the student has not answered this turn.
     guardStep3ValueProvenance(plan, prevPlan);
+    restoreFrozenParagraphPlanValues(plan, prevPlan);
     data.progressUpdate.paragraphPlan = plan;
   }
 
   if (Array.isArray(data.progressUpdate.step3SubpointSteps) && activeSp?.structureSteps) {
+    const prevFlat = activeSp.structureSteps || [];
     data.progressUpdate.step3SubpointSteps = mergeLogicStepValues(
-      activeSp.structureSteps,
+      prevFlat,
       data.progressUpdate.step3SubpointSteps,
     );
+    restoreFrozenFlatSteps(data.progressUpdate.step3SubpointSteps, prevFlat);
   }
 
   const skipBackfill =
@@ -2050,7 +2519,15 @@ function enforceStep3LogicCompletion(
     if (flat.length === 0) return;
 
     const flatSanitized = flat.map((s: any) =>
-      isGenuineStep3StepValue(s) ? s : { ...s, value: "" },
+      isGenuineStep3StepValue(s)
+        ? {
+            ...s,
+            status:
+              normalizeStep3Status(s?.status) === "confirmed"
+                ? "confirmed"
+                : "draft",
+          }
+        : { ...s, value: "", status: "" },
     );
     guardFlatStep3ValueProvenance(flatSanitized, activeSp?.structureSteps || []);
     const flatEmpty = flatSanitized.find(
@@ -2062,23 +2539,24 @@ function enforceStep3LogicCompletion(
       !skipBackfill
     ) {
       flatEmpty.value = String(userMessage).trim();
+      flatEmpty.status = "draft";
       data.progressUpdate.step3SubpointSteps = flatSanitized;
     } else {
       data.progressUpdate.step3SubpointSteps = flatSanitized;
     }
-    const stillEmpty = flatSanitized.some(
-      (s: any) => !isGenuineStep3StepValue(s),
-    );
-    if (stillEmpty) {
+    // Flat path has no per-step confirm gate from paragraphPlan; treat
+    // genuine values as draft unless model already marked confirmed.
+    const stillOpen = flatSanitized.some((s: any) => !isStep3Confirmed(s));
+    if (stillOpen) {
       data.progressUpdate.step3SubpointCompleted = false;
       data.progressUpdate.isCompleted = false;
       if (data.text && textSuggestsStep3Complete(data.text)) {
         const split = splitTwoParts(data.text, 3);
         const label = flatEmpty?.label || "下一步";
-        const ask = `这一步「${label}」还没写进论证链。请用一句话把它说清楚，我帮你补上。`;
+        const ask = `这一步「${label}」还需要再补完整一点。请用一句话把它说清楚。`;
         data.text = `${(split.part1 || "我们继续把这条论证链补完整。").trim()}\n\n---\n\n${ask}`;
         console.warn(
-          "[Step3Guard] Cleared premature completion CTA; flat chain still has empty steps.",
+          "[Step3Guard] Cleared premature completion CTA; flat chain still has unconfirmed steps.",
         );
       }
       return;
@@ -2110,8 +2588,10 @@ function enforceStep3LogicCompletion(
     return;
   }
 
-  // Prefer the student's raw words for this turn's target step, then backfill
-  // only if the target is still empty after the model omitted it.
+  // Backfill only the target derived from the PREVIOUS board. Never fall
+  // through to the first empty slot on the updated board: once the model
+  // confirms the target, that would consume the same utterance a second time
+  // by copying it into the next slot.
   if (!skipBackfill && isSubstantiveStep3Answer(userMessage)) {
     const wroteTarget = applyStudentAnswerToTargetStep(plan, prevPlan, userMessage);
     if (wroteTarget) {
@@ -2119,20 +2599,16 @@ function enforceStep3LogicCompletion(
       data.progressUpdate.step3SubpointSteps =
         rebuildFlatStepsFromParagraphPlan(plan);
       console.warn(
-        "[Step3Guard] Wrote student utterance into this turn's target step.",
+        "[Step3Guard] Backfilled empty target step from student utterance.",
       );
-    } else if (!isParagraphPlanFilled(plan)) {
-      const didBackfill = backfillFirstEmptyStepFromUser(plan, userMessage);
-      if (didBackfill) {
-        data.progressUpdate.paragraphPlan = plan;
-        data.progressUpdate.step3SubpointSteps =
-          rebuildFlatStepsFromParagraphPlan(plan);
-        console.warn(
-          "[Step3Guard] Backfilled empty paragraphPlan step from user message.",
-        );
-      }
     }
   }
+
+  // Model may propose confirmed; server only demotes invalid proposals (option A).
+  resolveStep3StepConfirmation(plan, activeSp, userMessage);
+  data.progressUpdate.paragraphPlan = plan;
+  data.progressUpdate.step3SubpointSteps =
+    rebuildFlatStepsFromParagraphPlan(plan);
 
   if (!isParagraphPlanFilled(plan)) {
     data.progressUpdate.step3SubpointCompleted = false;
@@ -2141,14 +2617,13 @@ function enforceStep3LogicCompletion(
     if (data.text && textSuggestsStep3Complete(data.text)) {
       const split = splitTwoParts(data.text, 3);
       const ask = pending
-        ? `「${pending.blockLabel}」的「${pending.stepLabel}」还没写进论证链。请用一句话把它说清楚，我帮你补上。`
+        ? `「${pending.blockLabel}」的「${pending.stepLabel}」还需要再补完整一点。请用一句话把它说清楚。`
         : fallbackNextStep(3, session);
       data.text = `${(split.part1 || "我们继续把这条论证链补完整。").trim()}\n\n---\n\n${ask}`;
       console.warn(
-        "[Step3Guard] Cleared premature completion CTA; paragraphPlan still has empty steps.",
+        "[Step3Guard] Cleared premature completion CTA; paragraphPlan still has unconfirmed steps.",
       );
     }
-    data.progressUpdate.step3SubpointSteps = rebuildFlatStepsFromParagraphPlan(plan);
     return;
   }
 
@@ -2284,16 +2759,73 @@ function resolveStep2CurrentStage(data: any, session?: any): string {
   ).trim();
 }
 
+/** Count filled body slots from blueprint.bodies[] or legacy body1/body2. */
+function countFilledStep2Bodies(blueprint: any): number {
+  if (!blueprint || typeof blueprint !== "object") return 0;
+  const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
+  let count = 0;
+  for (const b of bodies) {
+    if (String(b?.content || b?.title || "").trim()) count += 1;
+  }
+  if (count > 0) return count;
+  if (String(blueprint.body1 || "").trim()) count += 1;
+  if (String(blueprint.body2 || "").trim()) count += 1;
+  return count;
+}
+
 /**
- * Step 2 completion gate: unlock jump button only in summary + CTA
- * (mirrors enforceStep1SlotCompletion). Must run AFTER applyStepCompletionHeuristic
- * so a mid-explore "进入第三步" hallucination cannot stick.
+ * Content gate for Step 2 unlock: stance/overview + at least 2 body paragraphs
+ * (or 2 clustering themes). Used when the model emits a completion CTA but
+ * forgets to flip currentStage to "summary" (e.g. stuck at "stance").
+ */
+function isStep2BlueprintContentComplete(
+  progressUpdate: any,
+  session: any,
+): boolean {
+  const step2New =
+    progressUpdate?.step2Data && typeof progressUpdate.step2Data === "object"
+      ? progressUpdate.step2Data
+      : {};
+  const evalOld = session?.step2?.coachEvaluation || {};
+  const blueprint = step2New.blueprint || evalOld.blueprint || {};
+
+  const stance = String(
+    step2New.userStance ||
+      session?.step2?.userStance ||
+      evalOld.userStance ||
+      blueprint.position ||
+      "",
+  ).trim();
+  if (!stance) return false;
+
+  let bodyCount = countFilledStep2Bodies(blueprint);
+  if (bodyCount < 2) {
+    const clustering = step2New.clustering || evalOld.clustering;
+    if (Array.isArray(clustering?.clusters)) {
+      bodyCount = clustering.clusters.filter((c: any) =>
+        String(c?.content || c?.theme || "").trim(),
+      ).length;
+    }
+  }
+  return bodyCount >= 2;
+}
+
+/**
+ * Step 2 completion gate: unlock jump button on summary + CTA, OR on CTA +
+ * substantive blueprint even when the model forgot to flip currentStage
+ * (mirrors enforceStep1SlotCompletion's content-first spirit). Must run AFTER
+ * applyStepCompletionHeuristic so a mid-explore "进入第三步" hallucination
+ * without real blueprint content cannot stick.
  */
 function enforceStep2Completion(data: any, session: any): void {
   if (!data?.progressUpdate) return;
 
   const stage = resolveStep2CurrentStage(data, session);
   const ctaOk = textSuggestsStep2Complete(String(data.text || ""));
+  const contentOk = isStep2BlueprintContentComplete(
+    data.progressUpdate,
+    session,
+  );
   const driftedToStep3 =
     !!data.progressUpdate.paragraphPlan ||
     (Array.isArray(data.progressUpdate.step3SubpointSteps) &&
@@ -2301,6 +2833,23 @@ function enforceStep2Completion(data: any, session: any): void {
 
   if (stage === "summary" && ctaOk) {
     data.progressUpdate.isCompleted = true;
+    return;
+  }
+
+  // Content-gate fallback: completion CTA + real blueprint already present, but
+  // currentStage still stuck at explore/stance (classic text/field desync).
+  if (ctaOk && contentOk) {
+    data.progressUpdate.isCompleted = true;
+    if (
+      !data.progressUpdate.step2Data ||
+      typeof data.progressUpdate.step2Data !== "object"
+    ) {
+      data.progressUpdate.step2Data = {};
+    }
+    data.progressUpdate.step2Data.currentStage = "summary";
+    console.warn(
+      `[Step2CompletionGuard] Content-gate unlock: corrected stage ${stage} → summary (ctaOk=true, blueprint filled)`,
+    );
     return;
   }
 
@@ -2313,7 +2862,7 @@ function enforceStep2Completion(data: any, session: any): void {
   if (data.progressUpdate.isCompleted) {
     data.progressUpdate.isCompleted = false;
     console.warn(
-      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, ctaOk=${ctaOk})`,
+      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, ctaOk=${ctaOk}, contentOk=${contentOk})`,
     );
   }
 }
@@ -4085,7 +4634,7 @@ ${memoryDigestStr}
   DECIDING COMPLETION:
   - If currentStage is "summary", the user has finalized their stance/points, and your internal evaluation confirms EVERY planned Body paragraph has enough material to support a complete 90-110 word paragraph, set isCompleted: true in progressUpdate.
   - If any planned Body paragraph lacks sufficient material, you MUST NOT set isCompleted: true, and must instead ask the user for more ideas/clarification.
-  - When setting isCompleted: true, Part 2 MUST tell the student to click 【下一步】 and include the phrase "进入第三步". Do NOT start Step 3 drafting questions (mechanism, paragraphPlan, logic chain) in Step 2.
+  - When setting isCompleted: true, Part 2 MUST tell the student to click the left-side 【立即跳转】 button and include the phrase "进入第三步". Also set currentStage: "summary" in the SAME turn (do not leave currentStage at "stance" / "explore_*" while emitting the completion CTA). Do NOT start Step 3 drafting questions (mechanism, paragraphPlan, logic chain) in Step 2.
   - Do NOT populate paragraphPlan or step3SubpointSteps while step=2.
 `;
       } else if (Number(step) === 3) {
@@ -4120,9 +4669,10 @@ ${memoryDigestStr}
     - DO NOT SPLIT example: "全面禁烟能直接保护非吸烟者免受二手烟危害" -> one benefit, one mechanism = single point.
     - When unsure, prefer treating closely-fused modifiers of a single noun as ONE point; only split when each part could carry its own explanation/example.
 
-  LENGTH BUDGET (decide mode & detail BEFORE writing steps):
+  LENGTH BUDGET (decide mode & detail BEFORE writing steps — planning only):
   - A single IELTS body paragraph targets about 90-110 words total (same budget as Step 2).
   - This whole budget is shared across the total claim (if any) + ALL pointBlocks + optional closing.
+  - CRITICAL — BUDGET APPLIES AT PLANNING ONLY: Use this budget ONLY when you first emit paragraphPlan (mode, major/minor split, step COUNT). FORBIDDEN: shortening, compressing, or "polishing" already-confirmed steps[].value in later turns to meet the budget. If the paragraph is getting long, ask shorter follow-up questions for NEW empty steps — never rewrite old confirmed values.
   - For a MULTI-POINT claim with 2 sub-points, you should usually keep the whole paragraph within ~90-110 words. Therefore:
     1. Prefer ONE 'major' (2-3 steps) + ONE 'minor' (1-2 steps) only when one point is genuinely secondary.
        If both points are clearly co-equal (e.g., two parallel beneficiary groups / two parallel functions) and still controllable in length, you SHOULD keep BOTH as 'major' with concise steps.
@@ -4259,11 +4809,13 @@ ${memoryDigestStr}
        - 若当前 step 是“具体机制”: "这个动因具体是通过什么样的链条/机制起作用的？"
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
     - 学生回答后，先做完整性判断再写入：
-      - 若是 EMPTY：继续问该 step。
-      - 若是 FILLED_SHALLOW：最多追问一次具体化问题（机制/场景/受益人群/结果）；追问后即接受并推进，避免循环。
-      - 若是 FILLED_OK：提炼其内容后写入 \`paragraphPlan.pointBlocks[].steps[].value\`（可润色，但不得新增学生没说过的事实）。
-     - 同时更新扁平 \`step3SubpointSteps\`，让它成为 paragraphPlan 的兼容投影。
-     - 然后推进到下一个尚未填写 value 的 nested step，继续提问。
+      - 若是 EMPTY：继续问该 step；不要写 value，status 留空。
+      - 若是 FILLED_SHALLOW：写入当前 step 的 value，并设 \`status: "draft"\`（可后续更新）。最多追问一次具体化问题（机制/场景/受益人群/结果）；追问后若仍不够，保持 draft 并继续；若已够，升为 confirmed。
+      - 若是 FILLED_OK：写入当前 step 的 value，并设 \`status: "confirmed"\`。允许把学生原话整理得更清楚、更顺口（可合并本 step 相关轮次的补充），但 FORBIDDEN: 改变原意、新增学生没说过的概念/事实、压缩删掉关键推导。已经 \`status: "confirmed"\` 的 earlier steps 一律不得改写。
+     - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，应分别写入两个 slot（均可设 draft 或 confirmed），不要合并。合并时：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括，value 只保留一份不重复内容。
+     - 已经 \`status: "confirmed"\` 的 step 永远不可被合并、删除或吞并。
+     - 同时更新扁平 \`step3SubpointSteps\`（含 status），让它严格成为合并后 paragraphPlan 的兼容投影。
+     - 然后推进到下一个尚未 confirmed 的 nested step，继续提问。
      - 数据回填（best-effort，仅用于向后兼容下游，不可与 paragraphPlan 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`paragraphPlan\` 才是最权威结构。
 
   4. 论证策略建议 (Strategy Recommendation, 在涉及“支撑/举例/机制”类步骤时):
@@ -4271,7 +4823,7 @@ ${memoryDigestStr}
      - 注意区分概念层面的“原理/为什么”与具体层面的“证据/例子”，避免两步内容重叠；若重叠，温和地引导学生拆开。
 
   5. 逻辑闭环展示与诊断报告 (Closure & Diagnostic Report):
-     - 当 \`paragraphPlan.pointBlocks[].steps[]\` 中所有必要步骤的 \`value\` 均已填写完毕（或没有 paragraphPlan 时 \`step3SubpointSteps\` 全部填写完毕），将 \`step3SubpointCompleted\` 设为 true。
+     - 当当前（允许合理合并后的）\`paragraphPlan.pointBlocks[].steps[]\` 中每个保留 slot 的 \`status\` 均为 \`"confirmed"\`，并且原因/机制/影响等本段实际需要的论证要素已经足够完整、充实时，才将 \`step3SubpointCompleted\` 设为 true。若仍有 draft/空槽或关键推导缺口，即使非空也要继续追问。
      - 生成三项具体的诊断检查（JSON properties: 'step3SubpointCompletenessChecks', 'step3SubpointTransitionChecks', 'step3SubpointSufficiencyCheck'）：
        - completenessChecks: 逻辑要素诊断卡——检查 totalClaim（若有）、每个 subClaim、每个 pointBlock 的必要展开是否齐备。
        - transitionChecks: 衔接流畅度诊断——检查 totalClaim -> point1、point1 -> point2，以及每个 pointBlock 内部 nested steps 的过渡。
@@ -4289,12 +4841,14 @@ ${memoryDigestStr}
   - 因此：不要在当前对话里问"我们接着写第二个分论点吧"这类推进问题，也不要把下一个主体段的内容写进当前 \`paragraphPlan\`。当前 \`paragraphPlan\` 只能属于当前 Active Subpoint。
 
   DECIDING COMPLETION:
-  - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段 \`paragraphPlan.pointBlocks[].steps[]\` 的所有必要 \`value\` 均已填满时，才可将其设为 true；只要还有空步骤就必须保持 false。
-  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` is confirmed student content for the board/summary — it must be derived from what the student actually said. Each turn, write \`value\` ONLY for the step the student is answering NOW (the first still-empty step, or that step + the next adjacent step in the SAME pointBlock if one utterance covers both links). Leave all later empty steps empty even if you already know how you would guide them.
-  - CRITICAL — KICKOFF / FIRST PLANNING TURN: When the student has not yet answered any Step 3 question (opening turn), you may emit the paragraphPlan skeleton (mode, pointBlocks, labels, placeholders) but EVERY \`steps[].value\` MUST be an empty string. FORBIDDEN: pre-filling values from your planning draft on the opening turn.
-  - CRITICAL — NO PLACEHOLDER-ECHO (this causes silent premature completion): \`steps[].value\` MUST be the STUDENT's own words from THIS conversation. It is FORBIDDEN to copy your own \`placeholder\`（"例如：..." hint）text into \`value\` — verbatim or with only the "例如：" prefix stripped — for any step the student has not actually answered yet. A step whose \`value\` is empty MUST stay empty (do not pre-fill it with your example) until the student genuinely answers it in the dialogue.
-  - CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \`step3SubpointCompleted: true\`, every planned \`steps[].value\` MUST already contain the student's content (including the final step). FORBIDDEN: emitting a completion summary / "进入第四步" CTA while any step value is still empty OR still just your own placeholder echo — that leaves the right-side board unfinished and hides the jump button.
-  - If the student's current message answers the last empty step, you MUST write that answer into the corresponding \`steps[].value\` in this turn BEFORE marking completed. Do not only acknowledge it in chat text.
+  - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段保留下来的所有 slot 均为 \`status: "confirmed"\`，且左侧教练已确认本段所需的原因/机制/影响等要素足够完整、充实时，才可设为 true；只要还有空步骤、draft 步骤或关键推导缺口就必须保持 false。右侧 paragraphPlan 只同步这项对话判断。
+  - CRITICAL — SLOT STATUS (draft vs confirmed): Every nested step with a non-empty value MUST set \`status\`. Map EMPTY→leave value empty and omit/clear status; FILLED_SHALLOW→\`status: "draft"\` (written, still updatable); FILLED_OK→\`status: "confirmed"\` (argument-ready, frozen). A slot may go EMPTY→confirmed in one turn when the answer is already sufficient. Draft slots may be rewritten later without inventing new facts; confirmed slots are FROZEN unless the student explicitly corrects that step. When polishing or confirming a draft, REPLACE the value on that SAME step key and change its status there; NEVER append the polished rewrite to the next step or pointBlock.
+  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` must be derived from what the student actually said (you may reorganize wording for clarity, but must not change meaning or add new concepts). Each turn, update the first still-unconfirmed target. If one sentence covers two DISTINCT adjacent links, fill both slots (no merge). Merge ONLY when the two slot values would be near-duplicates of the same meaning (retain the target key, remove the next slot, relabel naturally). Leave every genuinely uncovered later step empty.
+  - CRITICAL — KICKOFF / FIRST PLANNING TURN: When the student has not yet answered any Step 3 question (opening turn), you may emit the paragraphPlan skeleton (mode, pointBlocks, labels, placeholders) but EVERY \`steps[].value\` MUST be an empty string and status must not be confirmed. FORBIDDEN: pre-filling values from your planning draft on the opening turn.
+  - CRITICAL — NO PLACEHOLDER-ECHO (this causes silent premature completion): \`steps[].value\` MUST be grounded in the STUDENT's own words from THIS conversation. It is FORBIDDEN to copy your own \`placeholder\`（"例如：..." hint）text into \`value\` — verbatim or with only the "例如：" prefix stripped — for any step the student has not actually answered yet. A step whose \`value\` is empty MUST stay empty (do not pre-fill it with your example) until the student genuinely answers it in the dialogue.
+  - CRITICAL — CONFIRMED VALUE IMMUTABILITY: Once a step has \`status: "confirmed"\` (or a genuine totalClaim is locked), it is FROZEN. Later turns MUST NOT replace it with a shorter paraphrase, summary, or budget-driven compression. Only the student explicitly correcting that step in chat may change it.
+  - CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \`step3SubpointCompleted: true\`, every retained \`steps[]\` MUST already have \`status: "confirmed"\` with genuine content (including the final step). FORBIDDEN: emitting a completion summary / "进入第四步" CTA while any step is empty, draft-only, OR still just your own placeholder echo.
+  - If the student's current message answers the last open step sufficiently, you MUST write that answer and set \`status: "confirmed"\` in this turn BEFORE marking completed. Do not only acknowledge it in chat text.
   - 不要仅凭"方案已规划好/刚开场"就把 \`step3SubpointCompleted\` 或 'isCompleted' 设为 true。规划完成 ≠ 逻辑链填写完成。
   - 'isCompleted'（整个 Step 3 完成）只在你确认所有主体段都各自完成后才可设为 true；否则一律为 false。界面会依据每个主体段的实际填写情况把控整体解锁，不要提前解锁。
   - 如果所有主体段都完成了，在回复最后明确引导：“第三步段落逻辑链构建已全部完成！请点击下方按钮进入第四步：逐句写作练习。”并设 isCompleted = true。
@@ -4400,7 +4954,7 @@ JSON Output Schema rules:
 - You MUST populate "step1Data" / "step2Data" inside "progressUpdate" IN REAL-TIME as the Socratic dialogue progresses.
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "suggestedStance", "suggestedPoints", "blueprint", "onlinePros", "offlinePros", and the three checks (positionCheckPassed, coverageCheckPassed, structureCheckPassed) with descriptions.
-  - For Step 3: "paragraphPlan" is the SINGLE SOURCE OF TRUTH when present. It MUST include mode, diagnosis, optional totalClaim, and pointBlocks with role, expansionStrategy, and nested steps. Each turn, update the relevant nested step's "value" with the student's refined content (live, never just placeholders). Also always emit "step3SubpointSteps" as a flattened compatibility projection of paragraphPlan. The legacy fields ("step3SubpointClaim", "step3SubpointReason", "step3SubpointSupportType", "step3SubpointSupportContent", "step3SubpointImpact", "step3SubpointMechanism", "step3SubpointResult") are OPTIONAL best-effort mirrors for backward-compatibility only; fill them only when a step cleanly maps, and NEVER at the expense of "paragraphPlan". Also keep "step3SubpointCompleted" and "currentSubpointHint" updated. If the student provides multiple parts or the full chain at once, extract all of them into the corresponding pointBlock step values immediately. If they have completed all subpoints, set overall "isCompleted: true".
+  - For Step 3: "paragraphPlan" is the SINGLE SOURCE OF TRUTH when present. It MUST include mode, diagnosis, optional totalClaim, and pointBlocks with role, expansionStrategy, and nested steps. Each nested step with content MUST include \`status\`: "draft" (written, updatable) or "confirmed" (argument-ready, frozen). The LEFT coach dialogue decides completeness; paragraphPlan only mirrors that for the RIGHT board. Each turn, update the current unconfirmed target with content grounded in the student's words (you may reorganize wording, but must not change meaning or add new concepts). When one sentence covers two DISTINCT adjacent links, fill both slots. Merge ONLY when the two values would be near-duplicates. Confirmed slots must never be merged or rewritten. Also always emit "step3SubpointSteps" as a flattened compatibility projection (including status). The legacy fields are OPTIONAL best-effort mirrors. Keep "step3SubpointCompleted" and "currentSubpointHint" updated. If they have completed all subpoints, set overall "isCompleted: true".
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, if you want to provide a suggested logical chain to the right side panel, populate the "currentSubpointHint" field inside "progressUpdate".
@@ -4490,6 +5044,12 @@ Student says:
                                   label: { type: Type.STRING },
                                   placeholder: { type: Type.STRING },
                                   value: { type: Type.STRING },
+                                  status: {
+                                    type: Type.STRING,
+                                    enum: ["draft", "confirmed"],
+                                    description:
+                                      "'draft' = written but still updatable; 'confirmed' = argument-ready and frozen. Omit or leave unset only when value is empty.",
+                                  },
                                 },
                                 required: ["key", "label", "placeholder", "value"],
                               },
@@ -4516,7 +5076,11 @@ Student says:
                         key: { type: Type.STRING },
                         label: { type: Type.STRING },
                         placeholder: { type: Type.STRING },
-                        value: { type: Type.STRING }
+                        value: { type: Type.STRING },
+                        status: {
+                          type: Type.STRING,
+                          enum: ["draft", "confirmed"],
+                        },
                       },
                       required: ["key", "label", "placeholder", "value"]
                     }

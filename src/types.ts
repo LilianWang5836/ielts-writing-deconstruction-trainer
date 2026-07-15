@@ -138,6 +138,8 @@ export interface LogicStep {
   label: string;
   placeholder: string;
   value?: string;
+  /** draft = written but still updatable; confirmed = argument-ready and frozen. */
+  status?: "draft" | "confirmed";
 }
 
 export interface ParagraphPointBlock {
@@ -251,6 +253,8 @@ export interface PracticeSession {
       draft?: string;
       hint?: string;
       isCompleted: boolean;
+      /** Server-authored: whether this body tab may be selected (sequential lock). */
+      selectable?: boolean;
       claim?: string;
       mechanism?: string;
       result?: string;

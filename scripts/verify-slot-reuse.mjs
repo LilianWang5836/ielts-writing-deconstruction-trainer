@@ -278,7 +278,7 @@ console.log("OK: step2 kickoff forbids re-confirming type/coreIssue");
 mustContain("Apply content-completeness boundary here:", "step3 completeness boundary section");
 mustContain("you MUST ask a depth follow-up for missing mechanism/scenario/outcome", "step3 fragment follow-up rule");
 mustContain("If the student already provides mechanism + beneficiary + outcome", "step3 polish allowed rule");
-mustContain("若是 FILLED_SHALLOW：最多追问一次具体化问题", "step3 follow-up-once rule in progression");
+mustContain("若是 FILLED_SHALLOW：写入当前 step 的 value，并设 \\`status: \"draft\"\\`", "step3 follow-up-once rule in progression");
 
 // Step 2 explore sufficiency gating (explore_A + explore_B)
 mustContain("Next Stage Transition (sufficiency-gated):", "explore sufficiency-gated transition header");
@@ -645,7 +645,7 @@ mustNotContain(
 );
 
 // Step 3 length budget + dynamic paragraph mode
-mustContain("LENGTH BUDGET (decide mode & detail BEFORE writing steps):", "step3 length budget header");
+mustContain("LENGTH BUDGET (decide mode & detail BEFORE writing steps — planning only):", "step3 length budget header");
 mustContain("targets about 90-110 words total", "step3 90-110 word budget");
 mustContain(
   "Do NOT mechanically force major+minor for symmetric two-point claims.",
@@ -724,12 +724,16 @@ mustContain("function isStep1SlotsComplete(", "step1 completion: slot checker ex
 mustContain("function enforceStep1SlotCompletion(", "step1 completion: enforce function exists");
 mustContain("function enforceStep3LogicCompletion(", "step3 completion: enforce function exists");
 mustContain(
-  "Backfilled empty paragraphPlan step from user message.",
-  "step3 completion: backfills missed last step from user message",
+  "Backfilled empty target step from student utterance.",
+  "step3 completion: backfills only the previous-board target",
+);
+mustNotContain(
+  "backfillFirstEmptyStepFromUser(",
+  "step3 completion: does not reuse one utterance in the next open slot",
 );
 mustContain(
-  "Cleared premature completion CTA; paragraphPlan still has empty steps.",
-  "step3 completion: clears premature CTA while empty steps remain",
+  "Cleared premature completion CTA; paragraphPlan still has unconfirmed steps.",
+  "step3 completion: clears premature CTA while unconfirmed steps remain",
 );
 mustContain(
   "CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \\`step3SubpointCompleted: true\\`",
@@ -742,7 +746,41 @@ mustContain(
 mustContain("function isSubpointQualityComplete(", "step3 completion: quality gate ignores isCompleted flag");
 mustContain("function isPlaceholderEchoValue(", "step3 completion: placeholder-echo detector exists (server)");
 mustContain("function isGenuineStep3StepValue(", "step3 completion: genuine-value gate combines kickoff + echo checks (server)");
+mustContain(
+  "CONFIRMED VALUE IMMUTABILITY",
+  "step3 prompt: confirmed values are frozen after first genuine fill",
+);
+mustContain(
+  "BUDGET APPLIES AT PLANNING ONLY",
+  "step3 prompt: word budget applies at planning only",
+);
+assert.ok(
+  fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
+    "function mergeStep3ValuePreserveConfirmed(",
+  ),
+  "Missing: step3 merge preserves confirmed step values",
+);
+console.log("OK: step3 merge preserves confirmed step values");
+assert.ok(
+  fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
+    "export function restoreFrozenParagraphPlanValues(",
+  ),
+  "Missing: step3 restore frozen paragraphPlan values helper",
+);
+console.log("OK: step3 restore frozen paragraphPlan values helper");
+mustContain(
+  "restoreFrozenParagraphPlanValues(plan, prevPlan)",
+  "step3 completion: restore frozen values after provenance guard",
+);
 mustContain("function guardStep3ValueProvenance(", "step3 completion: provenance firewall exists (server)");
+mustContain(
+  "Moved a misplaced draft rewrite from the adjacent slot back to the current target.",
+  "step3 provenance: shifted draft rewrite is restored to its target",
+);
+mustContain(
+  "targetValueChanged &&",
+  "step3 provenance: adjacent fill requires target update in the same turn",
+);
 mustContain("function applyStudentAnswerToTargetStep(", "step3 completion: prefers student utterance for target step (server)");
 mustContain("function isSubpointGenuinelyComplete(", "step3 completion: genuine complete requires student dialogue (server)");
 mustContain("function clearAllStep3PlanValues(", "step3 completion: kickoff clears all values (server)");
@@ -764,23 +802,22 @@ mustContain(
 );
 assert.ok(
   fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
-    "export function isPlaceholderEchoValue(",
+    "export function mergeParagraphPlanPreserveBlocks(",
   ),
-  "Missing: step3 completion: placeholder-echo detector exists (client)",
+  "Missing: step3 plan merge: union preserve helper exists",
 );
-console.log("OK: step3 completion: placeholder-echo detector exists (client)");
+console.log("OK: step3 plan merge: union preserve helper exists");
 assert.ok(
-  fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
-    "export function guardStep3ValueProvenance(",
-  ),
-  "Missing: step3 completion: provenance firewall exists (client)",
+  !coachChatSource.includes("mergeParagraphPlanPreserveBlocks(") &&
+    !coachChatSource.includes("guardStep3ValueProvenance(") &&
+    !coachChatSource.includes("isSubpointGenuinelyComplete("),
+  "Step3 client must not merge, guard, or recompute completion",
 );
-console.log("OK: step3 completion: provenance firewall exists (client)");
-assert.ok(
-  coachChatSource.includes("guardStep3ValueProvenance(updatedSp.paragraphPlan, prevPlanSnapshot)"),
-  "Missing: step3 CoachChat: provenance firewall wired after merge",
+console.log("OK: step3 CoachChat trusts server-authored board and progress");
+mustContain(
+  "mergeParagraphPlanPreserveBlocks",
+  "step3 server: union paragraphPlan merge wired",
 );
-console.log("OK: step3 CoachChat: provenance firewall wired after merge");
 mustContain("function finalizeStep3WholeStepCompletion(", "step3 completion: whole-step finalizer exists");
 mustContain("function rewriteStep3AdvanceToNextBody(", "step3 completion: rewrites CTA when other bodies remain");
 mustContain(
@@ -791,37 +828,101 @@ mustContain(
   "Do NOT force-complete Step 3 from CTA text alone.",
   "step3 heuristic: CTA text alone cannot force complete",
 );
+mustContain("function attachStep3UiProgress(", "step3 server: authoritative UI progress exists");
+mustContain("data.progressUpdate.step3Ui = {", "step3 server: emits authoritative UI progress");
+mustContain("areNearDuplicateStep3Values(", "step3 server: adjacent duplicate detector exists");
+mustContain(
+  "function doesStep3AnswerCoverValue(",
+  "step3 server: detects a paraphrased adjacent value covered by one answer",
+);
+mustContain(
+  "function collapseCoveredAdjacentStep3Slots(",
+  "step3 server: collapses adjacent open slots covered by one answer",
+);
+mustContain(
+  "collapseCoveredAdjacentStep3Slots(plan, prevPlan, userMessage)",
+  "step3 server: adaptive slot collapse is wired before completion checks",
+);
+mustContain(
+  "function wereStep3RefsAdjacentInPreviousPlan(",
+  "step3 server: merged-slot index shifts cannot expose a later step",
+);
+mustContain(
+  "ADAPTIVE SLOT MERGE（左侧判断、右侧同步）",
+  "step3 prompt: left coach can merge redundant adjacent right-board slots",
+);
+mustContain(
+  "Merge only when the TWO slot values themselves are near-duplicates.",
+  "step3 server: merge compares two slot values, not userMessage vs next",
+);
+mustContain(
+  "retain the target key, remove the next slot",
+  "step3 prompt: merged slot keeps a stable key",
+);
+mustContain(
+  "function resolveStep3StepConfirmation(",
+  "step3 server: confirm gate demotes invalid confirmed proposals",
+);
+mustContain(
+  "resolveStep3StepConfirmation(plan, activeSp, userMessage)",
+  "step3 server: confirm gate wired before completion checks",
+);
+mustContain(
+  "CRITICAL — SLOT STATUS (draft vs confirmed)",
+  "step3 prompt: draft vs confirmed slot status contract",
+);
+mustContain(
+  "REPLACE the value on that SAME step key",
+  "step3 prompt: draft confirmation must overwrite the same slot",
+);
+mustContain(
+  'enum: ["draft", "confirmed"]',
+  "step3 schema: status enum draft/confirmed on nested steps",
+);
 assert.ok(
   fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
-    "export function isStep3FullyComplete(",
+    "export function isStep3Confirmed(",
   ),
-  "Missing: step3 client: isStep3FullyComplete quality unlock",
+  "Missing: step3Quality: confirmed helper exists",
 );
-console.log("OK: step3 client: isStep3FullyComplete quality unlock");
-assert.ok(
-  step3DraftingSource.includes(
-    "const isStep3Finished = isStep3FullyComplete(session, subpoints);",
-  ),
-  "Missing: step3 UI: jump button uses quality-filled gate",
+console.log("OK: step3Quality: confirmed helper exists");
+mustContain(
+  "Backfilled empty target step from student utterance.",
+  "step3 completion: empty-target backfill only (no force overwrite of draft)",
 );
-console.log("OK: step3 UI: jump button uses quality-filled gate");
 assert.ok(
   fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
-    "export function isSubpointGenuinelyComplete(",
+    'block.steps.every((step: any) => isStep3Confirmed(step))',
   ),
-  "Missing: step3 client: genuine complete requires student dialogue",
+  "Missing: quality-filled requires confirmed status",
 );
-console.log("OK: step3 client: genuine complete requires student dialogue");
+console.log("OK: quality-filled requires confirmed status");
 assert.ok(
-  coachChatSource.includes("clearAllStep3PlanValues(updatedSp.paragraphPlan)"),
-  "Missing: step3 CoachChat: kickoff clears plan values",
+  fs.readFileSync(path.join(repoRoot, "src/types.ts"), "utf8").includes(
+    'status?: "draft" | "confirmed"',
+  ),
+  "Missing: LogicStep status field on types",
 );
-console.log("OK: step3 CoachChat: kickoff clears plan values");
+console.log("OK: LogicStep status field on types");
 assert.ok(
-  coachChatSource.includes("isSubpointGenuinelyComplete(withDraft"),
-  "Missing: step3 CoachChat: revalidates every body with dialogue gate",
+  step3DraftingSource.includes("const isStep3Finished = !!session.step3.isCompleted") &&
+    !step3DraftingSource.includes("inferExpectedStep3BodyCount") &&
+    !step3DraftingSource.includes("canSelectSubpoint"),
+  "Step3Drafting must render server-authored progress without recomputing it",
 );
-console.log("OK: step3 CoachChat: revalidates every body with dialogue gate");
+console.log("OK: step3 UI renders server-authored completion and selectability");
+assert.ok(
+  !step3DraftingSource.includes("进入第四步：逐句写作练习"),
+  "Should be absent: step3 right-footer duplicate jump CTA",
+);
+console.log("OK: step3 right-footer duplicate jump CTA removed");
+assert.ok(
+  coachChatSource.includes("const step3Ui = data.progressUpdate.step3Ui") &&
+    coachChatSource.includes("isCompleted: !!uiBody.isCompleted") &&
+    coachChatSource.includes("selectable: !!uiBody.selectable"),
+  "Step3 CoachChat must synchronize server-authored UI status",
+);
+console.log("OK: step3 CoachChat synchronizes server-authored UI status");
 mustContain(
   "Only unlock Step 1 completion when slots are filled AND the coach already",
   "step1 completion: enforce requires completion CTA, not slots alone",
@@ -852,6 +953,14 @@ mustContain(
   "step2 completion: enforce gate exists",
 );
 mustContain(
+  "function isStep2BlueprintContentComplete(",
+  "step2 completion: content-gate helper exists",
+);
+mustContain(
+  "Content-gate unlock: corrected stage",
+  "step2 completion: content-gate corrects stuck stage to summary",
+);
+mustContain(
   "enforceStep2Completion(data, session)",
   "step2 completion: enforce wired after heuristic",
 );
@@ -859,6 +968,25 @@ mustContain(
   "[Step2CompletionGuard] Cleared premature isCompleted",
   "step2 completion: clears premature isCompleted mid-explore",
 );
+mustContain(
+  'set currentStage: "summary" in the SAME turn',
+  "step2 prompt: require currentStage=summary with completion CTA",
+);
+mustContain(
+  "left-side 【立即跳转】",
+  "step2 prompt: CTA points to left jump button",
+);
+assert.ok(
+  step2BrainstormSource.includes("const showNextStepButton = useMemo"),
+  "Missing: step2 UI jump button uses showNextStepButton content gate",
+);
+console.log("OK: step2 UI jump button uses showNextStepButton content gate");
+assert.ok(
+  step2BrainstormSource.includes("进入第三步"),
+  "Missing: step2 UI detects 进入第三步 CTA for stuck-session unlock",
+);
+console.log("OK: step2 UI detects 进入第三步 CTA for stuck-session unlock");
+
 mustContain(
   "function findUndevelopedNumberedSibling(",
   "step2 retention: deterministic numbered-sibling fallback exists",
@@ -1344,7 +1472,7 @@ assert.ok(
 );
 console.log("OK: step2 stepper has 3-stage variant for no-stance essays");
 
-// Step 3: kickoff isolation + quality-filled gate + sequential body lock
+// Step 3: kickoff isolation + server-authored UI progress
 mustContain("function isKickoffOrInstructionText(", "step3 kickoff pollution detector exists");
 mustContain("function isValidStep3StepValue(", "step3 valid step value gate exists");
 mustContain("function sanitizeParagraphPlanValues(", "step3 sanitize paragraphPlan values exists");
@@ -1354,16 +1482,22 @@ mustContain(
   "step3 guard skips backfill on hidden kickoff",
 );
 assert.ok(
-  step3DraftingSource.includes("canSelectSubpoint"),
-  "Missing: Step3Drafting sequential body lock",
+  step3DraftingSource.includes("sp.selectable !== false") &&
+    step3DraftingSource.includes("subpoint.selectable !== false"),
+  "Missing: Step3Drafting renders server-authored selectable state",
 );
-console.log("OK: Step3Drafting sequential body lock");
+console.log("OK: Step3Drafting renders server-authored selectable state");
 assert.ok(
-  fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
-    "export function canSelectSubpoint",
-  ),
-  "Missing: step3Quality utils module",
+  !step3DraftingSource.includes("step.placeholder") &&
+    !step3DraftingSource.includes("等待上一步构建完成后开启"),
+  "Step3 right panel must not render model placeholder demo text",
 );
-console.log("OK: step3Quality utils module");
+console.log("OK: Step3 right panel hides placeholder demo text for empty steps");
+assert.ok(
+  !step3DraftingSource.includes("canSelectSubpoint") &&
+    !coachChatSource.includes("isStep3FullyComplete"),
+  "Step3 client must not contain progress decision helpers",
+);
+console.log("OK: Step3 client contains no progress decision helpers");
 
 console.log("\nAll slot-reuse/static-guard assertions passed.");
