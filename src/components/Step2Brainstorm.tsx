@@ -458,23 +458,43 @@ ${topic.question}
             <div className="space-y-5 animate-fade-in">
               {/* Socratic Stage Progress Indicator */}
               {(() => {
-                // requiresStance is stamped server-side every Step2 turn (applyNoStanceGate);
-                // default to true (show 4 stages) until the server has told us otherwise,
-                // so we never hide a stage the essay might actually need.
+                // requiresStance / taskLabelA/B are stamped server-side every Step2 turn
+                // (stampStep2TaskBrief / applyNoStanceGate) from questionBrief.taskMap.
                 const requiresStance = (evalData as any)?.requiresStance !== false;
+                const taskLabelA = String((evalData as any)?.taskLabelA || '').trim();
+                const taskLabelB = String((evalData as any)?.taskLabelB || '').trim();
+                const labelA = taskLabelA || (requiresStance ? '支持面' : '第一任务');
+                const labelB = taskLabelB || (requiresStance ? '让步/对立面' : '第二任务');
                 const stages = requiresStance
                   ? [
-                      { id: 'explore_A', label: '1. A面优势' },
-                      { id: 'explore_B', label: '2. B面不可替代' },
+                      { id: 'explore_A', label: `1. ${labelA}` },
+                      { id: 'explore_B', label: `2. ${labelB}` },
                       { id: 'stance', label: '3. 明确立场' },
                       { id: 'summary', label: '4. 蓝图生成' },
                     ]
                   : [
-                      { id: 'explore_A', label: '1. 第一任务' },
-                      { id: 'explore_B', label: '2. 第二任务' },
+                      { id: 'explore_A', label: `1. ${labelA || '第一任务'}` },
+                      { id: 'explore_B', label: `2. ${labelB || '第二任务'}` },
                       { id: 'summary', label: '3. 蓝图生成' },
                     ];
+                const dispositions = Array.isArray((evalData as any)?.dimensionDispositions)
+                  ? ((evalData as any).dimensionDispositions as {
+                      dimension: string;
+                      disposition: string;
+                      mergedInto?: string;
+                      note?: string;
+                    }[])
+                  : [];
+                const dispositionLabel = (d: string) =>
+                  d === 'expanded'
+                    ? '已展开'
+                    : d === 'merged'
+                      ? '已整合'
+                      : d === 'dropped'
+                        ? '已放下'
+                        : '待处理';
                 return (
+              <>
               <div className={`grid ${requiresStance ? 'grid-cols-4' : 'grid-cols-3'} gap-1.5 text-center bg-slate-50 border border-slate-200/50 p-2.5 rounded-xl`}>
                 {stages.map((st) => {
                   const currentStage = (evalData as any)?.currentStage || 'explore_A';
@@ -487,7 +507,8 @@ ${topic.question}
                   return (
                     <div
                       key={st.id}
-                      className={`py-1 px-1 rounded text-[10px] font-bold transition-all border ${
+                      title={st.label}
+                      className={`py-1 px-1 rounded text-[10px] font-bold transition-all border truncate ${
                         isCompleted
                           ? 'bg-emerald-50 text-emerald-800 border-emerald-250/50'
                           : isCurrent
@@ -500,6 +521,45 @@ ${topic.question}
                   );
                 })}
               </div>
+              {dispositions.length > 0 && (
+                <div className="mt-2 rounded-lg border border-slate-200/70 bg-white px-2.5 py-2">
+                  <p className="mb-1.5 text-[10px] font-bold text-slate-500">
+                    Step1 角度处置（展开 / 整合 / 放下）
+                  </p>
+                  <ul className="space-y-1">
+                    {dispositions.map((d, i) => (
+                      <li
+                        key={`${d.dimension}-${i}`}
+                        className="flex items-start justify-between gap-2 text-[10px] text-slate-700"
+                      >
+                        <span className="min-w-0 flex-1 truncate font-medium" title={d.dimension}>
+                          {d.dimension}
+                          {d.disposition === 'merged' && d.mergedInto
+                            ? ` → ${d.mergedInto}`
+                            : ''}
+                          {d.disposition === 'dropped' && d.note
+                            ? `（${d.note}）`
+                            : ''}
+                        </span>
+                        <span
+                          className={
+                            d.disposition === 'expanded'
+                              ? 'shrink-0 font-bold text-emerald-700'
+                              : d.disposition === 'merged'
+                                ? 'shrink-0 font-bold text-sky-700'
+                                : d.disposition === 'dropped'
+                                  ? 'shrink-0 font-bold text-slate-500'
+                                  : 'shrink-0 font-bold text-amber-700'
+                          }
+                        >
+                          {dispositionLabel(d.disposition)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              </>
                 );
               })()}
 

@@ -337,6 +337,144 @@ export function applyStudentAnswerToTargetStep(
   return true;
 }
 
+export function isStep3AffirmativeConfirmation(msg: string): boolean {
+  const t = String(msg || "").trim();
+  return /^(对|是|是的|对的|好的|好|嗯|没问题|可以|确认|就是这个意思|符合我的意思|ok|okay|yes)[。.!！]?$/i.test(
+    t,
+  );
+}
+
+function isSubstantiveStep3AnswerLocal(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (t.length < 4) return false;
+  if (isKickoffOrInstructionText(t)) return false;
+  return !/^(对|是|是的|对的|好的|嗯|明白|好|继续|下一步|ok|okay|yes)$/i.test(t);
+}
+
+function isConfirmContentSubstantiveLocal(value: string): boolean {
+  const t = String(value || "").trim();
+  if (t.length < 8) return false;
+  return isSubstantiveStep3AnswerLocal(t);
+}
+
+/**
+ * Auto-promote a draft target the model itself never flipped to confirmed.
+ * Two acceptance signals, either one is enough:
+ *  A) the student explicitly affirms it ("对/可以/没问题"...), or
+ *  B) the target's value is left untouched this turn AND the conversation
+ *     genuinely advanced — a LATER step in the same block newly gained
+ *     genuine content — implying nobody objected and work moved on.
+ * Reuses the same substantive-content bar as resolveStep3StepConfirmation so
+ * a thin/off-topic draft is never frozen just because the student moved on.
+ */
+export function promoteAcknowledgedStep3DraftTarget(
+  plan: any,
+  prevPlan: any,
+  userMessage: string,
+): number {
+  if (!plan || !prevPlan || !Array.isArray(plan.pointBlocks)) return 0;
+  const refs = collectStep3PlanRefs(prevPlan);
+  let targetIdx = -1;
+  for (let i = 0; i < refs.length; i++) {
+    if (!isStep3RefFilled(prevPlan, refs[i])) {
+      targetIdx = i;
+      break;
+    }
+  }
+  if (targetIdx < 0) return 0;
+  const ref = refs[targetIdx];
+  if (ref.kind !== "step") return 0;
+
+  const prevStep = prevPlan.pointBlocks?.[ref.blockIndex]?.steps?.[ref.stepIndex];
+  if (!isGenuineStep3StepValue(prevStep)) return 0;
+
+  const block = plan.pointBlocks?.[ref.blockIndex];
+  const nowStep = block?.steps?.[ref.stepIndex];
+  if (!nowStep || isStep3Confirmed(nowStep) || !isGenuineStep3StepValue(nowStep)) {
+    return 0;
+  }
+
+  const valueUnchanged =
+    normalizeForEchoCompare(String(nowStep.value || "")) ===
+    normalizeForEchoCompare(String(prevStep.value || ""));
+  const studentAffirmed = isStep3AffirmativeConfirmation(userMessage);
+
+  const prevSiblingSteps = Array.isArray(prevPlan.pointBlocks?.[ref.blockIndex]?.steps)
+    ? prevPlan.pointBlocks[ref.blockIndex].steps
+    : [];
+  const nowSiblingSteps = Array.isArray(block?.steps) ? block.steps : [];
+  let laterStepAdvanced = false;
+  for (let i = ref.stepIndex + 1; i < nowSiblingSteps.length; i++) {
+    if (
+      !isGenuineStep3StepValue(prevSiblingSteps[i]) &&
+      isGenuineStep3StepValue(nowSiblingSteps[i])
+    ) {
+      laterStepAdvanced = true;
+      break;
+    }
+  }
+
+  if (!studentAffirmed && !(valueUnchanged && laterStepAdvanced)) return 0;
+  if (!isConfirmContentSubstantiveLocal(String(nowStep.value || ""))) return 0;
+
+  nowStep.status = "confirmed";
+  return 1;
+}
+
+/** Flat-array counterpart of promoteAcknowledgedStep3DraftTarget (no paragraphPlan). */
+export function promoteAcknowledgedFlatStep3Target(
+  steps: any[],
+  prevSteps: any[],
+  userMessage: string,
+): number {
+  if (!Array.isArray(steps) || steps.length === 0) return 0;
+  const prevByKey: Record<string, any> = {};
+  (prevSteps || []).forEach((s: any, idx: number) => {
+    prevByKey[String(s?.key || idx)] = s;
+  });
+
+  let targetIdx = -1;
+  for (let i = 0; i < steps.length; i++) {
+    const key = String(steps[i]?.key || i);
+    const prev = prevByKey[key] || (prevSteps || [])[i];
+    if (!isStep3Confirmed(prev)) {
+      targetIdx = i;
+      break;
+    }
+  }
+  if (targetIdx < 0) return 0;
+
+  const key = String(steps[targetIdx]?.key || targetIdx);
+  const prevStep = prevByKey[key] || (prevSteps || [])[targetIdx];
+  if (!isGenuineStep3StepValue(prevStep)) return 0;
+
+  const nowStep = steps[targetIdx];
+  if (!nowStep || isStep3Confirmed(nowStep) || !isGenuineStep3StepValue(nowStep)) {
+    return 0;
+  }
+
+  const valueUnchanged =
+    normalizeForEchoCompare(String(nowStep.value || "")) ===
+    normalizeForEchoCompare(String(prevStep.value || ""));
+  const studentAffirmed = isStep3AffirmativeConfirmation(userMessage);
+
+  let laterStepAdvanced = false;
+  for (let i = targetIdx + 1; i < steps.length; i++) {
+    const k = String(steps[i]?.key || i);
+    const prevSib = prevByKey[k] || (prevSteps || [])[i];
+    if (!isGenuineStep3StepValue(prevSib) && isGenuineStep3StepValue(steps[i])) {
+      laterStepAdvanced = true;
+      break;
+    }
+  }
+
+  if (!studentAffirmed && !(valueUnchanged && laterStepAdvanced)) return 0;
+  if (!isConfirmContentSubstantiveLocal(String(nowStep.value || ""))) return 0;
+
+  steps[targetIdx] = { ...nowStep, status: "confirmed" };
+  return 1;
+}
+
 /** Once status=confirmed, value+status are frozen — later model rewrites ignored. */
 function mergeStep3ValuePreserveConfirmed(prev: any, next: any): {
   value: string;
@@ -449,12 +587,21 @@ export function restoreFrozenParagraphPlanValues(plan: any, prevPlan: any): numb
       (b: any) => b?.id && prevBlock?.id && String(b.id) === String(prevBlock.id),
     );
     if (!match || !Array.isArray(prevBlock.steps)) continue;
+    if (!Array.isArray(match.steps)) match.steps = [];
     const prevSteps = prevBlock.steps;
-    const nextSteps = Array.isArray(match.steps) ? match.steps : [];
-    for (const prevStep of prevSteps) {
-      if (!prevStep?.key || !isStep3Confirmed(prevStep)) continue;
+    const nextSteps = match.steps;
+    prevSteps.forEach((prevStep: any, prevIndex: number) => {
+      if (!prevStep?.key || !isStep3Confirmed(prevStep)) return;
       const nextStep = nextSteps.find((s: any) => String(s?.key) === String(prevStep.key));
-      if (!nextStep) continue;
+      if (!nextStep) {
+        // The model's new turn dropped this key entirely (e.g. flat-chain
+        // re-wrap or a re-generated block). A confirmed slot must never
+        // silently vanish — re-insert it at its previous position.
+        const insertAt = Math.min(prevIndex, nextSteps.length);
+        nextSteps.splice(insertAt, 0, { ...prevStep });
+        restored += 1;
+        return;
+      }
       const prevVal = String(prevStep.value || "");
       const nowVal = String(nextStep.value || "");
       const statusChanged = normalizeStep3Status(nextStep.status) !== "confirmed";
@@ -467,7 +614,7 @@ export function restoreFrozenParagraphPlanValues(plan: any, prevPlan: any): numb
         nextStep.status = "confirmed";
         restored += 1;
       }
-    }
+    });
   }
 
   if (restored > 0 && typeof console !== "undefined") {
@@ -658,4 +805,179 @@ export function isStep3FullyComplete(session: any, subpoints: any[]): boolean {
   const expected = inferExpectedStep3BodyCount(session);
   if (expected > 0 && subpoints.length < expected) return false;
   return subpoints.every((sp) => isSubpointGenuinelyComplete(sp));
+}
+
+/** Required argument beats per Step-2 argumentRelation (design-time table). */
+export const ARGUMENT_RELATION_BEATS: Record<string, string[]> = {
+  supports: [],
+  elaborates: [],
+  concedes: [
+    "承认反面确实存在",
+    "说明为何该反面不足以推翻整体立场",
+  ],
+  compares: [
+    "说明双方各自情况",
+    "指出关键差异",
+    "得出孰优孰劣",
+  ],
+  solves: [
+    "说明问题或不足",
+    "提出具体方案",
+    "论证方案为何有效",
+  ],
+};
+
+export function resolveArgumentRelation(frameworkOrSubpoint: any): string {
+  const rel = String(
+    frameworkOrSubpoint?.argumentRelation ||
+      frameworkOrSubpoint?.stanceRelation ||
+      "",
+  ).trim();
+  if (rel && Object.prototype.hasOwnProperty.call(ARGUMENT_RELATION_BEATS, rel)) {
+    return rel;
+  }
+  return "";
+}
+
+export function getRequiredBeatsForRelation(relation: string): string[] {
+  const key = String(relation || "").trim();
+  if (!key) return [];
+  return ARGUMENT_RELATION_BEATS[key] ? [...ARGUMENT_RELATION_BEATS[key]] : [];
+}
+
+/** Whole-essay fingerprint that invalidates Step 3 when Step 2 converge changes. */
+export function computeEssayFrameworkSignature(session: any): string {
+  const clustering =
+    session?.step2?.coachEvaluation?.clustering || session?.step2?.clustering || {};
+  const blueprint =
+    session?.step2?.coachEvaluation?.blueprint || session?.step2?.blueprint || {};
+  const stance = String(
+    session?.step2?.coachEvaluation?.userStance ||
+      session?.step2?.userStance ||
+      blueprint?.position ||
+      "",
+  ).trim();
+  const bodyCount = String(
+    clustering?.bodyCount || blueprint?.bodyCount || "",
+  ).trim();
+  const layout = String(
+    clustering?.layoutPattern || blueprint?.layoutPattern || "",
+  ).trim();
+  const clusterSig = (Array.isArray(clustering?.clusters) ? clustering.clusters : [])
+    .map((c: any) =>
+      [
+        String(c?.targetBody || "").trim(),
+        String(c?.paragraphDensity || "").trim(),
+        resolveArgumentRelation(c),
+        Array.isArray(c?.points)
+          ? c.points.map((p: any) => String(p || "").trim()).filter(Boolean).join("|")
+          : "",
+      ].join("~"),
+    )
+    .join(";");
+  return [stance, bodyCount, layout, clusterSig].join("::");
+}
+
+/** Stable fingerprint for Step 2 → Step 3 body framework handoff. */
+export function computeSubpointFrameworkSignature(
+  subpoint: any,
+  session?: any,
+): string {
+  if (!subpoint) return "";
+  const roles = Array.isArray(subpoint.pointRoles)
+    ? subpoint.pointRoles
+        .map(
+          (r: any) =>
+            `${String(r?.point || "").trim()}:${String(r?.role || "").trim()}`,
+        )
+        .filter(Boolean)
+        .join(";")
+    : "";
+  const points = Array.isArray(subpoint.points)
+    ? subpoint.points.map((p: any) => String(p || "").trim()).filter(Boolean).join("|")
+    : "";
+  const essaySig = session ? computeEssayFrameworkSignature(session) : "";
+  return [
+    String(subpoint.id || "").trim(),
+    String(subpoint.content || "").trim(),
+    String(subpoint.targetBody || "").trim(),
+    String(subpoint.paragraphDensity || "").trim(),
+    resolveArgumentRelation(subpoint),
+    String(subpoint.stanceRelation || "").trim(),
+    roles,
+    points,
+    essaySig,
+  ].join("::");
+}
+
+/** @deprecated Prefer beat coverage via ARGUMENT_RELATION_BEATS; kept for label heuristics. */
+export function isConcessionStepLabel(label: string): boolean {
+  const t = String(label || "").trim();
+  if (!t) return false;
+  return /让步|限制|缓解|削弱|反驳|转折|局限|可克服|可缓解|concession|rebuttal|limitation|mitig/i.test(
+    t,
+  );
+}
+
+/** Whether a step label/value covers a required argument beat (semantic fuzzy match). */
+export function stepCoversArgumentBeat(
+  step: { label?: string; key?: string; value?: string; placeholder?: string },
+  beat: string,
+): boolean {
+  const beatText = String(beat || "").trim();
+  if (!beatText) return false;
+  const hay = [
+    step?.label,
+    step?.key,
+    step?.value,
+    step?.placeholder,
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  if (!hay) return false;
+
+  const beatNorm = beatText.replace(/\s+/g, "").toLowerCase();
+  const hayNorm = hay.replace(/\s+/g, "").toLowerCase();
+  if (hayNorm.includes(beatNorm) || beatNorm.includes(hayNorm)) return true;
+
+  // Keyword families per known beat (generic, not concession-only).
+  const families: Array<{ beatRe: RegExp; stepRe: RegExp }> = [
+    {
+      beatRe: /承认|反面|对立|确实存在/,
+      stepRe: /承认|让步|反面|对立|确实|存在|对方|另一面/,
+    },
+    {
+      beatRe: /不足以|推翻|整体立场|削弱|限制|缓解/,
+      stepRe: /不足以|推翻|削弱|限制|缓解|局限|可克服|转折|反驳|mitig|limit|rebut/i,
+    },
+    {
+      beatRe: /双方|对比|各自/,
+      stepRe: /双方|对比|比较|各自|对照|compare/i,
+    },
+    {
+      beatRe: /差异|差别/,
+      stepRe: /差异|差别|不同|区别|difference/i,
+    },
+    {
+      beatRe: /孰优|孰劣|更优|更好|结论/,
+      stepRe: /孰优|孰劣|更优|更好|结论|综合|权衡|prefer/i,
+    },
+    {
+      beatRe: /问题|不足/,
+      stepRe: /问题|不足|缺陷|痛点|problem|gap/i,
+    },
+    {
+      beatRe: /方案|措施|解决/,
+      stepRe: /方案|措施|解决|对策|solution|remed/i,
+    },
+    {
+      beatRe: /为何有效|有效性|论证方案/,
+      stepRe: /有效|为何|可行性|效果|work|effect/i,
+    },
+  ];
+  for (const f of families) {
+    if (f.beatRe.test(beatText) && f.stepRe.test(hay)) return true;
+  }
+  return false;
 }

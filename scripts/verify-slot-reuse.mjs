@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const serverPath = path.join(repoRoot, "server.ts");
 const step3DraftingPath = path.join(repoRoot, "src/components/Step3Drafting.tsx");
+const step3QualityPath = path.join(repoRoot, "src/utils/step3Quality.ts");
 const step2BrainstormPath = path.join(repoRoot, "src/components/Step2Brainstorm.tsx");
 const source = fs.readFileSync(serverPath, "utf8");
 const step3DraftingSource = fs.readFileSync(step3DraftingPath, "utf8");
+const step3QualitySource = fs.readFileSync(step3QualityPath, "utf8");
 const step2BrainstormSource = fs.readFileSync(step2BrainstormPath, "utf8");
 
 function mustContain(snippet, label) {
@@ -62,7 +64,10 @@ mustContain(
 // Step 1 slot checklist + cross-slot example
 mustContain("## Step 1 Slot Checklist (按缺口推进，不重复提问)", "step1 slot checklist");
 mustContain("Cross-slot extraction is mandatory", "step1 cross-slot extraction instruction");
-mustContain("线上教育是否会完全替代传统课堂", "step1 entirely skip example (mirrors real case)");
+mustContain(
+  "是否要在公共场所完全禁止吸烟",
+  "step1 entirely/all skip example (mirrors real case)",
+);
 mustContain(
   "Per-slot feedback — no spoiler (CRITICAL):",
   "step1 per-slot no-spoiler feedback rule",
@@ -98,7 +103,7 @@ mustContain(
   "step1 dimensions anti-fabrication rule header",
 );
 mustContain(
-  "You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach the 2~4 target count.",
+  "You MUST NOT invent an ADDITIONAL dimension the student never mentioned or implied just to reach a target count.",
   "step1 dimensions anti-fabrication hard rule",
 );
 mustContain(
@@ -114,11 +119,11 @@ mustContain(
   "step1 dimensions anti-fabrication violation example",
 );
 mustContain(
-  "Sufficiency gate: if the student's message truly yields only ONE genuine dimension, do NOT fabricate a second one and do NOT mark the step complete yet",
+  "AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student",
   "step1 dimensions sufficiency gate forbids premature completion",
 );
 mustContain(
-  "at most ONE such follow-up for this slot; after that, accept whatever the student gives",
+  "each dimension gets at most ONE probe",
   "step1 dimensions follow-up is anti-loop bounded",
 );
 mustContain(
@@ -126,8 +131,8 @@ mustContain(
   "step1 dimensions feedback proportionality rule",
 );
 mustContain(
-  "suggestedDimensions has only 1 genuine dimension so far after both tasks -> use the sufficiency-gate follow-up above",
-  "step1 dimensions missing-slot template covers single-dimension case",
+  "suggestedDimensions has fewer than 3 effective dimensions so far -> ask for another NEW angle with no exit option yet",
+  "step1 dimensions missing-slot template covers under-3 effective case",
 );
 
 // Step 1 board-authority + continuation-signal routing
@@ -278,7 +283,7 @@ console.log("OK: step2 kickoff forbids re-confirming type/coreIssue");
 mustContain("Apply content-completeness boundary here:", "step3 completeness boundary section");
 mustContain("you MUST ask a depth follow-up for missing mechanism/scenario/outcome", "step3 fragment follow-up rule");
 mustContain("If the student already provides mechanism + beneficiary + outcome", "step3 polish allowed rule");
-mustContain("若是 FILLED_SHALLOW：写入当前 step 的 value，并设 \\`status: \"draft\"\\`", "step3 follow-up-once rule in progression");
+mustContain("若是 EMPTY / FILLED_SHALLOW：mode=expand", "step3 follow-up-once rule in progression");
 
 // Step 2 explore sufficiency gating (explore_A + explore_B)
 mustContain("Next Stage Transition (sufficiency-gated):", "explore sufficiency-gated transition header");
@@ -297,8 +302,8 @@ mustContain(
   "explore_A sufficient no-reask branch",
 );
 mustContain(
-  "If questionBrief.requiresStance=true: Set currentStage: \"stance\".",
-  "explore_B sufficient → stance when requiresStance",
+  "If questionBrief.requiresStance=true: Set currentStage: \"stance\" AND immediately",
+  "explore_B sufficient → immediate stance recommendation when requiresStance",
 );
 mustContain(
   "If questionBrief.requiresStance=false: Set currentStage: \"summary\" (skip stance entirely)",
@@ -614,7 +619,7 @@ mustContain(
   "step1 hard-qualifier gate in prompt",
 );
 mustContain(
-  'If questionBrief.hasHardQualifiers=false: do NOT ask the constraints question',
+  "If questionBrief.hasHardQualifiers=false AND the student did not echo any qualifier: do NOT ask the constraints question",
   "step1 skips constraints when no hard qualifiers",
 );
 mustContain(
@@ -622,8 +627,16 @@ mustContain(
   "step1 completion preview is structural only",
 );
 mustContain(
-  'FORBIDDEN: recommending which stance option is safer/better/more common (e.g. "多数稳妥路径是弊大于利" / "建议选③")',
-  "step2 stance forbids recommending a preferred stance",
+  "Coach recommendation first (CRITICAL)",
+  "step2 stance recommends a preferred stance from prior evidence",
+);
+mustContain(
+  "The recommendation must be evidence-based from THIS student's brainstorm.",
+  "step2 stance recommendation cannot invent supporting arguments",
+);
+mustContain(
+  'Set currentStage: "stance" AND immediately apply the stance-stage "Coach recommendation first" rule',
+  "step2 explore-B transition recommends stance without an empty extra turn",
 );
 mustContain(
   "Candidate directions MUST be neutral: do NOT imply which direction is easier, safer, or higher-scoring",
@@ -671,6 +684,34 @@ mustContain(
 mustContain(
   "Active Subpoint belongs to:",
   "step3 context: active body targetBody in ContextSummary",
+);
+mustContain(
+  "ESSAY FRAMEWORK METADATA (INTERNAL",
+  "step2 summary: emits internal essay framework for Step 3",
+);
+mustContain(
+  "paragraphDensity",
+  "step2 schema: paragraphDensity on clustering clusters",
+);
+mustContain(
+  "stanceRelation",
+  "step2 schema: stanceRelation on clustering clusters",
+);
+mustContain(
+  "STEP 0 — INHERIT STEP 2 ESSAY FRAMEWORK",
+  "step3 prompt: inherits Step 2 body framework",
+);
+mustContain(
+  "function resolveStep2BodyFrameworkForSubpoint(",
+  "step3 server: resolves Step 2 framework for active subpoint",
+);
+mustContain(
+  "Step 2 Body Framework for Active Subpoint",
+  "step3 context: Step 2 body framework in ContextSummary",
+);
+mustContain(
+  "[inherited-step2-framework]",
+  "step3 prompt: tags inherited framework in diagnosis",
 );
 mustContain("function recommendParagraphMode(", "step3 mode: recommendParagraphMode exists");
 mustContain("function applyParagraphModeCorrection(", "step3 mode: applyParagraphModeCorrection exists");
@@ -724,16 +765,48 @@ mustContain("function isStep1SlotsComplete(", "step1 completion: slot checker ex
 mustContain("function enforceStep1SlotCompletion(", "step1 completion: enforce function exists");
 mustContain("function enforceStep3LogicCompletion(", "step3 completion: enforce function exists");
 mustContain(
-  "Backfilled empty target step from student utterance.",
-  "step3 completion: backfills only the previous-board target",
+  "function enforceConfirmedOnlySlots(",
+  "step3 completion: confirmed-only board clears unconfirmed model prefills",
+);
+mustContain(
+  "function commitPendingOnAffirm(",
+  "step3 completion: unique write entry commits pending only on affirm",
+);
+mustContain(
+  "function evaluateSlotDraft(",
+  "step3 completion: evaluateSlotDraft demoted to hard-check helper only",
+);
+mustContain(
+  "MUST NOT stage pending or own student-facing asks",
+  "step3 completion: evaluateSlotDraft must not stage pending",
+);
+mustContain(
+  "Staged pending from step3SlotEval",
+  "step3 completion: pending staged from step3SlotEval only",
+);
+mustContain(
+  "no server heuristic stage",
+  "step3 completion: no server heuristic stage for firstEmpty",
+);
+mustContain(
+  "isDraftNearDuplicateOfConfirmedSiblings(",
+  "step3 completion: rejects drafts that near-duplicate confirmed siblings",
+);
+mustContain(
+  "kept model next-slot ask; aligned expand state",
+  "step3 completion: after affirm keeps model ask when legal",
+);
+mustContain(
+  "vetoed illegal next-ask text; short firstEmpty ask",
+  "step3 completion: after affirm vetoes illegal next-ask",
+);
+mustContain(
+  "Step2-only must not auto-qualify",
+  "step3 completion: evaluateSlotDraft requires student utterance (not Step2 alone)",
 );
 mustNotContain(
   "backfillFirstEmptyStepFromUser(",
   "step3 completion: does not reuse one utterance in the next open slot",
-);
-mustContain(
-  "Cleared premature completion CTA; paragraphPlan still has unconfirmed steps.",
-  "step3 completion: clears premature CTA while unconfirmed steps remain",
 );
 mustContain(
   "CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \\`step3SubpointCompleted: true\\`",
@@ -769,29 +842,205 @@ assert.ok(
 );
 console.log("OK: step3 restore frozen paragraphPlan values helper");
 mustContain(
-  "restoreFrozenParagraphPlanValues(plan, prevPlan)",
-  "step3 completion: restore frozen values after provenance guard",
+  "enforceConfirmedOnlySlots(plan, prevPlan)",
+  "step3 completion: confirmed-only freeze wired into state machine",
 );
 mustContain("function guardStep3ValueProvenance(", "step3 completion: provenance firewall exists (server)");
 mustContain(
-  "Moved a misplaced draft rewrite from the adjacent slot back to the current target.",
-  "step3 provenance: shifted draft rewrite is restored to its target",
+  "function isStep3RejectMessage(",
+  "step3 completion: reject/protest detector exists",
 );
 mustContain(
-  "targetValueChanged &&",
-  "step3 provenance: adjacent fill requires target update in the same turn",
+  "function buildContinuousConfirmAsk(",
+  "step3 completion: legacy confirm ask builder retained but not main path",
 );
 mustContain("function applyStudentAnswerToTargetStep(", "step3 completion: prefers student utterance for target step (server)");
 mustContain("function isSubpointGenuinelyComplete(", "step3 completion: genuine complete requires student dialogue (server)");
-mustContain("function clearAllStep3PlanValues(", "step3 completion: kickoff clears all values (server)");
 mustContain(
-  "Kickoff turn: cleared all step values",
-  "step3 completion: kickoff path logs value wipe",
+  "function buildStep3KickoffPendingDrafts(",
+  "step3 kickoff legacy builder retained (not main path)",
+);
+mustContain(
+  "Hidden kickoff: never stage confirm; sanitize dump but keep model ask",
+  "step3 kickoff never stages confirm; sanitizes dump; keeps model ask",
+);
+mustContain(
+  "function applyKickoffPendingDraftsToPlan(",
+  "step3 kickoff applies pending drafts only after affirmation",
+);
+mustContain(
+  "function buildStep3KickoffConfirmText(",
+  "step3 kickoff confirm chat lists pending drafts",
+);
+mustContain(
+  "clearAllStep3PlanValues(plan)",
+  "step3 kickoff clears slot values before confirm-then-write",
+);
+mustContain(
+  "step3KickoffPendingDrafts",
+  "step3 kickoff pending drafts field exists",
+);
+mustContain(
+  "confirm-then-write",
+  "step3 prompt: kickoff confirm-then-write rule",
+);
+mustContain(
+  "function inferStep2SideForSubpoint(",
+  "step3 kickoff maps body to A/B userPoints side",
+);
+mustContain(
+  "function cleanStep2EvidenceSnippet(",
+  "step3 kickoff cleans 已选详写 blobs into draft prose",
+);
+mustContain(
+  "kickoffPendingDrafts",
+  "step3 client persists kickoffPendingDrafts on subpoint",
+);
+mustContain(
+  "Kickoff dump/confirm sanitized — salvaged ask",
+  "step3 kickoff salvages ask without mid-dialogue veto template",
+);
+mustContain(
+  "Kickoff OK — kept model expand ask (no mid-dialogue veto template)",
+  "step3 kickoff keeps legal model expand ask",
+);
+mustContain(
+  "function prepareStep3KickoffCoachText(",
+  "step3 kickoff prepare path is separate from mid-dialogue veto",
+);
+mustContain(
+  "function salvageStep3KickoffAskText(",
+  "step3 kickoff salvages model question after dump strip",
+);
+mustContain(
+  "function countNarrativeChainLabels(",
+  "step3 server: detects narrative 原因/场景/影响 chain dumps",
+);
+mustContain(
+  "narrativeLabels >= 2",
+  "step3 illegal dump includes narrative chain labels",
+);
+mustContain(
+  "function detectStep3IllegalCoachText(",
+  "step3 server: illegal coach-text detector (dump/fake-complete)",
+);
+mustContain(
+  "STUCK / 「不知道」",
+  "step3 prompt: stuck students get clues not rubber-stamp sentences",
+);
+mustContain(
+  "listing polished reason+example+impact bullets OR narrative lines",
+  "step3 prompt: kickoff forbids narrative full-sentence chain dump",
+);
+mustContain(
+  "function vetoStep3TextToFirstEmptyAsk(",
+  "step3 server: mid-dialogue full-text veto still exists",
+);
+mustContain(
+  "function enforceStep3TextBoardConsistency(",
+  "step3 server: board-consistency enforce (trust or veto)",
+);
+mustContain(
+  "affirm_no_pending",
+  "step3 server: bare affirm with no pending is vetoed",
+);
+mustContain(
+  "function alignFirstEmptyExpandState(",
+  "step3 server: alignFirstEmptyExpandState keeps legal model ask",
+);
+mustContain(
+  "function isKickoffDraftSubstantiveEnough(",
+  "step3 kickoff substantive-enough gate for confirm-write",
+);
+mustContain(
+  "function lookLikeStep2ThemeLabel(",
+  "step3 kickoff rejects Step2 theme-label shorthand as sentences",
+);
+mustContain(
+  "function splitOutsideParens(",
+  "step3 kickoff splits clauses without breaking parentheses",
+);
+mustContain(
+  "usedFullEvidence",
+  "step3 kickoff full-sentence evidence is consumed once across beats",
+);
+mustContain(
+  "function rewriteStep3AskText(",
+  "step3 rewriteStep3AskText helper retained (not main ask path)",
+);
+mustContain(
+  "function paraphraseKickoffDraftText(",
+  "step3 kickoff paraphrases drafts without adding facts",
+);
+mustContain(
+  "function buildStep3KickoffExpandText(",
+  "step3 kickoff expand-ask builder exists",
 );
 mustContain(
   "KICKOFF / FIRST PLANNING TURN",
-  "step3 prompt: kickoff must leave all values empty",
+  "step3 prompt: kickoff expand-first (Step2 is ask clue only)",
 );
+mustContain(
+  "CONTENT REUSE FROM STEP 2 (CRITICAL)",
+  "step3 prompt: mapped Step2 points are ask evidence only (no complete-then-confirm)",
+);
+mustContain(
+  "NO LLM-COMPLETE-THEN-CONFIRM",
+  "step3 prompt: expand content must be student-authored",
+);
+mustContain(
+  "confirm_requires_student_utterance",
+  "step3 server: confirm pending requires substantive student utterance",
+);
+mustContain(
+  "kickoff_requires_student_expand",
+  "step3 server: kickoff forces expand when model tries confirm",
+);
+mustContain(
+  "isStep3AffirmativeConfirmation",
+  "step3 explicit short confirmation counts after grounded draft reuse",
+);
+mustContain(
+  "function applyStep3FrameworkGuard(",
+  "step3 framework guard enforces Step2 inheritance",
+);
+mustContain(
+  "function ensureArgumentRelationCoverage(",
+  "step3 generic argument-relation coverage exists",
+);
+mustContain(
+  "function ensureConcessionStructure(",
+  "step3 concession structure enforcement exists (compat wrapper)",
+);
+mustContain(
+  "[argument-relation-coverage:",
+  "step3 relation coverage tags enforced structure",
+);
+mustContain(
+  "refusing to merge stale paragraphPlan",
+  "step3 refuses merge when framework signature drifted",
+);
+assert.ok(
+  step3QualitySource.includes("export function computeSubpointFrameworkSignature("),
+  "Missing: step3Quality framework signature helper",
+);
+console.log("OK: step3Quality framework signature helper");
+assert.ok(
+  step3QualitySource.includes("export function computeEssayFrameworkSignature("),
+  "Missing: step3Quality essay framework signature helper",
+);
+console.log("OK: step3Quality essay framework signature helper");
+assert.ok(
+  step3QualitySource.includes("ARGUMENT_RELATION_BEATS"),
+  "Missing: argument relation beats table",
+);
+console.log("OK: argument relation beats table");
+assert.ok(
+  step3DraftingSource.includes("computeSubpointFrameworkSignature") &&
+    step3DraftingSource.includes("computeEssayFrameworkSignature"),
+  "Missing: Step3Drafting uses framework signature for stale-plan invalidation",
+);
+console.log("OK: Step3Drafting uses framework signature for stale-plan invalidation");
 mustContain(
   "VALUE vs PLANNING DRAFT SEPARATION",
   "step3 prompt: separates planning drafts from confirmed value fields",
@@ -824,9 +1073,137 @@ mustContain(
   "Never trust sibling isCompleted flags",
   "step3 completion: never trust sibling isCompleted alone",
 );
+mustContain("function textSuggestsStep3Complete(", "step3 completion: text heuristic exists");
+mustContain(
+  't.includes("大功告成")',
+  "step3 completion: text heuristic catches premature 大功告成 CTA",
+);
+mustContain(
+  't.includes("点击下一步进入写作练习")',
+  "step3 completion: text heuristic catches premature writing-practice CTA",
+);
+mustContain(
+  't.includes("切换到下一个主体段")',
+  "step3 completion: text heuristic catches premature next-body tab CTA",
+);
+mustContain(
+  "anchored to whole-chain / advance-CTA phrasing",
+  "step3 completion: text heuristic stays scoped to whole-chain language",
+);
 mustContain(
   "Do NOT force-complete Step 3 from CTA text alone.",
   "step3 heuristic: CTA text alone cannot force complete",
+);
+mustContain(
+  "function sanitizeStep3RewritePart1(",
+  "step3 completion: part1 sanitizer exists (avoids self-contradictory rewrite)",
+);
+mustContain(
+  "function textSuggestsStep3SlotAlreadyWritten(",
+  "step3 completion: detects false already-written-to-board claims in part1",
+);
+mustContain(
+  "textSuggestsStep3SlotAlreadyWritten(t)",
+  "step3 completion: part1 sanitizer strips already-written claims",
+);
+mustContain(
+  "forceNeutralPart1",
+  "step3 ask rewrite can force neutral part1 for confirm-ask",
+);
+mustContain(
+  "sanitizeStep3RewritePart1(split.part1,",
+  "step3 completion: rewrite sites use the part1 sanitizer",
+);
+assert.ok(
+  step3QualitySource.includes("export function promoteAcknowledgedStep3DraftTarget("),
+  "Missing: step3Quality auto-promote helper (paragraphPlan) exists",
+);
+console.log("OK: step3Quality auto-promote helper (paragraphPlan) exists");
+assert.ok(
+  step3QualitySource.includes("export function promoteAcknowledgedFlatStep3Target("),
+  "Missing: step3Quality auto-promote helper (flat steps) exists",
+);
+console.log("OK: step3Quality auto-promote helper (flat steps) exists");
+assert.ok(
+  step3QualitySource.includes("export function isStep3AffirmativeConfirmation("),
+  "Missing: step3Quality shared affirmative-confirmation detector",
+);
+console.log("OK: step3Quality shared affirmative-confirmation detector");
+mustContain(
+  "commitPendingOnAffirm(plan, pending)",
+  "step3 completion: affirm writes via commitPendingOnAffirm only",
+);
+mustContain(
+  "function resolveStep3StepConfirmation(",
+  "step3 confirm-resolution function exists",
+);
+mustContain(
+  "wasAcceptedPolishedDraft",
+  "step3 confirm-resolution skips corpus-grounding demotion for just-affirmed drafts (fixes confirm deadlock)",
+);
+mustContain(
+  "polishedFromCurrentAnswer",
+  "step3 confirm-resolution also accepts substantive-answer + light-polish grounding",
+);
+mustContain(
+  "isStep3AffirmativeConfirmation(userMessage)",
+  "step3 state machine gates slot write on affirmative confirmation",
+);
+mustContain(
+  "function rewriteStep3AskText(",
+  "step3 ask rewrite helper always owns part2 after ---",
+);
+mustContain(
+  "function isKickoffDraftDeepEnough(",
+  "step3 kickoff beat-level depth gate exists (rejects grammatical-but-shallow drafts)",
+);
+mustContain(
+  "function isKickoffDraftReadyToConfirm(",
+  "step3 kickoff combined substantive+deep confirm gate exists",
+);
+mustContain(
+  "applyLabeledPendingEdits(",
+  "step3 completion: labeled pending edits (partial update by key)",
+);
+mustContain(
+  "Refused confirm/pending without substantive student utterance — vetoed to firstEmpty ask",
+  "step3: confirm without student utterance vetoes to firstEmpty ask",
+);
+mustContain(
+  "function stripStep3EnglishTranslationShow(",
+  "step3 server: strips mid-flow English translation show-offs",
+);
+mustContain(
+  "NO ENGLISH IN STEP 3 CHAT",
+  "step3 prompt: forbids English translations in coaching chat",
+);
+mustContain(
+  "SERVER vs LLM OWNERSHIP",
+  "step3 prompt: LLM owns asks; server owns flow/state only",
+);
+mustContain(
+  "confirm-then-write via commitPendingOnAffirm",
+  "step3 kickoff: affirmation writes pending drafts into slots",
+);
+mustContain(
+  "function buildStep3PendingAsk(",
+  "step3 ask: distinguishes confirm-draft vs fill-empty",
+);
+mustContain(
+  "NO INVENTED SLOT PROSE",
+  "step3 prompt: forbids inventing slot prose without Step2 grounding",
+);
+mustContain(
+  "CHAT vs BOARD AFTER CONFIRM",
+  "step3 prompt: chat vs board rules after confirm-then-write",
+);
+mustContain(
+  "function stripStep3BlockLabelPrefix(",
+  "step3 labels: strip duplicated 分点N prefix helper exists",
+);
+mustContain(
+  "function formatStep3FlatStepLabel(",
+  "step3 labels: flat label formatter avoids double prefix",
 );
 mustContain("function attachStep3UiProgress(", "step3 server: authoritative UI progress exists");
 mustContain("data.progressUpdate.step3Ui = {", "step3 server: emits authoritative UI progress");
@@ -840,8 +1217,8 @@ mustContain(
   "step3 server: collapses adjacent open slots covered by one answer",
 );
 mustContain(
-  "collapseCoveredAdjacentStep3Slots(plan, prevPlan, userMessage)",
-  "step3 server: adaptive slot collapse is wired before completion checks",
+  "enforceConfirmedOnlySlots(plan, prevPlan)",
+  "step3 server: confirmed-only freeze supersedes adaptive collapse in state machine",
 );
 mustContain(
   "function wereStep3RefsAdjacentInPreviousPlan(",
@@ -856,7 +1233,7 @@ mustContain(
   "step3 server: merge compares two slot values, not userMessage vs next",
 );
 mustContain(
-  "retain the target key, remove the next slot",
+  "删除紧邻 step",
   "step3 prompt: merged slot keeps a stable key",
 );
 mustContain(
@@ -864,17 +1241,37 @@ mustContain(
   "step3 server: confirm gate demotes invalid confirmed proposals",
 );
 mustContain(
-  "resolveStep3StepConfirmation(plan, activeSp, userMessage)",
-  "step3 server: confirm gate wired before completion checks",
+  "commitPendingOnAffirm(plan, pending)",
+  "step3 server: confirm-then-write gate wired (affirm commits pending to slots)",
 );
 mustContain(
   "CRITICAL — SLOT STATUS (draft vs confirmed)",
   "step3 prompt: draft vs confirmed slot status contract",
 );
 mustContain(
-  "REPLACE the value on that SAME step key",
+  "Slot writing is SERVER-ONLY after student affirm",
   "step3 prompt: draft confirmation must overwrite the same slot",
 );
+
+// Step 3 LLM-owned eval architecture
+mustContain("step3SlotEval", "step3 architecture: step3SlotEval in server");
+mustContain("function hardRejectSlotText(", "step3 architecture: hard-reject firewall");
+mustContain("function normalizeStep3SlotEval(", "step3 architecture: normalize step3SlotEval");
+mustContain("function formatStep3SlotCursorForPrompt(", "step3 architecture: slot cursor context injection");
+mustContain("lastRejectCode", "step3 architecture: lastRejectCode in context/persistence");
+mustContain("NO META PROCESS PHRASES", "step3 prompt: forbids meta process phrases");
+mustContain("不会现在写入右侧", "step3 architecture: strip/forbid 不会现在写入右侧 meta");
+mustContain("function stripStep3MetaProcessPhrases(", "step3 architecture: strips meta process phrases");
+mustContain("function ensureMinimalStep3Text(", "step3 architecture: minimal text fallback only");
+mustNotContain(
+  'data.text = `${hint}\n\n---\n\n请先用一句话把「${empty.cleanStepLabel}」说完整；说清楚后我们再整理确认，不会现在写入右侧。`',
+  "step3 architecture: main path must not template 不会现在写入右侧 expand asks",
+);
+mustContain(
+  "commitPendingOnAffirm(plan, pending)",
+  "step3 architecture: affirm writes via commitPendingOnAffirm",
+);
+
 mustContain(
   'enum: ["draft", "confirmed"]',
   "step3 schema: status enum draft/confirmed on nested steps",
@@ -887,8 +1284,8 @@ assert.ok(
 );
 console.log("OK: step3Quality: confirmed helper exists");
 mustContain(
-  "Backfilled empty target step from student utterance.",
-  "step3 completion: empty-target backfill only (no force overwrite of draft)",
+  "syncPlanProgressFields(data, plan, pending)",
+  "step3 completion: pending sync keeps slots empty until affirm",
 );
 assert.ok(
   fs.readFileSync(path.join(repoRoot, "src/utils/step3Quality.ts"), "utf8").includes(
@@ -924,7 +1321,7 @@ assert.ok(
 );
 console.log("OK: step3 CoachChat synchronizes server-authored UI status");
 mustContain(
-  "Only unlock Step 1 completion when slots are filled AND the coach already",
+  "Only unlock when slots filled, dimensions sufficient, exit gate open",
   "step1 completion: enforce requires completion CTA, not slots alone",
 );
 mustContain(
@@ -932,13 +1329,13 @@ mustContain(
   "step1 completion: premature isCompleted cleared without CTA",
 );
 mustContain(
-  "FORBIDDEN: Do NOT set isCompleted: true while still asking Task A/Task B dimension questions",
+  'FORBIDDEN: Do NOT set isCompleted: true while still asking dimension questions, soft exit ("够用了吗"), or any other missing-slot question.',
   "step1 prompt: forbids isCompleted during mid-flow dimension questions",
 );
 mustContain("function textSuggestsStep1Complete(", "step1 completion: text heuristic exists");
 mustContain(
-  '// Canonical CTA required by Step 1 completion prompt. Keep this strict so',
-  "step1 completion: text heuristic kept strict for Task B mid-flow",
+  "// Soft exit asks may say",
+  "step1 completion: text heuristic kept strict for soft-exit vs hard CTA",
 );
 mustContain("function applyStepCompletionHeuristic(", "step completion: heuristic function exists");
 mustContain("Step 1 deterministic safety net (A):", "step1 backfill: wired in coach handler");
@@ -1440,37 +1837,209 @@ mustContain(
 mustContain("function detectRequiresStance(", "requiresStance detector exists");
 mustContain("function applyNoStanceGate(", "no-stance gate exists");
 mustContain(
-  "step2New.requiresStance = brief.requiresStance;",
+  "step2.requiresStance = brief.requiresStance;",
   "no-stance gate stamps requiresStance every turn for client stepper",
 );
 mustContain(
   "applyNoStanceGate(question, data, session);",
   "no-stance gate wired into Step2 handler",
 );
+mustContain(
+  "function enforceStep2StanceMaterialGuard(",
+  "step2 stance-material guard exists",
+);
+mustContain(
+  "enforceStep2StanceMaterialGuard(data, session, userMessage);",
+  "step2 stance-material guard wired into Step2 handler",
+);
+mustContain(
+  "Stance–material fit (CRITICAL, converge-stage only)",
+  "step2 prompt: stance-material fit rule",
+);
+mustContain(
+  "function studentSignalsExhausted(",
+  "shared student termination-signal helper exists",
+);
+mustContain(
+  "材料校验已提示",
+  "step2 material-guard anti-loop tag exists",
+);
+mustContain(
+  "countEffectiveStep1Dimensions(",
+  "step1 effective-dimension counter exists",
+);
+mustContain(
+  "Dimension quality & exit rules (CRITICAL",
+  "step1 dimension quality & exit rules exist",
+);
+mustContain(
+  "hasStandaloneStep1Tag(t, STEP1_DIM_EXPANDABLE_TAG) &&",
+  "step1 effective dims require standalone expandable tag",
+);
+mustContain(
+  "hasStandaloneStep1Tag(t, STEP1_DIM_PROBED_TAG)",
+  "step1 effective dims require probed tag",
+);
+mustContain(
+  "function isStep1ExitGateOpen(",
+  "step1 exit-offer gate helper exists",
+);
+mustContain(
+  "Blocked premature Step1 completion; exit offer required",
+  "step1 exit-offer gate blocks early complete",
+);
+mustContain(
+  "Blocked same-turn complete while new dimension introduced",
+  "step1 same-turn new-dimension complete blocked",
+);
+mustContain(
+  "exitOffered",
+  "step1 schema/prompt includes exitOffered",
+);
+mustContain(
+  "FORBIDDEN: tagging （可展开） in the same turn you first introduce a dimension",
+  "step1 prompt forbids same-turn expandable+introduce",
+);
+mustContain(
+  "enforceStep1SlotCompletion(data, session, userMessage);",
+  "step1 completion guard receives userMessage",
+);
+mustContain(
+  "const STEP1_DIM_MIN_EFFECTIVE = 3;",
+  "step1 effective minimum is 3",
+);
+mustContain(
+  "function computeStep1DimensionsSufficient(",
+  "step1 dimensionsSufficient helper exists",
+);
+mustContain(
+  "AI sufficiency first (CRITICAL)",
+  "step1 prompt: AI sufficiency before student exit ask",
+);
+mustContain(
+  "function questionHasScopedAll(",
+  "step1 scoped-all hard-qualifier detector exists",
+);
+mustContain(
+  "Cross-group: student says 完全/彻底 while question has scoped all",
+  "step1 cross-group qualifier echo (完全↔all) exists",
+);
+mustContain(
+  "constraintsSkipped = true;",
+  "step1 no-hard-qualifier gate uses constraintsSkipped",
+);
+mustContain(
+  "Stripped student-visible '无明显限定词' marker",
+  "step1 strips 无明显限定词 marker from board",
+);
+mustContain(
+  "Soft exit asks may say",
+  "step1 hard CTA excludes soft exit phrasing",
+);
+mustContain(
+  '(/点击/.test(t) && /下一步/.test(t) && /进入第二步/.test(t))',
+  "step1 hard CTA requires click next-step button",
+);
+mustNotContain(
+  'set constraints=["无明显限定词"]',
+  "step1 prompt no longer tells model to write 无明显限定词",
+);
+mustContain(
+  "argumentRelation",
+  "step2 schema: argumentRelation on clustering clusters",
+);
+mustContain(
+  "CONVERGE — select points + stance",
+  "step2 converge stage selects points and stance together",
+);
+mustContain(
+  "SKIP this entire step. Copy",
+  "step3 skips re-diagnosis when framework present",
+);
 
 // Step 2: momentum guard (Part 2 must always be a question or CTA)
 mustContain("function enforceStep2Momentum(", "step2 momentum guard exists");
 mustContain("function looksLikeQuestionEnding(", "step2 momentum: question-ending detector exists");
 mustContain(
-  "appended fallback next-step prompt",
-  "step2 momentum: logs when fallback question is injected",
+  "appended content-aware prompt for resolved stage",
+  "step2 momentum: logs content-aware fallback injection",
+);
+mustContain(
+  "function fallbackStep2QuestionForStage(",
+  "step2 momentum resolves fallback from updated stage",
+);
+mustContain(
+  "Repaired verbal stage advance",
+  "step2 momentum repairs text and stage desynchronization",
+);
+mustContain(
+  "stanceRecommendationAlreadyPresent",
+  "step2 momentum preserves an evidence-based stance recommendation",
 );
 mustContain(
   "enforceStep2Momentum(data, session);",
   "step2 momentum guard wired into Step2 handler",
 );
+mustContain(
+  "function sideHasSolidExploreContent(",
+  "step2 momentum: solid-side detector exists",
+);
+mustContain(
+  "A+B sides already solid → advance stage to",
+  "step2 momentum advances when A+B already solid",
+);
+mustContain(
+  "function normalizeQuestionTypeLabel(",
+  "question type alias normalizer exists",
+);
+mustContain(
+  'if (/^agree\\s*(or|\\/)\\s*disagree$/.test(lower)) return "Agree / Disagree";',
+  "Agree or Disagree alias maps to Agree / Disagree",
+);
+mustContain(
+  "STEP1_DIM_SYNONYM_BAGS",
+  "step1 dimension synonym bags for disposition matching",
+);
 
-// Client stepper: requiresStance-aware stage list
+// Client stepper: requiresStance-aware stage list + taskMap labels
 assert.ok(
   step2BrainstormSource.includes("const requiresStance = (evalData as any)?.requiresStance !== false;"),
   "Missing: step2 stepper reads requiresStance from evalData",
 );
 console.log("OK: step2 stepper reads requiresStance from evalData");
 assert.ok(
-  step2BrainstormSource.includes("{ id: 'explore_A', label: '1. 第一任务' }"),
-  "Missing: step2 stepper has 3-stage variant for no-stance essays",
+  step2BrainstormSource.includes("taskLabelA") &&
+    step2BrainstormSource.includes("taskLabelB") &&
+    step2BrainstormSource.includes("labelA || '第一任务'"),
+  "Missing: step2 stepper uses taskMap labels with 第一任务 fallback",
 );
 console.log("OK: step2 stepper has 3-stage variant for no-stance essays");
+mustContain("function stampStep2TaskBrief(", "step2 stamps taskMap labels for client stepper");
+mustContain(
+  "step2.taskLabelA = brief.taskMap.explore_A;",
+  "step2 taskLabelA comes from questionBrief.taskMap",
+);
+mustContain(
+  "function enforceStep2DimensionDispositionGuard(",
+  "step2 dimension disposition guard exists",
+);
+mustContain(
+  "Step1 dimension disposition ledger (CRITICAL — no silent drop):",
+  "step2 prompt forbids silent drop of Step1 dimensions",
+);
+mustContain(
+  "enforceStep2DimensionDispositionGuard(data, session);",
+  "step2 dimension disposition guard wired into handler",
+);
+mustContain(
+  "dimensionDispositions",
+  "step2 schema includes dimensionDispositions ledger",
+);
+assert.ok(
+  step2BrainstormSource.includes("Step1 角度处置"),
+  "Missing: step2 UI shows Step1 dimension disposition checklist",
+);
+console.log("OK: step2 UI shows Step1 dimension disposition checklist");
 
 // Step 3: kickoff isolation + server-authored UI progress
 mustContain("function isKickoffOrInstructionText(", "step3 kickoff pollution detector exists");
@@ -1478,8 +2047,8 @@ mustContain("function isValidStep3StepValue(", "step3 valid step value gate exis
 mustContain("function sanitizeParagraphPlanValues(", "step3 sanitize paragraphPlan values exists");
 mustContain("isHiddenKickoff", "step3 API accepts isHiddenKickoff flag");
 mustContain(
-  "skipBackfill =\n    options?.isHiddenKickoff || isKickoffOrInstructionText(userMessage)",
-  "step3 guard skips backfill on hidden kickoff",
+  "if (options?.isHiddenKickoff)",
+  "step3 guard uses dedicated confirm-then-write path on hidden kickoff",
 );
 assert.ok(
   step3DraftingSource.includes("sp.selectable !== false") &&

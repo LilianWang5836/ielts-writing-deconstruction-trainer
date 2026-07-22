@@ -409,6 +409,20 @@ export default function CoachChat({
                 updatedSp.structureSteps =
                   data.progressUpdate.step3SubpointSteps;
               }
+              if (Array.isArray(data.progressUpdate.step3KickoffPendingDrafts)) {
+                updatedSp.kickoffPendingDrafts =
+                  data.progressUpdate.step3KickoffPendingDrafts;
+              }
+              if (typeof data.progressUpdate.step3LastRejectCode === "string") {
+                updatedSp.lastRejectCode =
+                  data.progressUpdate.step3LastRejectCode;
+              }
+              if (
+                data.progressUpdate.step3SlotEval &&
+                typeof data.progressUpdate.step3SlotEval === "object"
+              ) {
+                updatedSp.step3SlotEval = data.progressUpdate.step3SlotEval;
+              }
 
               if (data.progressUpdate.step3SubpointCompletenessChecks) {
                 updatedSp.completenessChecks = data.progressUpdate.step3SubpointCompletenessChecks;

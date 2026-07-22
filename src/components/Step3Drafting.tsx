@@ -14,6 +14,10 @@ import {
 } from "lucide-react";
 import { Topic, PracticeSession } from "../types";
 import CoachChat from "./CoachChat";
+import {
+  computeEssayFrameworkSignature,
+  computeSubpointFrameworkSignature,
+} from "../utils/step3Quality";
 
 type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
 
@@ -107,6 +111,11 @@ export default function Step3Drafting({
         points: cluster.points || [],
         targetBody: cluster.targetBody || `Body Paragraph ${i + 1}`,
         theme: cluster.theme || `主题 ${i + 1}`,
+        paragraphDensity: cluster.paragraphDensity,
+        pointRoles: cluster.pointRoles,
+        argumentRelation: cluster.argumentRelation || cluster.stanceRelation,
+        stanceRelation: cluster.stanceRelation,
+        layoutRationale: cluster.layoutRationale,
         isCompleted: false,
       }))
     : fallbackBodies && Array.isArray(fallbackBodies) && fallbackBodies.length > 0
@@ -116,6 +125,11 @@ export default function Step3Drafting({
         points: [body.content || body.title || ""],
         targetBody: body.title || `Body Paragraph ${i + 1}`,
         theme: body.title || `主题 ${i + 1}`,
+        paragraphDensity: body.paragraphDensity,
+        pointRoles: body.pointRoles,
+        argumentRelation: body.argumentRelation || body.stanceRelation,
+        stanceRelation: body.stanceRelation,
+        layoutRationale: body.layoutRationale,
         isCompleted: false,
       }))
     : (() => {
@@ -138,15 +152,39 @@ export default function Step3Drafting({
         }));
       })();
 
-  const parsedSubpointsSignature = parsedSubpoints
-    .map((sp) => `${sp.id}:${String(sp.content || "").trim()}`)
-    .join("|");
+  const essayFrameworkSignature = computeEssayFrameworkSignature(session);
+  const parsedSubpointsSignature = [
+    essayFrameworkSignature,
+    ...parsedSubpoints.map((sp) => computeSubpointFrameworkSignature(sp, session)),
+  ].join("|");
 
-  const subpoints =
-    session.step3.subpoints &&
-    session.step3.subpoints.length === parsedSubpoints.length
-      ? session.step3.subpoints
-      : parsedSubpoints;
+  const subpoints = parsedSubpoints.map((parsed) => {
+    const existing = (session.step3.subpoints || []).find(
+      (sp) => sp.id === parsed.id,
+    );
+    const parsedSig = computeSubpointFrameworkSignature(parsed, session);
+    const existingSig = existing
+      ? String(
+          existing.frameworkSignature ||
+            computeSubpointFrameworkSignature(existing, session),
+        )
+      : "";
+    if (existing && existingSig && existingSig === parsedSig) {
+      return {
+        ...parsed,
+        frameworkSignature: parsedSig,
+        paragraphPlan: existing.paragraphPlan,
+        structureSteps: existing.structureSteps,
+        chatHistory: existing.chatHistory,
+        isCompleted: existing.isCompleted,
+      };
+    }
+    return {
+      ...parsed,
+      frameworkSignature: parsedSig,
+      isCompleted: false,
+    };
+  });
 
   useEffect(() => {
     setActiveTab("step3");
@@ -154,7 +192,16 @@ export default function Step3Drafting({
     const shapeChanged =
       !existing ||
       existing.length !== parsedSubpoints.length ||
-      existing.some((sp, idx) => sp.id !== parsedSubpoints[idx]?.id);
+      existing.some((sp, idx) => sp.id !== parsedSubpoints[idx]?.id) ||
+      parsedSubpoints.some((parsed, idx) => {
+        const prev = existing[idx];
+        if (!prev || prev.id !== parsed.id) return true;
+        const prevSig = String(
+          prev.frameworkSignature ||
+            computeSubpointFrameworkSignature(prev, session),
+        );
+        return prevSig !== computeSubpointFrameworkSignature(parsed, session);
+      });
     if (
       shapeChanged
     ) {
@@ -168,8 +215,9 @@ export default function Step3Drafting({
       onUpdateSession({
         step3: {
           ...session.step3,
-          subpoints: parsedSubpoints,
+          subpoints,
           activeSubpointId: nextActiveSubpointId,
+          ...(shapeChanged ? { isCompleted: false } : {}),
         },
       });
     }
@@ -196,7 +244,7 @@ export default function Step3Drafting({
     (s) => s.id === session.step3.activeSubpointId,
   );
   const kickoffPrompt = activeSubpoint?.content
-    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先判断这是单点还是多点论点，用大白话简要说明结构安排，然后直接开始第一个具体问题；结构细节写入系统即可，不要在对话里提字段名。`
+    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先继承第二步已经提供的具体材料：把能对应原因、机制、场景或影响的内容按原意整理成草稿，不要加入新事实，并先请我一次性确认；只有第二步真正没有覆盖的环节才继续追问。再判断这是单点还是多点论点，用大白话简要说明安排；结构细节写入系统即可，不要在对话里提字段名。`
     : "";
 
   // Server is the sole authority for whole-step unlock (via progressUpdate.step3Ui).

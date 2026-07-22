@@ -142,6 +142,19 @@ export interface LogicStep {
   status?: "draft" | "confirmed";
 }
 
+/**
+ * Step 3 LLM-owned slot quality judgment (unique eval source).
+ * Server may only hard-reject staging/write; it must not re-judge narrative quality.
+ */
+export interface Step3SlotEval {
+  activeKey: string;
+  mode: "expand" | "confirm";
+  qualified: boolean;
+  /** Required when mode=confirm — polished draft awaiting student affirm. */
+  pendingText?: string;
+  rejectReason?: string;
+}
+
 export interface ParagraphPointBlock {
   id: string;
   label: string;
@@ -157,6 +170,40 @@ export interface ParagraphPlan {
   totalClaim?: string;
   pointBlocks: ParagraphPointBlock[];
   optionalShortClosing?: string;
+}
+
+/** Internal Step 2 → Step 3 contract; never shown in student-facing UI. */
+export type BodyParagraphDensity = 'single_point' | 'dual_point';
+/** @deprecated Prefer ArgumentRelation; kept for older sessions. */
+export type BodyStanceRelation = 'supports' | 'concedes';
+/** Per-body argument relation chosen in Step 2 converge; drives Step 3 coverage beats. */
+export type ArgumentRelation =
+  | 'supports'
+  | 'concedes'
+  | 'compares'
+  | 'solves'
+  | 'elaborates';
+export type EssayLayoutPattern =
+  | 'concession_then_support'
+  | 'thematic_split'
+  | 'side_by_side'
+  | 'custom';
+
+export interface BodyPointRole {
+  point: string;
+  role: 'major' | 'minor';
+}
+
+/** Per-body essay skeleton from Step 2 summary (coach/internal only). */
+export interface EssayBodyFramework {
+  paragraphDensity?: BodyParagraphDensity;
+  pointRoles?: BodyPointRole[];
+  /** Preferred: relation type for required argument beats in Step 3. */
+  argumentRelation?: ArgumentRelation;
+  /** @deprecated Prefer argumentRelation. */
+  stanceRelation?: BodyStanceRelation;
+  /** Internal planning note — do not echo to students. */
+  layoutRationale?: string;
 }
 
 export interface PracticeSession {
@@ -177,6 +224,12 @@ export interface PracticeSession {
       writingTask?: string;
       keyQualifier?: string;
       suggestedDimensions?: string[];
+      /** Soft exit ask already offered (continue vs enter Step 2). */
+      exitOffered?: boolean;
+      /** AI/server: enough effective dimensions to offer exit. */
+      dimensionsSufficient?: boolean;
+      /** Silently skipped constraints when question has no hard qualifiers. */
+      constraintsSkipped?: boolean;
     };
     /** User edits on the right-side board; always win over later AI progressUpdate merges. */
     boardOverrides?: {
@@ -208,25 +261,51 @@ export interface PracticeSession {
       suggestions: string[];
       suggestedStance: string;
       suggestedPoints: string;
+      /** From questionBrief.taskMap.explore_A — student-facing explore label. */
+      taskLabelA?: string;
+      /** From questionBrief.taskMap.explore_B — student-facing explore label. */
+      taskLabelB?: string;
+      /** Whether this essay needs the stance stage (server-stamped). */
+      requiresStance?: boolean;
+      /**
+       * Ledger for Step1 （已探测）（可展开） dimensions:
+       * expanded | merged | dropped | pending — silent omit forbidden.
+       */
+      dimensionDispositions?: {
+        dimension: string;
+        disposition: 'expanded' | 'merged' | 'dropped' | 'pending';
+        side?: 'A' | 'B' | '';
+        mergedInto?: string;
+        note?: string;
+      }[];
       blueprint?: {
         question: string;
         position: string;
         body1?: string;
         body2?: string;
-        bodies?: { title: string; content: string }[];
+        /** Internal: planned body count (2 or 3). */
+        bodyCount?: number;
+        /** Internal: whole-essay layout pattern. */
+        layoutPattern?: EssayLayoutPattern;
+        bodies?: (EssayBodyFramework & { title: string; content: string })[];
       };
       clustering?: {
         totalPoints: number;
         pointsList: string[];
-        clusters: {
+        /** Internal: mirrors clusters.length; whole-essay layout. */
+        bodyCount?: number;
+        layoutPattern?: EssayLayoutPattern;
+        clusters: (EssayBodyFramework & {
           theme: string;
           points: string[];
           targetBody: string;
           content: string;
-        }[];
+        })[];
         outliers?: {
           point: string;
           suggestion: string;
+          disposition?: 'dropped' | 'merged';
+          mergedInto?: string;
         }[];
       };
       onlinePros?: string[];
@@ -250,6 +329,14 @@ export interface PracticeSession {
       points?: string[];
       targetBody?: string;
       theme?: string;
+      /** Carried from Step 2 clustering; internal, not rendered in UI. */
+      paragraphDensity?: BodyParagraphDensity;
+      pointRoles?: BodyPointRole[];
+      argumentRelation?: ArgumentRelation;
+      stanceRelation?: BodyStanceRelation;
+      layoutRationale?: string;
+      /** Fingerprint of Step 2 framework handoff; used to invalidate stale plans. */
+      frameworkSignature?: string;
       draft?: string;
       hint?: string;
       isCompleted: boolean;
@@ -267,6 +354,22 @@ export interface PracticeSession {
       sufficiencyCheck?: { label: string; passed: boolean; desc: string };
       paragraphPlan?: ParagraphPlan;
       structureSteps?: LogicStep[];
+      /**
+       * Confirm-then-write pending drafts (chat-only). Server-synced from
+       * validated step3SlotEval.pendingText; written only on student affirm.
+       * Persisted across turns on this subpoint (including body switches).
+       */
+      kickoffPendingDrafts?: {
+        key: string;
+        label: string;
+        text: string;
+        blockIndex: number;
+        stepIndex: number;
+      }[];
+      /** Last server hard-reject code (empty/theme_label/duplicate_sibling/…). */
+      lastRejectCode?: string;
+      /** Last model slot eval echoed for debugging / next-turn context. */
+      step3SlotEval?: Step3SlotEval;
       chatHistory?: ChatMessage[];
     }[];
     activeSubpointId?: string;
