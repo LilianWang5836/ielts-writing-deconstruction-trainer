@@ -6,7 +6,6 @@ import {
   Loader2,
   Sparkles,
   Trophy,
-  WandSparkles,
 } from 'lucide-react';
 import { Topic, SentencePracticeTask, PracticeSession, InlineGuidanceResult } from '../types';
 
@@ -27,7 +26,11 @@ type GuidanceIntent =
   | 'find_word';
 
 type Annotation = NonNullable<SentencePracticeTask['annotations']>[number];
-type AnnotatedSegment = { text: string; annotation?: Annotation };
+type AnnotatedSegment = {
+  text: string;
+  annotation?: Annotation;
+  annotationIndex?: number;
+};
 type SentenceTaskMatchResult = {
   matchedTaskId: string;
   confidence: 'high' | 'medium' | 'low';
@@ -42,6 +45,14 @@ const SECTION_LABELS: Record<SectionKey, string> = {
   conclusion: 'Conclusion（总结立场）',
 };
 
+/** Compact nav pills on Step4 left rail. */
+const SECTION_SHORT_LABELS: Record<SectionKey, string> = {
+  intro: 'Intro',
+  body1: 'Body1',
+  body2: 'Body2',
+  conclusion: 'Conc',
+};
+
 const CATEGORY_LABELS: Record<string, string> = {
   grammar: '语法',
   lexical: '用词',
@@ -50,6 +61,60 @@ const CATEGORY_LABELS: Record<string, string> = {
   expression: '表达思路',
   meaning: '意思对齐',
 };
+
+/** Left-panel whole-sentence quick asks (always visible). */
+const LEFT_QUICK_ASKS: Array<{ id: GuidanceIntent; label: string }> = [
+  { id: 'find_word', label: '核心词汇提示' },
+  { id: 'start_sentence', label: '我不会起步' },
+];
+
+type GuidanceThreadMessage = {
+  id: string;
+  role: 'user' | 'coach';
+  label?: string;
+  category?: string;
+  issue?: string;
+  hint?: string;
+};
+
+/** Highlight key fragments in coach guidance (candidates, quotes, bold). */
+function renderHighlightedGuidanceText(text: string): React.ReactNode {
+  const raw = String(text || '');
+  if (!raw) return null;
+  const re =
+    /(\*\*[^*]+\*\*|`[^`]+`|「[^」]+」|"[^"]+"|'[^']+'|[A-Za-z][A-Za-z'/.-]{1,}(?:\s+[A-Za-z][A-Za-z'/.-]+){0,4})/g;
+  const nodes: React.ReactNode[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = re.exec(raw)) !== null) {
+    if (match.index > last) {
+      nodes.push(raw.slice(last, match.index));
+    }
+    const token = match[0];
+    let inner = token;
+    if (token.startsWith('**') && token.endsWith('**')) inner = token.slice(2, -2);
+    else if (token.startsWith('`') && token.endsWith('`')) inner = token.slice(1, -1);
+    else if (token.startsWith('「') && token.endsWith('」')) inner = token.slice(1, -1);
+    else if (
+      (token.startsWith('"') && token.endsWith('"')) ||
+      (token.startsWith("'") && token.endsWith("'"))
+    ) {
+      inner = token.slice(1, -1);
+    }
+    nodes.push(
+      <mark
+        key={`h-${key++}`}
+        className="rounded px-1 py-0.5 bg-amber-100 text-amber-950 font-semibold not-italic"
+      >
+        {inner}
+      </mark>,
+    );
+    last = match.index + token.length;
+  }
+  if (last < raw.length) nodes.push(raw.slice(last));
+  return nodes.length ? <>{nodes}</> : raw;
+}
 
 function inferSectionFromId(id: string): SectionKey {
   if (id.startsWith('intro-')) return 'intro';
@@ -96,15 +161,17 @@ function buildAnnotatedSegments(sentence: string, annotations: Annotation[]) {
     return { segments: [] as AnnotatedSegment[], unmatched: [] as Annotation[] };
   }
 
-  const validAnnotations = (annotations || [])
-    .filter((ann) => ann?.text?.trim() && ann?.explanation?.trim())
-    .map((ann) => ({
-      text: ann.text.trim(),
-      category: ann.category,
-      explanation: ann.explanation.trim(),
-    }));
+  const source = annotations || [];
+  const validWithIndex = source
+    .map((ann, annotationIndex) => ({
+      ann,
+      annotationIndex,
+      text: String(ann?.text || '').trim(),
+      explanation: String(ann?.explanation || '').trim(),
+    }))
+    .filter((item) => item.text && item.explanation);
 
-  if (validAnnotations.length === 0) {
+  if (validWithIndex.length === 0) {
     return {
       segments: [{ text: cleanSentence }],
       unmatched: [] as Annotation[],
@@ -115,10 +182,10 @@ function buildAnnotatedSegments(sentence: string, annotations: Annotation[]) {
   const unmatched: Annotation[] = [];
   let cursor = 0;
 
-  validAnnotations.forEach((ann) => {
-    let idx = cleanSentence.indexOf(ann.text, cursor);
+  validWithIndex.forEach(({ ann, annotationIndex, text }) => {
+    let idx = cleanSentence.indexOf(text, cursor);
     if (idx === -1) {
-      const fallbackIdx = cleanSentence.indexOf(ann.text);
+      const fallbackIdx = cleanSentence.indexOf(text);
       if (fallbackIdx === -1 || fallbackIdx < cursor) {
         unmatched.push(ann);
         return;
@@ -129,8 +196,16 @@ function buildAnnotatedSegments(sentence: string, annotations: Annotation[]) {
     if (idx > cursor) {
       segments.push({ text: cleanSentence.slice(cursor, idx) });
     }
-    segments.push({ text: ann.text, annotation: ann });
-    cursor = idx + ann.text.length;
+    segments.push({
+      text,
+      annotation: {
+        text,
+        category: ann.category,
+        explanation: String(ann.explanation || '').trim(),
+      },
+      annotationIndex,
+    });
+    cursor = idx + text.length;
   });
 
   if (cursor < cleanSentence.length) {
@@ -160,7 +235,17 @@ export default function Step4SentencePractice({
   const [confirming, setConfirming] = useState(false);
   const [showGuidance, setShowGuidance] = useState(false);
   const [topicExpanded, setTopicExpanded] = useState(false);
+  const [draftExpanded, setDraftExpanded] = useState(false);
+  const [activeAnnotationIdx, setActiveAnnotationIdx] = useState<number | null>(null);
+  const [guidanceThread, setGuidanceThread] = useState<GuidanceThreadMessage[]>([]);
+  const [selectionGuidance, setSelectionGuidance] = useState<InlineGuidanceResult | null>(null);
+  const [selectionAskLoading, setSelectionAskLoading] = useState(false);
   const fullDraftRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const annotationListRef = useRef<HTMLDivElement>(null);
+  const annotationItemRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const handleRequestGuidanceRef = useRef<() => void>(() => {});
+  const guidanceThreadEndRef = useRef<HTMLDivElement>(null);
 
   const activeTask = tasks[currentTaskIndex];
   const allConfirmed = tasks.length > 0 && tasks.every((t) => !!t.confirmed);
@@ -201,16 +286,28 @@ export default function Step4SentencePractice({
   );
   const selectedScope = selectedText.trim();
   const selectedSceneChips: Array<{ id: GuidanceIntent; label: string }> = [
-    { id: 'selected_vocabulary', label: '词汇不自然' },
+    { id: 'selected_vocabulary', label: '表达不确定' },
     { id: 'selected_grammar', label: '语法不确定' },
     { id: 'selected_wordOrder', label: '语序别扭' },
     { id: 'selected_expression', label: '更学术一点' },
   ];
-  const noSelectionChips: Array<{ id: GuidanceIntent; label: string }> = [
-    { id: 'start_sentence', label: '我不会起步' },
-    { id: 'find_word', label: '我想表达但词不确定' },
-  ];
-  const activeGuidanceChips = selectedScope ? selectedSceneChips : noSelectionChips;
+
+  const currentSectionEntries = sectionTaskMap[activeSection] || [];
+  const currentSectionPreview = useMemo(() => {
+    const confirmed = currentSectionEntries
+      .filter(({ task, idx }) => idx !== currentTaskIndex && task.confirmedSentence?.trim())
+      .map(({ task }) => task.confirmedSentence!.trim());
+    if (confirmed.length === 0) return '本段尚无其它已确认句';
+    const joined = confirmed.join(' · ');
+    return joined.length > 90 ? `${joined.slice(0, 90)}…` : joined;
+  }, [currentSectionEntries, currentTaskIndex]);
+
+  const focusAnnotation = (idx: number | null) => {
+    setActiveAnnotationIdx(idx);
+    if (idx == null) return;
+    const el = annotationItemRefs.current[idx];
+    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
 
   const setTaskState = (updatedTasks: SentencePracticeTask[]) => {
     setTasks(updatedTasks);
@@ -257,6 +354,9 @@ export default function Step4SentencePractice({
     setGuidanceIntent('');
     setGuidanceQuestion('');
     setShowGuidance(false);
+    setActiveAnnotationIdx(null);
+    setDraftExpanded(false);
+    setGuidanceThread([]);
     return sorted;
   };
 
@@ -474,6 +574,8 @@ export default function Step4SentencePractice({
       setGuidanceIntent('');
       setGuidanceQuestion('');
       setShowGuidance(false);
+      setActiveAnnotationIdx(null);
+      setGuidanceThread([]);
 
       const nextPendingIdx = sortedUpdated.findIndex((task) => !task.confirmed);
       if (nextPendingIdx !== -1) {
@@ -502,6 +604,9 @@ export default function Step4SentencePractice({
     setGuidanceQuestion('');
     setShowGuidance(false);
     setErrorMsg('');
+    setActiveAnnotationIdx(null);
+    setGuidanceThread([]);
+    setSelectionGuidance(null);
   };
 
   const handleSectionSelect = (section: SectionKey) => {
@@ -523,7 +628,10 @@ export default function Step4SentencePractice({
   };
 
   const handleScrollToDraft = () => {
-    fullDraftRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setDraftExpanded(true);
+    requestAnimationFrame(() => {
+      fullDraftRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const handleEditorSelection = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
@@ -531,29 +639,19 @@ export default function Step4SentencePractice({
     const { selectionStart, selectionEnd, value } = target;
     if (selectionStart === selectionEnd) {
       setSelectedText('');
-      setGuidanceIntent('');
+      setSelectionGuidance(null);
       return;
     }
     const selected = value.slice(selectionStart, selectionEnd).trim();
     setSelectedText(selected);
-    setGuidance(null);
-    setGuidanceIntent('');
+    setSelectionGuidance(null);
   };
 
-  const handleRequestGuidance = async () => {
-    if (!activeTask) return;
-    const cleanQuestion = guidanceQuestion.trim();
-    const hasIntent = !!guidanceIntent;
-    if (!selectedScope && !cleanQuestion && !hasIntent) {
-      setErrorMsg('请选择一个提问标签，或输入你卡住的问题。');
-      return;
-    }
-    if (selectedScope && !cleanQuestion && !hasIntent) {
-      setErrorMsg('你已选中文本，请选择一个标签或补充问题后再提问。');
-      return;
-    }
-    setGuidanceLoading(true);
+  const handleSelectionAsk = async (intent: GuidanceIntent) => {
+    if (!activeTask || !selectedScope || selectionAskLoading) return;
+    setSelectionAskLoading(true);
     setErrorMsg('');
+    setSelectionGuidance(null);
     try {
       const res = await fetch('/api/inline-guidance', {
         method: 'POST',
@@ -563,8 +661,8 @@ export default function Step4SentencePractice({
           fullDraft: userDraft.trim(),
           concept: activeTask.concept,
           prompts: activeTask.prompts,
-          intent: guidanceIntent || null,
-          questionText: cleanQuestion,
+          intent,
+          questionText: '',
         }),
       });
       const data = await res.json();
@@ -572,7 +670,7 @@ export default function Step4SentencePractice({
         setErrorMsg(data.error || '快捷帮助调用失败。');
         return;
       }
-      setGuidance({
+      setSelectionGuidance({
         category: data.category || 'expression',
         issue: data.issue || '',
         hint: data.hint || '',
@@ -581,27 +679,132 @@ export default function Step4SentencePractice({
       console.error(e);
       setErrorMsg('快捷帮助调用失败。' + (e.message || ''));
     } finally {
+      setSelectionAskLoading(false);
+    }
+  };
+
+  handleRequestGuidanceRef.current = () => {};
+
+
+  const handleLeftQuickAsk = async (ask: { id: GuidanceIntent; label: string }) => {
+    if (!activeTask || guidanceLoading) return;
+    const userMsgId = `u-${Date.now()}`;
+    setGuidanceThread((prev) => [
+      ...prev,
+      { id: userMsgId, role: 'user', label: ask.label },
+    ]);
+    setGuidanceIntent(ask.id);
+    setGuidanceLoading(true);
+    setErrorMsg('');
+    try {
+      const res = await fetch('/api/inline-guidance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scopeText: '',
+          fullDraft: userDraft.trim(),
+          concept: activeTask.concept,
+          prompts: activeTask.prompts,
+          intent: ask.id,
+          questionText: ask.label,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setErrorMsg(data.error || '快捷帮助调用失败。');
+        setGuidanceThread((prev) => [
+          ...prev,
+          {
+            id: `c-${Date.now()}`,
+            role: 'coach',
+            issue: '暂时没能生成建议',
+            hint: String(data.error || '请稍后再试。'),
+          },
+        ]);
+        return;
+      }
+      const result: InlineGuidanceResult = {
+        category: data.category || 'expression',
+        issue: data.issue || '',
+        hint: data.hint || '',
+      };
+      setGuidance(result);
+      setGuidanceThread((prev) => [
+        ...prev,
+        {
+          id: `c-${Date.now()}`,
+          role: 'coach',
+          category: result.category,
+          issue: result.issue,
+          hint: result.hint,
+        },
+      ]);
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg('快捷帮助调用失败。' + (e.message || ''));
+      setGuidanceThread((prev) => [
+        ...prev,
+        {
+          id: `c-${Date.now()}`,
+          role: 'coach',
+          issue: '调用失败',
+          hint: String(e?.message || '请检查网络后重试。'),
+        },
+      ]);
+    } finally {
       setGuidanceLoading(false);
     }
   };
 
+  useEffect(() => {
+    guidanceThreadEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [guidanceThread, guidanceLoading]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (selectedText) {
+          setSelectedText('');
+          setSelectionGuidance(null);
+          const el = editorRef.current;
+          if (el) {
+            const pos = el.selectionEnd;
+            el.setSelectionRange(pos, pos);
+          }
+        } else if (draftExpanded) {
+          setDraftExpanded(false);
+        } else if (activeAnnotationIdx != null) {
+          setActiveAnnotationIdx(null);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedText, draftExpanded, activeAnnotationIdx]);
+
+  useEffect(() => {
+    setActiveAnnotationIdx(null);
+    setSelectionGuidance(null);
+  }, [currentTaskIndex, viewMode]);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
-      <div className="lg:col-span-5 xl:col-span-5 flex flex-col h-[480px] lg:h-full bg-slate-50 rounded-xl border border-slate-200/80 p-4 min-h-0 overflow-y-auto">
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-600 uppercase tracking-wider">
-              <Sparkles className="h-4 w-4" />
-              <span>分段逐句通关训练</span>
+      <div className="lg:col-span-5 xl:col-span-5 flex flex-col h-[480px] lg:h-full bg-slate-50 rounded-xl border border-slate-200/80 p-3 min-h-0 overflow-hidden">
+        {/* Compact top switcher */}
+        <div className="shrink-0 space-y-1.5 pb-2 border-b border-slate-200/80">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 uppercase tracking-wider min-w-0">
+              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">逐句通关</span>
             </div>
             {tasks.length > 0 && (
-              <span className="font-mono text-[10px] font-bold text-slate-500 bg-slate-200/60 px-2 py-0.5 rounded-full">
-                已确认: {tasks.filter((t) => t.confirmed).length} / {tasks.length}
+              <span className="font-mono text-[10px] font-bold text-slate-500 bg-slate-200/60 px-1.5 py-0.5 rounded shrink-0">
+                {tasks.filter((t) => t.confirmed).length}/{tasks.length}
               </span>
             )}
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
+          <div className="flex gap-1 overflow-x-auto">
             {SECTION_ORDER.map((section) => {
               const sectionTasks = sectionTaskMap[section];
               const done = sectionTasks.filter(({ task }) => task.confirmed).length;
@@ -612,56 +815,60 @@ export default function Step4SentencePractice({
                   key={section}
                   onClick={() => handleSectionSelect(section)}
                   disabled={total === 0}
-                  className={`rounded-lg border px-3 py-2 text-left transition ${
+                  title={SECTION_LABELS[section]}
+                  className={`shrink-0 rounded-md border px-2 py-1 text-[10px] font-bold transition ${
                     isActive
-                      ? 'border-indigo-600 bg-indigo-50 text-indigo-900'
+                      ? 'border-indigo-600 bg-indigo-600 text-white'
                       : done === total && total > 0
                       ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
                       : 'border-slate-200 bg-white text-slate-600'
                   } ${total === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
-                  <div className="text-[11px] font-bold leading-tight">{SECTION_LABELS[section]}</div>
-                  <div className="text-[10px] mt-1 font-mono">
+                  {SECTION_SHORT_LABELS[section]}
+                  <span className="ml-1 font-mono font-normal opacity-80">
                     {done}/{total || 0}
-                  </div>
+                  </span>
                 </button>
               );
             })}
           </div>
 
           {!allConfirmed && sectionTaskMap[activeSection]?.length > 0 && (
-            <div className="flex items-center justify-between gap-2 pb-1 select-none overflow-x-auto">
-              <div className="flex gap-2 shrink-0">
+            <div className="flex items-center justify-between gap-2 select-none overflow-x-auto">
+              <div className="flex gap-1 shrink-0">
                 {sectionTaskMap[activeSection].map(({ task, idx }, localIdx) => (
                   <button
                     key={task.id}
                     onClick={() => handleTaskSelect(idx)}
-                    className={`px-3 py-1.5 rounded-lg border font-sans text-xs font-bold transition-all shrink-0 flex items-center gap-1 ${
+                    className={`px-2 py-0.5 rounded-md border font-sans text-[10px] font-bold transition-all shrink-0 flex items-center gap-0.5 ${
                       idx === currentTaskIndex
-                        ? 'border-indigo-600 bg-indigo-600 text-white shadow-sm'
+                        ? 'border-indigo-600 bg-indigo-600 text-white'
                         : task.confirmed
-                        ? 'border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100/70'
-                        : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-100'
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                        : 'border-slate-200 bg-white text-slate-500'
                     }`}
                   >
-                    <span>句 {localIdx + 1}</span>
-                    {task.confirmed && <CheckCircle2 className="h-3 w-3 text-emerald-600" />}
+                    <span>句{localIdx + 1}</span>
+                    {task.confirmed && <CheckCircle2 className="h-2.5 w-2.5 text-emerald-600" />}
                   </button>
                 ))}
               </div>
               <button
                 onClick={generateTasks}
                 disabled={loadingTasks}
-                className="text-[10px] text-indigo-600 font-bold hover:text-indigo-800 shrink-0 hover:underline flex items-center gap-1 cursor-pointer transition-all active:scale-95"
+                className="text-[10px] text-indigo-600 font-bold hover:text-indigo-800 shrink-0 hover:underline"
                 title="根据当前数据重新生成逐句任务"
               >
-                <span>重新生成 ↻</span>
+                ↻
               </button>
             </div>
           )}
+        </div>
 
+        {/* Main content — takes remaining height */}
+        <div className="flex-1 min-h-0 overflow-y-auto pt-2.5 space-y-3">
           {loadingTasks && (
-            <div className="flex flex-col gap-2 bg-indigo-50/50 rounded-xl p-4 border border-indigo-105/50 font-sans text-xs text-indigo-900 leading-relaxed py-5">
+            <div className="flex flex-col gap-2 bg-indigo-50/50 rounded-xl p-3 border border-indigo-100 font-sans text-xs text-indigo-900 leading-relaxed">
               <div className="flex items-center gap-2">
                 <Loader2 className="h-4 w-4 animate-spin text-indigo-600" />
                 <span className="font-bold">正在生成分段逐句训练任务...</span>
@@ -702,21 +909,21 @@ export default function Step4SentencePractice({
             </div>
           ) : (
             activeTask && (
-              <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3.5">
+              <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-sm space-y-3 flex flex-col min-h-0">
                 <div>
                   <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block mb-1">
                     🎯 当前中文语义目标
                   </span>
-                  <p className="text-slate-900 font-bold text-sm leading-relaxed bg-indigo-50/50 border-l-4 border-indigo-500 p-3 rounded-r-lg font-sans">
+                  <p className="text-slate-900 font-bold text-sm leading-relaxed bg-indigo-50/50 border-l-4 border-indigo-500 p-2.5 rounded-r-lg font-sans">
                     {activeTask.concept}
                   </p>
                 </div>
 
                 <div>
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
                     🔗 句型骨架提示
                   </span>
-                  <div className="space-y-2">
+                  <div className="space-y-1.5">
                     {activeTask.prompts.slice(0, 2).map((p, i) => {
                       const hasArrow = p.includes('->');
                       if (hasArrow) {
@@ -724,7 +931,7 @@ export default function Step4SentencePractice({
                         const engPattern = parts[0].trim();
                         const chiMapping = parts.slice(1).join('->').trim();
                         return (
-                          <div key={i} className="border-l-2 border-indigo-200 pl-2.5 space-y-0.5">
+                          <div key={i} className="border-l-2 border-indigo-200 pl-2 space-y-0.5">
                             <span className="font-mono text-xs font-bold text-indigo-900 select-all block">{engPattern}</span>
                             {chiMapping && (
                               <p className="font-sans text-[11px] text-slate-400 leading-normal">{chiMapping}</p>
@@ -733,7 +940,7 @@ export default function Step4SentencePractice({
                         );
                       }
                       return (
-                        <div key={i} className="border-l-2 border-indigo-200 pl-2.5 font-mono text-[11px] text-slate-600">
+                        <div key={i} className="border-l-2 border-indigo-200 pl-2 font-mono text-[11px] text-slate-600">
                           {p}
                         </div>
                       );
@@ -744,7 +951,7 @@ export default function Step4SentencePractice({
                           <span className="group-open:hidden">+ {activeTask.prompts.length - 2} 条更多</span>
                           <span className="hidden group-open:inline">收起</span>
                         </summary>
-                        <div className="mt-2 space-y-2">
+                        <div className="mt-1.5 space-y-1.5">
                           {activeTask.prompts.slice(2).map((p, i) => {
                             const hasArrow = p.includes('->');
                             if (hasArrow) {
@@ -752,7 +959,7 @@ export default function Step4SentencePractice({
                               const engPattern = parts[0].trim();
                               const chiMapping = parts.slice(1).join('->').trim();
                               return (
-                                <div key={i} className="border-l-2 border-indigo-100 pl-2.5 space-y-0.5">
+                                <div key={i} className="border-l-2 border-indigo-100 pl-2 space-y-0.5">
                                   <span className="font-mono text-xs font-bold text-indigo-800 select-all block">{engPattern}</span>
                                   {chiMapping && (
                                     <p className="font-sans text-[11px] text-slate-400 leading-normal">{chiMapping}</p>
@@ -761,7 +968,7 @@ export default function Step4SentencePractice({
                               );
                             }
                             return (
-                              <div key={i} className="border-l-2 border-indigo-100 pl-2.5 font-mono text-[11px] text-slate-500">
+                              <div key={i} className="border-l-2 border-indigo-100 pl-2 font-mono text-[11px] text-slate-500">
                                 {p}
                               </div>
                             );
@@ -771,12 +978,86 @@ export default function Step4SentencePractice({
                     )}
                   </div>
                 </div>
+
+                <div className="border-t border-slate-100 pt-2.5 space-y-2 flex flex-col min-h-0 flex-1">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                    快捷提问
+                  </span>
+                  <div className="grid grid-cols-2 gap-1.5 shrink-0">
+                    {LEFT_QUICK_ASKS.map((ask) => (
+                      <button
+                        key={ask.id}
+                        type="button"
+                        disabled={guidanceLoading || !activeTask}
+                        onClick={() => void handleLeftQuickAsk(ask)}
+                        className="rounded-lg border border-indigo-200 bg-indigo-50/60 px-2 py-2 text-left text-[11px] font-bold text-indigo-900 hover:bg-indigo-100 transition disabled:opacity-50"
+                      >
+                        {ask.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {(guidanceThread.length > 0 || guidanceLoading) && (
+                    <div className="flex-1 min-h-[140px] max-h-none overflow-y-auto space-y-1.5 rounded-lg bg-slate-50/80 border border-slate-100 p-2">
+                      {guidanceThread.map((msg) =>
+                        msg.role === 'user' ? (
+                          <div key={msg.id} className="flex justify-end">
+                            <div className="max-w-[90%] rounded-2xl rounded-br-md bg-indigo-600 px-2.5 py-1 text-[11px] font-bold text-white">
+                              {msg.label}
+                            </div>
+                          </div>
+                        ) : (
+                          <div key={msg.id} className="flex justify-start">
+                            <div className="max-w-[95%] rounded-2xl rounded-bl-md border border-slate-200 bg-white px-2.5 py-1.5 space-y-1 shadow-xs">
+                              {(() => {
+                                const hint = String(msg.hint || '').trim();
+                                const issue = String(msg.issue || '').trim();
+                                const showIssue =
+                                  !!issue &&
+                                  (!hint ||
+                                    (!hint.includes(issue) &&
+                                      issue.length >= 4 &&
+                                      issue !== '暂时没能生成建议' &&
+                                      issue !== '调用失败'));
+                                return (
+                                  <>
+                                    {showIssue && (
+                                      <p className="text-[11px] text-slate-500 leading-snug">
+                                        {renderHighlightedGuidanceText(issue)}
+                                      </p>
+                                    )}
+                                    {hint ? (
+                                      <p className="text-[12px] text-slate-800 leading-relaxed font-medium">
+                                        {renderHighlightedGuidanceText(hint)}
+                                      </p>
+                                    ) : showIssue ? null : (
+                                      <p className="text-[11px] text-slate-400">暂无建议</p>
+                                    )}
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        ),
+                      )}
+                      {guidanceLoading && (
+                        <div className="flex justify-start">
+                          <div className="inline-flex items-center gap-1.5 rounded-2xl rounded-bl-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-indigo-700">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            …
+                          </div>
+                        </div>
+                      )}
+                      <div ref={guidanceThreadEndRef} />
+                    </div>
+                  )}
+                </div>
               </div>
             )
           )}
 
           {errorMsg && (
-            <div className="bg-rose-50 border border-rose-100 rounded-lg p-3 text-rose-800 text-xs flex items-center gap-2 mt-2">
+            <div className="bg-rose-50 border border-rose-100 rounded-lg p-3 text-rose-800 text-xs flex items-center gap-2">
               <AlertCircle className="h-4 w-4 text-rose-500 shrink-0" />
               <span>{errorMsg}</span>
             </div>
@@ -784,29 +1065,45 @@ export default function Step4SentencePractice({
         </div>
       </div>
 
-      <div className="lg:col-span-7 xl:col-span-7 flex flex-col h-[480px] lg:h-full bg-white rounded-xl border border-slate-200 shadow-sm overflow-y-auto min-h-0">
-        <div className="bg-slate-50/80 border-b border-slate-200 px-4 py-2.5 shrink-0">
+      <div className="lg:col-span-7 xl:col-span-7 relative flex flex-col h-[480px] lg:h-full bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden min-h-0">
+        {/* Thin top bar */}
+        <div className="bg-slate-50/80 border-b border-slate-200 px-4 py-2 shrink-0">
           <div className="flex items-center justify-between gap-3">
-            <button
-              onClick={() => setTopicExpanded((v) => !v)}
-              className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500 hover:text-slate-700 transition"
-            >
-              <span>{topicExpanded ? '▾' : '▸'}</span>
-              <span>原题</span>
-              {!topicExpanded && (
-                <span className="font-normal text-slate-400 truncate max-w-[280px]">
-                  — {topic.question.slice(0, 60)}{topic.question.length > 60 ? '…' : ''}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={handleCopyDraft}
-              disabled={!fullDraftText}
-              className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-            >
-              <Clipboard className="h-3.5 w-3.5" />
-              复制全文
-            </button>
+            <div className="flex items-center gap-2 min-w-0">
+              <button
+                onClick={() => setTopicExpanded((v) => !v)}
+                className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500 hover:text-slate-700 transition shrink-0"
+              >
+                <span>{topicExpanded ? '▾' : '▸'}</span>
+                <span>原题</span>
+                {!topicExpanded && (
+                  <span className="font-normal text-slate-400 truncate max-w-[160px]">
+                    — {topic.question.slice(0, 40)}{topic.question.length > 40 ? '…' : ''}
+                  </span>
+                )}
+              </button>
+              <span className="text-slate-300 hidden sm:inline">|</span>
+              <span className="text-[11px] font-bold text-indigo-700 truncate hidden sm:inline">
+                {SECTION_LABELS[activeSection]}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setDraftExpanded(true)}
+                className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-slate-700 hover:bg-slate-50"
+              >
+                全文 ▸
+              </button>
+              <button
+                onClick={handleCopyDraft}
+                disabled={!fullDraftText}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Clipboard className="h-3.5 w-3.5" />
+                复制
+              </button>
+            </div>
           </div>
           {topicExpanded && (
             <p className="font-serif italic text-slate-700 text-xs leading-relaxed mt-2 pl-4 border-l-2 border-slate-300">
@@ -815,264 +1112,334 @@ export default function Step4SentencePractice({
           )}
         </div>
 
-        <div className={`flex-1 p-5 min-h-0 ${allConfirmed ? 'overflow-y-auto' : 'grid grid-rows-[1fr_auto] gap-4'}`}>
-          {allConfirmed && (
-            <div className="text-center py-6 space-y-1">
-              <div className="text-2xl">🎉</div>
-              <p className="font-bold text-emerald-700 text-sm">全文写作完成</p>
-              <p className="text-xs text-slate-400">{tasks.length} 句 · 约 {totalWords} 词</p>
+        {/* Context strip — current section preview only */}
+        {!allConfirmed && (
+          <button
+            type="button"
+            onClick={() => setDraftExpanded(true)}
+            className="shrink-0 border-b border-slate-100 px-4 py-2 text-left hover:bg-slate-50/80 transition"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                本段上下文
+              </span>
+              <span className="text-[10px] text-indigo-600 font-bold">展开全文</span>
             </div>
-          )}
-          <div ref={fullDraftRef} className="overflow-y-auto bg-slate-50/40 rounded-xl p-4 space-y-4">
-            {SECTION_ORDER.map((section) => {
-              const sectionTasks = sectionTaskMap[section];
-              if (!sectionTasks.length) return null;
-              return (
-                <section key={section} className="space-y-1">
-                  <h4 className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500 mb-1">
-                    {SECTION_LABELS[section]}
-                  </h4>
-                  <div className="divide-y divide-slate-100">
-                    {sectionTasks.map(({ task, idx }) => {
-                      const isActive = idx === currentTaskIndex;
-                      return (
-                        <div
-                          key={task.id}
-                          onClick={() => handleTaskSelect(idx)}
-                          className={`px-3 py-2 text-sm leading-relaxed cursor-pointer transition-colors ${
-                            isActive
-                              ? 'border-l-2 border-indigo-400 bg-indigo-50/50 text-slate-800'
-                              : task.confirmedSentence?.trim()
-                              ? 'text-slate-700 hover:bg-emerald-50/40'
-                              : 'text-slate-400 italic hover:bg-slate-100/60'
-                          }`}
-                        >
-                          {task.confirmedSentence?.trim() || `待确认：${task.concept}`}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
-              );
-            })}
-          </div>
+            <p className="mt-0.5 text-[11px] text-slate-500 truncate leading-relaxed">
+              {currentSectionPreview}
+            </p>
+          </button>
+        )}
 
-          {!allConfirmed && (
-            <div className="border-t border-slate-200 pt-4 bg-white space-y-3">
-              <div className="flex items-center justify-between">
+        {/* Full draft overlay drawer */}
+        {draftExpanded && (
+          <div className="absolute inset-0 z-20 flex flex-col bg-white/95 backdrop-blur-[2px]">
+            <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-2.5 shrink-0">
+              <span className="text-[11px] font-bold text-slate-700">全文草稿</span>
+              <button
+                type="button"
+                onClick={() => setDraftExpanded(false)}
+                className="text-[11px] font-bold text-slate-500 hover:text-slate-800"
+              >
+                收起 ✕
+              </button>
+            </div>
+            <div ref={fullDraftRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+              {allConfirmed && (
+                <div className="text-center py-2 space-y-1">
+                  <p className="font-bold text-emerald-700 text-sm">全文写作完成</p>
+                  <p className="text-xs text-slate-400">{tasks.length} 句 · 约 {totalWords} 词</p>
+                </div>
+              )}
+              {SECTION_ORDER.map((section) => {
+                const sectionTasks = sectionTaskMap[section];
+                if (!sectionTasks.length) return null;
+                return (
+                  <section key={section} className="space-y-1">
+                    <h4 className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500 mb-1">
+                      {SECTION_LABELS[section]}
+                    </h4>
+                    <div className="divide-y divide-slate-100">
+                      {sectionTasks.map(({ task, idx }) => {
+                        const isActive = idx === currentTaskIndex;
+                        return (
+                          <div
+                            key={task.id}
+                            onClick={() => {
+                              handleTaskSelect(idx);
+                              setDraftExpanded(false);
+                            }}
+                            className={`px-3 py-2 text-sm leading-relaxed cursor-pointer transition-colors ${
+                              isActive
+                                ? 'border-l-2 border-indigo-400 bg-indigo-50/50 text-slate-800'
+                                : task.confirmedSentence?.trim()
+                                ? 'text-slate-700 hover:bg-emerald-50/40'
+                                : 'text-slate-400 italic hover:bg-slate-100/60'
+                            }`}
+                          >
+                            {task.confirmedSentence?.trim() || `待确认：${task.concept}`}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Main practice stage */}
+        <div className="flex-1 min-h-0 flex flex-col p-4 overflow-hidden">
+          {allConfirmed ? (
+            <div className="flex-1 overflow-y-auto space-y-4">
+              <div className="text-center py-4 space-y-1">
+                <div className="text-2xl">🎉</div>
+                <p className="font-bold text-emerald-700 text-sm">全文写作完成</p>
+                <p className="text-xs text-slate-400">{tasks.length} 句 · 约 {totalWords} 词</p>
+              </div>
+              <div className="bg-slate-50/40 rounded-xl p-4 space-y-4">
+                {SECTION_ORDER.map((section) => {
+                  const sectionTasks = sectionTaskMap[section];
+                  if (!sectionTasks.length) return null;
+                  return (
+                    <section key={section} className="space-y-1">
+                      <h4 className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500 mb-1">
+                        {SECTION_LABELS[section]}
+                      </h4>
+                      <div className="divide-y divide-slate-100">
+                        {sectionTasks.map(({ task }) => (
+                          <div key={task.id} className="px-3 py-2 text-sm leading-relaxed text-slate-700">
+                            {task.confirmedSentence?.trim() || task.concept}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
+              <div className="flex items-center justify-between shrink-0">
                 <span className="text-[10px] text-slate-400 uppercase tracking-wider">
                   当前练习工作区
                 </span>
-                {userDraft.trim() && (
-                  <span className="text-[10px] text-slate-300 tabular-nums">
-                    {userDraft.trim().split(/\s+/).filter(Boolean).length}词
+                <div className="flex items-center gap-2">
+                  {userDraft.trim() && (
+                    <span className="text-[10px] text-slate-300 tabular-nums">
+                      {userDraft.trim().split(/\s+/).filter(Boolean).length}词
+                    </span>
+                  )}
+                  <span className="text-[10px] text-slate-300 hidden md:inline" title="快捷键">
+                    选中后点标签提问 · Esc 清除
                   </span>
-                )}
+                </div>
               </div>
 
-              {viewMode === 'editing' ? (
-                <textarea
-                  value={userDraft}
-                  onChange={(e) => {
-                    setUserDraft(e.target.value);
-                    setViewMode('editing');
-                  }}
-                  onSelect={handleEditorSelection}
-                  disabled={evaluating || !activeTask}
-                  placeholder="在此起草当前句子的英文版本..."
-                  className="w-full h-32 p-4 border border-slate-200 rounded-lg font-serif italic text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 resize-none leading-relaxed"
-                />
-              ) : (
-                <div className="w-full min-h-[128px] p-4 border border-slate-200 rounded-lg bg-slate-50/40 text-sm leading-relaxed">
-                  <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">句内批改视图（红色高亮）</div>
-                  <p className="font-serif text-slate-800">
-                    {reviewResult.segments.map((segment, idx) =>
-                      segment.annotation ? (
-                        <span
-                          key={idx}
-                          className="bg-rose-100 text-rose-800 underline decoration-wavy decoration-rose-500 px-0.5 rounded-sm cursor-help"
-                          title={`${CATEGORY_LABELS[segment.annotation.category] || segment.annotation.category}: ${segment.annotation.explanation}`}
-                        >
-                          {segment.text}
-                        </span>
-                      ) : (
-                        <span key={idx}>{segment.text}</span>
-                      ),
-                    )}
-                  </p>
-                  {reviewResult.segments.length === 0 && (
-                    <p className="text-slate-400 italic">暂无可批改内容。</p>
+              {/* Selection ask — chips + answer directly below */}
+              {viewMode === 'editing' && selectedScope && (
+                <div className="shrink-0 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50/70 px-2.5 py-2">
+                    <span className="text-[11px] text-indigo-800 truncate max-w-[180px]">
+                      选中：「{selectedScope}」
+                    </span>
+                    {selectedSceneChips.map((chip) => (
+                      <button
+                        key={chip.id}
+                        type="button"
+                        disabled={selectionAskLoading}
+                        onClick={() => void handleSelectionAsk(chip.id)}
+                        className="rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[10px] font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                      >
+                        {chip.label}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedText('');
+                        setSelectionGuidance(null);
+                      }}
+                      className="ml-auto text-[10px] text-slate-400 hover:text-slate-600"
+                    >
+                      Esc 清除
+                    </button>
+                  </div>
+                  {(selectionAskLoading || selectionGuidance) && (
+                    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 space-y-1">
+                      {selectionAskLoading && (
+                        <div className="text-[11px] text-indigo-700 flex items-center gap-1.5">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          …
+                        </div>
+                      )}
+                      {selectionGuidance && !selectionAskLoading && (
+                        <>
+                          {selectionGuidance.hint?.trim() ? (
+                            <p className="text-[12px] text-slate-800 leading-relaxed font-medium">
+                              {renderHighlightedGuidanceText(selectionGuidance.hint)}
+                            </p>
+                          ) : selectionGuidance.issue?.trim() ? (
+                            <p className="text-[12px] text-slate-800 leading-relaxed">
+                              {renderHighlightedGuidanceText(selectionGuidance.issue)}
+                            </p>
+                          ) : (
+                            <p className="text-[11px] text-slate-400">暂无建议</p>
+                          )}
+                        </>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
 
-              {viewMode === 'reviewing' && activeTask?.annotations && activeTask.annotations.length > 0 && (
-                <details open className="group">
-                  <summary className="flex items-center gap-1.5 cursor-pointer list-none text-[10px] font-bold text-rose-700 uppercase tracking-wider select-none">
-                    <span className="group-open:rotate-90 transition-transform inline-block">▸</span>
-                    批改说明（{activeTask.annotations.length} 处）
-                  </summary>
-                  <div className="mt-1.5 border-l-4 border-rose-300 pl-3 py-1 space-y-1.5">
-                    {activeTask.annotations.map((ann, idx) => (
-                      <div key={`${ann.text}-${idx}`} className="text-[11px] text-rose-900 leading-relaxed">
-                        <span className="font-bold mr-1">[{CATEGORY_LABELS[ann.category] || ann.category}]</span>
-                        <span className="font-mono bg-rose-50 px-1 rounded">{ann.text}</span>
-                        <span className="mx-1">{'->'}</span>
-                        <span>{ann.explanation}</span>
-                      </div>
-                    ))}
-                    {reviewResult.unmatched.length > 0 && (
-                      <div className="text-[11px] text-amber-700 pt-1 border-t border-rose-100">
-                        部分标注未能精确定位到原句，已按列表展示。
-                      </div>
-                    )}
-                  </div>
-                </details>
-              )}
-
-              {viewMode === 'reviewing' && activeTask?.contentAlignment && (
-                <details open className="group">
-                  <summary className={`flex items-center gap-1.5 cursor-pointer list-none text-[10px] font-bold uppercase tracking-wider select-none ${
-                    activeTask.contentAlignment.status === 'aligned'
-                      ? 'text-emerald-700'
-                      : activeTask.contentAlignment.status === 'partial'
-                        ? 'text-amber-700'
-                        : 'text-rose-700'
-                  }`}>
-                    <span className="group-open:rotate-90 transition-transform inline-block">▸</span>
-                    {{
-                      aligned: '✓ 意思对齐',
-                      partial: '⚠ 基本对齐，有待补充',
-                      mismatched: '✗ 意思偏差较大',
-                    }[activeTask.contentAlignment.status] ?? activeTask.contentAlignment.status}
-                  </summary>
-                  <div className={`mt-1.5 border-l-4 pl-3 py-1 space-y-1 ${
-                    activeTask.contentAlignment.status === 'aligned'
-                      ? 'border-emerald-400'
-                      : activeTask.contentAlignment.status === 'partial'
-                        ? 'border-amber-400'
-                        : 'border-rose-400'
-                  }`}>
-                    <p className="text-[11px] text-slate-700 leading-relaxed">
-                      {activeTask.contentAlignment.summary || '暂无总结。'}
-                    </p>
-                    {activeTask.contentAlignment.coveredPoints.length > 0 && (
-                      <div className="text-[11px] text-slate-600">
-                        <span className="font-bold mr-1">已覆盖：</span>
-                        <span>{activeTask.contentAlignment.coveredPoints.join('；')}</span>
-                      </div>
-                    )}
-                    {activeTask.contentAlignment.missingPoints.length > 0 && (
-                      <div className="text-[11px] text-amber-700">
-                        <span className="font-bold mr-1">待补充：</span>
-                        <span>{activeTask.contentAlignment.missingPoints.join('；')}</span>
-                      </div>
-                    )}
-                    {activeTask.contentAlignment.extraPoints.length > 0 && (
-                      <div className="text-[11px] text-rose-700">
-                        <span className="font-bold mr-1">偏离点：</span>
-                        <span>{activeTask.contentAlignment.extraPoints.join('；')}</span>
-                      </div>
-                    )}
-                  </div>
-                </details>
-              )}
-
-              <div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowGuidance((v) => !v);
-                    setGuidance(null);
-                    setGuidanceIntent('');
-                    setGuidanceQuestion('');
-                  }}
-                  className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-600 hover:text-indigo-800 transition"
-                >
-                  <WandSparkles className="h-3 w-3" />
-                  <span>{showGuidance ? '收起提问' : '遇到问题？快捷提问'}</span>
-                  {selectedScope && !showGuidance && (
-                    <span className="font-normal text-indigo-400 truncate max-w-[120px]">— 已选中片段</span>
-                  )}
-                </button>
-
-                {showGuidance && (
-                  <div className="mt-2 border-l-4 border-indigo-300 pl-3 py-1 space-y-2">
-                    <p className="text-[11px] text-slate-500">
-                      {selectedScope
-                        ? `针对选中：「${selectedScope}」`
-                        : userDraft.trim()
-                        ? '针对整句（按问题定位卡点）'
-                        : '尚无草稿（按中文目标给起笔思路）'}
-                    </p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {activeGuidanceChips.map((chip) => {
-                        const active = guidanceIntent === chip.id;
-                        return (
+              <div className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-0.5">
+                {viewMode === 'editing' ? (
+                  <textarea
+                    ref={editorRef}
+                    value={userDraft}
+                    onChange={(e) => {
+                      setUserDraft(e.target.value);
+                      setViewMode('editing');
+                    }}
+                    onSelect={handleEditorSelection}
+                    disabled={evaluating || !activeTask}
+                    placeholder="在此起草当前句子的英文版本... 选中片段可提问"
+                    className="w-full min-h-[160px] h-full p-4 border border-slate-200 rounded-lg font-serif italic text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 resize-none leading-relaxed"
+                  />
+                ) : (
+                  <div className="w-full min-h-[128px] p-4 border border-slate-200 rounded-lg bg-slate-50/40 text-sm leading-relaxed">
+                    <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">
+                      句内批改（点击描红查看说明）
+                    </div>
+                    <p className="font-serif text-slate-800">
+                      {reviewResult.segments.map((segment, idx) =>
+                        segment.annotation ? (
                           <button
-                            key={chip.id}
                             type="button"
-                            onClick={() => {
-                              setGuidanceIntent(chip.id);
-                              setGuidance(null);
+                            key={idx}
+                            onClick={() =>
+                              focusAnnotation(
+                                typeof segment.annotationIndex === 'number'
+                                  ? segment.annotationIndex
+                                  : null,
+                              )
+                            }
+                            className={`px-0.5 rounded-sm underline decoration-wavy decoration-rose-500 cursor-pointer transition ${
+                              activeAnnotationIdx === segment.annotationIndex
+                                ? 'bg-rose-300 text-rose-950 ring-2 ring-rose-400'
+                                : 'bg-rose-100 text-rose-800 hover:bg-rose-200'
+                            }`}
+                            title={`${CATEGORY_LABELS[segment.annotation.category] || segment.annotation.category}: ${segment.annotation.explanation}`}
+                          >
+                            {segment.text}
+                          </button>
+                        ) : (
+                          <span key={idx}>{segment.text}</span>
+                        ),
+                      )}
+                    </p>
+                    {reviewResult.segments.length === 0 && (
+                      <p className="text-slate-400 italic">暂无可批改内容。</p>
+                    )}
+                  </div>
+                )}
+
+                {viewMode === 'reviewing' && activeTask?.annotations && activeTask.annotations.length > 0 && (
+                  <div ref={annotationListRef} className="space-y-1.5">
+                    <div className="text-[10px] font-bold text-rose-700 uppercase tracking-wider">
+                      批改说明（{activeTask.annotations.length} 处）· 点击与描红联动
+                    </div>
+                    <div className="space-y-1.5">
+                      {activeTask.annotations.map((ann, idx) => {
+                        const active = activeAnnotationIdx === idx;
+                        return (
+                          <div
+                            key={`${ann.text}-${idx}`}
+                            ref={(el) => {
+                              annotationItemRefs.current[idx] = el;
                             }}
-                            className={`rounded-full border px-2.5 py-1 text-[11px] font-bold transition ${
+                            onClick={() => focusAnnotation(idx)}
+                            className={`cursor-pointer rounded-md border px-2.5 py-1.5 text-[11px] leading-relaxed transition ${
                               active
-                                ? 'border-indigo-500 bg-indigo-600 text-white'
-                                : 'border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50'
+                                ? 'border-rose-400 bg-rose-50 text-rose-950 shadow-sm'
+                                : 'border-transparent border-l-4 border-l-rose-200 text-rose-900 hover:bg-rose-50/60'
                             }`}
                           >
-                            {chip.label}
-                          </button>
+                            <span className="font-bold mr-1">
+                              [{CATEGORY_LABELS[ann.category] || ann.category}]
+                            </span>
+                            <span className="font-mono bg-rose-100/80 px-1 rounded">{ann.text}</span>
+                            <span className="mt-0.5 block text-rose-800/90">{ann.explanation}</span>
+                          </div>
                         );
                       })}
+                      {reviewResult.unmatched.length > 0 && (
+                        <div className="text-[11px] text-amber-700 pt-1">
+                          部分标注未能精确定位到原句，已按列表展示。
+                        </div>
+                      )}
                     </div>
-                    <textarea
-                      value={guidanceQuestion}
-                      onChange={(e) => setGuidanceQuestion(e.target.value)}
-                      rows={2}
-                      placeholder={
-                        selectedScope
-                          ? '例如：这个片段听起来不自然，不知道要换什么表达。'
-                          : '例如：我不知道这句怎么起步，或者不知道该用哪个词。'
-                      }
-                      className="w-full rounded-md border border-slate-200 bg-white px-2.5 py-2 text-[11px] text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 resize-none"
-                    />
-                    <button
-                      onClick={handleRequestGuidance}
-                      disabled={guidanceLoading || !activeTask}
-                      className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      发送提问
-                    </button>
-                    {guidanceLoading && (
-                      <div className="text-[11px] text-indigo-700 flex items-center gap-1.5">
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        正在生成引导建议...
-                      </div>
-                    )}
-                    {guidance && (
-                      <div className="space-y-1 text-[11px] pt-1">
-                        <div className="text-indigo-900">
-                          <span className="font-bold mr-1">[{CATEGORY_LABELS[guidance.category] || guidance.category}]</span>
-                          <span>{guidance.issue}</span>
-                        </div>
-                        <div className="text-slate-700 border-l-2 border-indigo-200 pl-2">
-                          {guidance.hint}
-                        </div>
-                      </div>
-                    )}
                   </div>
+                )}
+
+                {viewMode === 'reviewing' && activeTask?.contentAlignment && (
+                  <details className="group">
+                    <summary className={`flex items-center gap-1.5 cursor-pointer list-none text-[10px] font-bold uppercase tracking-wider select-none ${
+                      activeTask.contentAlignment.status === 'aligned'
+                        ? 'text-emerald-700'
+                        : activeTask.contentAlignment.status === 'partial'
+                          ? 'text-amber-700'
+                          : 'text-rose-700'
+                    }`}>
+                      <span className="group-open:rotate-90 transition-transform inline-block">▸</span>
+                      {{
+                        aligned: '✓ 意思对齐',
+                        partial: '⚠ 基本对齐，有待补充',
+                        mismatched: '✗ 意思偏差较大',
+                      }[activeTask.contentAlignment.status] ?? activeTask.contentAlignment.status}
+                    </summary>
+                    <div className={`mt-1.5 border-l-4 pl-3 py-1 space-y-1 ${
+                      activeTask.contentAlignment.status === 'aligned'
+                        ? 'border-emerald-400'
+                        : activeTask.contentAlignment.status === 'partial'
+                          ? 'border-amber-400'
+                          : 'border-rose-400'
+                    }`}>
+                      <p className="text-[11px] text-slate-700 leading-relaxed">
+                        {activeTask.contentAlignment.summary || '暂无总结。'}
+                      </p>
+                      {activeTask.contentAlignment.coveredPoints.length > 0 && (
+                        <div className="text-[11px] text-slate-600">
+                          <span className="font-bold mr-1">已覆盖：</span>
+                          <span>{activeTask.contentAlignment.coveredPoints.join('；')}</span>
+                        </div>
+                      )}
+                      {activeTask.contentAlignment.missingPoints.length > 0 && (
+                        <div className="text-[11px] text-amber-700">
+                          <span className="font-bold mr-1">待补充：</span>
+                          <span>{activeTask.contentAlignment.missingPoints.join('；')}</span>
+                        </div>
+                      )}
+                      {activeTask.contentAlignment.extraPoints.length > 0 && (
+                        <div className="text-[11px] text-rose-700">
+                          <span className="font-bold mr-1">偏离点：</span>
+                          <span>{activeTask.contentAlignment.extraPoints.join('；')}</span>
+                        </div>
+                      )}
+                    </div>
+                  </details>
                 )}
               </div>
 
               {!activeTask?.hasBeenChecked && userDraft.trim() && (
-                <div className="text-[11px] text-slate-500">
+                <div className="text-[11px] text-slate-500 shrink-0">
                   你可以直接确认，也可以先批改再确认。
                 </div>
               )}
 
-              <div className="sticky bottom-0 bg-white pt-2 pb-1 -mx-4 px-4 border-t border-slate-100 flex flex-col sm:flex-row gap-2">
+              <div className="shrink-0 bg-white pt-2 border-t border-slate-100 flex flex-col sm:flex-row gap-2">
                 <button
                   onClick={handleConfirmSentence}
                   disabled={!userDraft.trim() || !activeTask || confirming}

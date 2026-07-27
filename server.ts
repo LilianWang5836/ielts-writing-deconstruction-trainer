@@ -11148,6 +11148,11 @@ Rules:
       }
 
       const ai = getAI();
+      const isLeftQuickAsk =
+        !normalizedScopeText &&
+        (normalizedIntent === "find_word" ||
+          normalizedIntent === "start_sentence");
+
       const prompt = `
         You are an IELTS writing coach.
         The student is drafting ONE sentence in Step 4.
@@ -11192,6 +11197,19 @@ Rules:
         3. Even for "vocabulary", do NOT provide a ready-made full sentence, polished sentence, or full translated answer.
         4. issue/hint MUST be plain Chinese with learner-friendly wording (IELTS 5-5.5 level), avoid heavy grammar jargon.
         5. Keep it short and practical.
+${
+  isLeftQuickAsk
+    ? `
+        EXTRA — LEFT-PANEL QUICK ASK (intent is find_word or start_sentence, no selected scope):
+        - ULTRA COMPACT. No greetings, no restating the Chinese concept, no "你可以试试", no filler.
+        - issue: leave as "" OR one short clause (≤12 Chinese characters). Prefer "".
+        - hint: ONLY the actionable core.
+          * find_word / vocabulary: list 1-3 candidates like \`word\` 短注; max ~40 Chinese chars total notes.
+          * start_sentence / expression: ≤2 short sentences on how to open; no full sample sentence.
+        - Do NOT write diagnosis essays. Density over politeness.
+`
+    : ""
+}
 
         Return JSON:
         {
