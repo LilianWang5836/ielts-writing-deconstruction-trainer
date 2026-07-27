@@ -15,6 +15,7 @@ import {
   computeEssayFrameworkSignature,
   resolveArgumentRelation,
   getRequiredBeatsForRelation,
+  ARGUMENT_RELATION_BEATS,
   stepCoversArgumentBeat,
   isConcessionStepLabel,
   isStep3AffirmativeConfirmation,
@@ -2499,31 +2500,67 @@ function isStep3RejectMessage(msg: string): boolean {
   return /不是已经写了|明明写了|刚才写过|重复问|已经确认过|都写过了/.test(t);
 }
 
+/** Normalize a step label for confirmed-slot matching across model key/label churn. */
+function normalizeStep3SlotLabelForMatch(
+  blockLabel: string,
+  stepLabel: string,
+): string {
+  return stripStep3BlockLabelPrefix(blockLabel, stepLabel)
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
 /**
- * Confirmed-only board: wipe every slot, then restore prev confirmed values by key.
+ * Confirmed-only board: wipe every slot, then restore prev confirmed values by
+ * key first; if the key churned, restore by same blockId + normalized label.
  * Model prefill of unconfirmed slots is discarded (confirm-then-write).
  */
 function enforceConfirmedOnlySlots(plan: any, prevPlan: any): number {
   if (!plan || !Array.isArray(plan.pointBlocks)) return 0;
   const confirmedByKey = new Map<string, any>();
+  // `${blockId}::${normalizedLabel}` → confirmed prev step (fallback when key churns)
+  const confirmedByBlockLabel = new Map<string, { key: string; step: any }>();
   for (const block of prevPlan?.pointBlocks || []) {
+    const blockId = String(block?.id || "").trim();
+    const blockLabel = String(block?.label || "");
     for (const step of block?.steps || []) {
       const key = String(step?.key || "").trim();
-      if (key && isStep3Confirmed(step)) {
-        confirmedByKey.set(key, step);
+      if (!key || !isStep3Confirmed(step)) continue;
+      confirmedByKey.set(key, step);
+      if (blockId) {
+        const labelKey = `${blockId}::${normalizeStep3SlotLabelForMatch(blockLabel, String(step?.label || ""))}`;
+        if (!confirmedByBlockLabel.has(labelKey)) {
+          confirmedByBlockLabel.set(labelKey, { key, step });
+        }
       }
     }
   }
   let restored = 0;
   for (const block of plan.pointBlocks) {
     if (!Array.isArray(block?.steps)) continue;
+    const blockId = String(block?.id || "").trim();
+    const blockLabel = String(block?.label || "");
     for (const step of block.steps) {
       const key = String(step?.key || "").trim();
-      const prev = key ? confirmedByKey.get(key) : null;
+      let prev = key ? confirmedByKey.get(key) : null;
+      if (!prev && blockId) {
+        const labelKey = `${blockId}::${normalizeStep3SlotLabelForMatch(blockLabel, String(step?.label || ""))}`;
+        const hit = confirmedByBlockLabel.get(labelKey);
+        // Only reclaim via label if that confirmed key is still outstanding.
+        if (hit && confirmedByKey.has(hit.key)) {
+          prev = hit.step;
+        }
+      }
       if (prev) {
+        const prevKey = String(prev.key || "").trim();
+        // Preserve confirmed key/value/label through model key/label churn.
+        if (prevKey) step.key = prevKey;
         step.value = String(prev.value || "");
         step.status = "confirmed";
-        confirmedByKey.delete(key);
+        if (prev.label != null && String(prev.label).trim()) {
+          step.label = prev.label;
+        }
+        confirmedByKey.delete(prevKey || key);
         restored += 1;
       } else {
         step.value = "";
@@ -2553,6 +2590,92 @@ function enforceConfirmedOnlySlots(plan: any, prevPlan: any): number {
   return restored;
 }
 
+/** True when an empty step looks like a framework beat injection (keep it). */
+function isAuthorizedFrameworkBeatStep(step: any, blockLabel: string): boolean {
+  const key = String(step?.key || "").trim();
+  if (/_beat_\d+$/.test(key)) return true;
+  const allBeats: string[] = [];
+  for (const beats of Object.values(ARGUMENT_RELATION_BEATS)) {
+    for (const b of beats) allBeats.push(b);
+  }
+  if (allBeats.length === 0) return false;
+  if (allBeats.some((beat) => stepCoversArgumentBeat(step, beat))) return true;
+  const label = stripStep3BlockLabelPrefix(
+    blockLabel,
+    String(step?.label || ""),
+  );
+  const labelNorm = label.replace(/\s+/g, "").toLowerCase();
+  return allBeats.some((beat) => {
+    const beatNorm = String(beat || "")
+      .replace(/\s+/g, "")
+      .toLowerCase();
+    return (
+      !!beatNorm &&
+      (labelNorm === beatNorm ||
+        labelNorm.includes(beatNorm) ||
+        beatNorm.includes(labelNorm))
+    );
+  });
+}
+
+/**
+ * Drop empty (no genuine value / not confirmed) steps the model freely inserted
+ * whose keys were not in prevPlan. Keeps framework beat injections
+ * (`*_beat_N` or required argument-relation beat labels).
+ * Optional keepKeys: protect confirm-path targets (one-shot reclass) from prune.
+ */
+function pruneUnauthorizedEmptySteps(
+  plan: any,
+  prevPlan: any,
+  keepKeys: string[] = [],
+): number {
+  if (!plan || !Array.isArray(plan.pointBlocks)) return 0;
+  if (!prevPlan || !Array.isArray(prevPlan.pointBlocks)) return 0;
+  const prevKeys = new Set<string>();
+  for (const block of prevPlan.pointBlocks) {
+    for (const step of block?.steps || []) {
+      const key = String(step?.key || "").trim();
+      if (key) prevKeys.add(key);
+    }
+  }
+  // No prior skeleton — do not wipe the model's first plan.
+  if (prevKeys.size === 0) return 0;
+
+  const protectedKeys = new Set(
+    (keepKeys || []).map((k) => String(k || "").trim()).filter(Boolean),
+  );
+
+  let pruned = 0;
+  for (const block of plan.pointBlocks) {
+    if (!Array.isArray(block?.steps)) continue;
+    const blockLabel = String(block?.label || "");
+    const kept: any[] = [];
+    for (const step of block.steps) {
+      if (isStep3Confirmed(step) || isGenuineStep3StepValue(step)) {
+        kept.push(step);
+        continue;
+      }
+      const key = String(step?.key || "").trim();
+      if (key && (prevKeys.has(key) || protectedKeys.has(key))) {
+        kept.push(step);
+        continue;
+      }
+      if (isAuthorizedFrameworkBeatStep(step, blockLabel)) {
+        kept.push(step);
+        continue;
+      }
+      pruned += 1;
+    }
+    block.steps = kept;
+  }
+  if (pruned > 0) {
+    console.warn(
+      `[Step3Guard] Pruned ${pruned} unauthorized empty step(s) not present in prevPlan.`,
+    );
+  }
+  return pruned;
+}
+
 function findStepLocationByKey(
   plan: any,
   key: string,
@@ -2574,6 +2697,114 @@ function findStepLocationByKey(
     }
   }
   return null;
+}
+
+/** True when targetKey is the immediate next empty step after firstEmpty. */
+function isImmediateNextEmptyAfterFirst(
+  plan: any,
+  empty: { blockIndex: number; stepIndex: number },
+  targetKey: string,
+): boolean {
+  let passedFirst = false;
+  const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+  for (let bi = 0; bi < blocks.length; bi++) {
+    const steps = Array.isArray(blocks[bi]?.steps) ? blocks[bi].steps : [];
+    for (let si = 0; si < steps.length; si++) {
+      if (isStep3Confirmed(steps[si])) continue;
+      if (!passedFirst) {
+        passedFirst = bi === empty.blockIndex && si === empty.stepIndex;
+        continue;
+      }
+      return String(steps[si]?.key || "") === targetKey;
+    }
+  }
+  return false;
+}
+
+/**
+ * One-shot semantic reclass (答非所问但合理 → 一次归对格):
+ * Model targeted a new empty key instead of firstEmpty. Prefer preserving
+ * firstEmpty key: copy the model's label onto firstEmpty, stage there, prune
+ * the duplicate new empty.
+ */
+function absorbStep3ConfirmReclass(
+  plan: any,
+  empty: { blockIndex: number; stepIndex: number; cleanStepLabel?: string },
+  emptyKey: string,
+  slotEval: Step3SlotEvalPayload,
+  existingPending: KickoffPendingDraft[],
+): {
+  activeKey: string;
+  label: string;
+  blockIndex: number;
+  stepIndex: number;
+} | null {
+  if (!plan || !empty || !emptyKey || !slotEval?.activeKey) return null;
+  if (emptyKey === slotEval.activeKey) return null;
+  if (
+    Array.isArray(existingPending) &&
+    existingPending.some((d) => String(d?.key || "") === emptyKey)
+  ) {
+    return null;
+  }
+
+  const emptyStep =
+    plan.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+  if (
+    !emptyStep ||
+    isStep3Confirmed(emptyStep) ||
+    isGenuineStep3StepValue(emptyStep)
+  ) {
+    return null;
+  }
+
+  const targetLoc = findStepLocationByKey(plan, slotEval.activeKey);
+  if (!targetLoc) return null;
+  if (
+    isStep3Confirmed(targetLoc.step) ||
+    isGenuineStep3StepValue(targetLoc.step)
+  ) {
+    return null;
+  }
+
+  const sameBlock = targetLoc.blockIndex === empty.blockIndex;
+  const immediateNext = isImmediateNextEmptyAfterFirst(
+    plan,
+    empty,
+    slotEval.activeKey,
+  );
+  if (!sameBlock && !immediateNext) return null;
+
+  // (a) Preserve firstEmpty key; adopt model's label from the targeted empty.
+  const newLabel =
+    String(targetLoc.step?.label || "").trim() ||
+    String(targetLoc.label || "").trim();
+  if (newLabel) emptyStep.label = newLabel;
+  if (targetLoc.step?.placeholder != null) {
+    emptyStep.placeholder = targetLoc.step.placeholder;
+  }
+
+  // Prune the duplicate new empty key (different from firstEmpty).
+  const tSteps = plan.pointBlocks[targetLoc.blockIndex]?.steps;
+  if (Array.isArray(tSteps)) {
+    const idx = tSteps.findIndex(
+      (s: any) => String(s?.key || "") === slotEval.activeKey,
+    );
+    if (idx >= 0) tSteps.splice(idx, 1);
+  }
+
+  const blockLabel = String(
+    plan.pointBlocks[empty.blockIndex]?.label || `分点${empty.blockIndex + 1}`,
+  );
+  return {
+    activeKey: emptyKey,
+    label: stripStep3BlockLabelPrefix(
+      blockLabel,
+      String(emptyStep.label || newLabel || "展开"),
+    ),
+    blockIndex: empty.blockIndex,
+    stepIndex: empty.stepIndex,
+  };
 }
 
 /** Unique write entry: pending → confirmed slots only on explicit affirm. */
@@ -2712,7 +2943,90 @@ function countNarrativeChainLabels(text: string): number {
 }
 
 /**
- * Illegal coach text that contradicts the board (dump / fake complete).
+ * Identity tokens for a pointBlock (label / short subClaim) used to detect
+ * coach asks that jump to a later block while an earlier slot is still empty.
+ */
+function step3PointBlockIdentityTokens(block: any): string[] {
+  const out: string[] = [];
+  const push = (s: string) => {
+    const t = String(s || "").trim();
+    if (t.length >= 4 && !out.includes(t)) out.push(t);
+  };
+  const rawLabel = String(block?.label || "").trim();
+  const stripped = rawLabel
+    .replace(/^分点\s*\d+\s*[：:\-–—]\s*/u, "")
+    .trim();
+  push(stripped);
+  const core = stripped.replace(/[（(][^）)]*[）)]/g, "").trim();
+  push(core);
+  const sub = String(block?.subClaim || "").trim();
+  if (sub.length >= 8 && sub.length <= 48) push(sub);
+  return out;
+}
+
+/**
+ * True when coach text advances into a later pointBlock while firstEmpty is
+ * still in an earlier block. Empty slots must be filled (or deleted) first —
+ * cross-block skip asks are forbidden regardless of slot role.
+ *
+ * Scope: prefer the ask half (Part2 after ---). Part1 may preview「次要方向」
+ * as plan shape on kickoff without counting as a skip-ahead ask.
+ */
+function detectStep3CrossBlockSkipAsk(
+  text: string,
+  plan: any,
+  empty: { blockIndex: number; cleanStepLabel?: string },
+): boolean {
+  const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+  if (blocks.length < 2) return false;
+  if (empty.blockIndex < 0 || empty.blockIndex >= blocks.length - 1) {
+    return false;
+  }
+
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  const split = splitTwoParts(t, 1);
+  const askPart = (split.ok ? String(split.part2 || "") : t).trim();
+  const scan = askPart || t;
+
+  // Explicit advance into a later point (ask half — not mere Part1 plan preview).
+  if (
+    /进入次要(?:方向)?|现在[，,\s]*(?:我们)?进入次要|下一个分点|下一分点|第二个分点|现在[，,\s]*进入.{0,12}(?:分点|方向|略写)/.test(
+      scan,
+    )
+  ) {
+    return true;
+  }
+  // “分点2/3…” in the ask half when firstEmpty is still earlier.
+  const pointNumHit = scan.match(/分点\s*([2-9])/);
+  if (pointNumHit) {
+    const n = Number(pointNumHit[1]);
+    if (Number.isFinite(n) && n - 1 > empty.blockIndex) return true;
+  }
+  // Claim earlier/major chain is fully done, then pivot — still empty upstream.
+  // Completion claim may sit in Part1; pivot must appear in ask half or full text.
+  if (
+    /(?:主要方向|这个分点|该分点).{0,40}(?:已经全部确认|已全部确认|全部确认了)|论证链已经全部确认|连成了.{0,12}逻辑闭环/.test(
+      t,
+    ) &&
+    /进入次要|次要方向|下一个分点|分点\s*[2-9]|略写/.test(scan)
+  ) {
+    return true;
+  }
+
+  // Ask half names a later block’s identity (never Part1-only preview).
+  for (let bi = empty.blockIndex + 1; bi < blocks.length; bi++) {
+    const tokens = step3PointBlockIdentityTokens(blocks[bi]);
+    for (const token of tokens) {
+      if (scan.includes(token)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Illegal coach text that contradicts the board (dump / fake complete /
+ * cross-block skip while earlier slots remain empty).
  * Returns a reject code or "" when text is acceptable.
  */
 function detectStep3IllegalCoachText(text: string, plan: any): string {
@@ -2731,6 +3045,11 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
       confirmed < total)
   ) {
     return "fake_complete";
+  }
+
+  // Earlier pointBlock still has empty slots — forbid advancing the ask to a later block.
+  if (detectStep3CrossBlockSkipAsk(t, plan, empty)) {
+    return "skip_ahead_cross_block";
   }
 
   // Complete-then-confirm dump: multi-slot polished chain for student to rubber-stamp.
@@ -2764,10 +3083,71 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
   return "";
 }
 
-/** Short firstEmpty ask — veto only for mid-dialogue illegal text (not kickoff). */
+/** Soft firstEmpty ask — mid-dialogue veto fallback (not the rigid 谁/情况下 template). */
 function buildStep3VetoFirstEmptyAsk(label: string): string {
   const L = String(label || "当前这一环").trim() || "当前这一环";
-  return `我们还没写到「${L}」这一环。\n\n---\n\n请先用一句话说清「${L}」：谁、在什么情况下、发生了什么？`;
+  return `我们继续。\n\n---\n\n请先把「${L}」说具体一点。`;
+}
+
+/** Whether coach ask text already targets the firstEmpty label. */
+function askTextMentionsStep3Label(text: string, label: string): boolean {
+  const L = String(label || "").trim();
+  if (!L || L === "当前这一环") return true;
+  const t = String(text || "");
+  if (t.includes(L)) return true;
+  const core = L.replace(/[（(][^）)]*[）)]/g, "")
+    .replace(/[：:].*$/u, "")
+    .trim();
+  return core.length >= 2 && t.includes(core);
+}
+
+/**
+ * Mid-dialogue soft salvage: strip illegal dumps; keep natural Part2 ask when it
+ * already targets firstEmpty. Else soft short ask (not rigid 谁/情况下 boilerplate).
+ */
+function salvageStep3VetoAskText(rawText: string, label: string): string {
+  const L = String(label || "当前这一环").trim() || "当前这一环";
+  const soft = buildStep3VetoFirstEmptyAsk(L);
+  const cleaned = stripStep3EnglishTranslationShow(
+    stripStep3MetaProcessPhrases(stripStep3KickoffDumpBlocks(rawText)),
+  );
+  const split = splitTwoParts(cleaned, 1);
+  const part2 = (split.ok ? split.part2 : cleaned).trim();
+  const part2Ok =
+    part2.length >= 8 &&
+    looksLikeQuestionEnding(part2) &&
+    countNarrativeChainLabels(part2) < 2 &&
+    askTextMentionsStep3Label(part2, L) &&
+    !/待确认草稿|整理了以下论证|请回复\s*\*?\*?[「"']?对|逻辑链草稿/.test(
+      part2,
+    );
+  if (part2Ok) {
+    let part1 = split.ok ? String(split.part1 || "").trim() : "";
+    part1 = stripStep3KickoffDumpBlocks(part1);
+    if (
+      !part1 ||
+      part1.length < 4 ||
+      countNarrativeChainLabels(part1) >= 2 ||
+      /待确认草稿|整理了以下论证|请回复\s*\*?\*?[「"']?对|逻辑链草稿/.test(
+        part1,
+      )
+    ) {
+      part1 = "我们继续。";
+    }
+    return `${part1}\n\n---\n\n${part2}`;
+  }
+  if (
+    cleaned.length >= 8 &&
+    looksLikeQuestionEnding(cleaned) &&
+    countNarrativeChainLabels(cleaned) < 2 &&
+    askTextMentionsStep3Label(cleaned, L) &&
+    !/待确认草稿|请回复\s*\*?\*?[「"']?对|逻辑链草稿/.test(cleaned)
+  ) {
+    return cleaned.includes("\n---\n")
+      ? cleaned
+      : `我们继续。\n\n---\n\n${cleaned}`;
+  }
+  return soft;
 }
 
 /**
@@ -2836,19 +3216,30 @@ function stripStep3KickoffDumpBlocks(text: string): string {
  */
 function salvageStep3KickoffAskText(rawText: string, label: string): string {
   const L = String(label || "当前这一环").trim() || "当前这一环";
+  const soft = `我们开始。\n\n---\n\n请先用你自己的话写「${L}」。`;
   const cleaned = stripStep3EnglishTranslationShow(
     stripStep3MetaProcessPhrases(stripStep3KickoffDumpBlocks(rawText)),
   );
+  const looksUsableKickoffAsk = (s: string): boolean => {
+    const part = String(s || "").trim();
+    if (part.length < 8) return false;
+    if (countNarrativeChainLabels(part) >= 2) return false;
+    if (
+      /待确认草稿|整理了以下论证|请回复\s*\*?\*?[「"']?对|逻辑链草稿|一次性确认/.test(
+        part,
+      )
+    ) {
+      return false;
+    }
+    // Prefer ?/？; also accept imperative expand asks (common without question mark).
+    if (looksLikeQuestionEnding(part)) return true;
+    return /请(?:先|用|把|你)|怎么(?:表达|说|写)|先(?:从|写|说)|用一句话|说清楚|你想/.test(
+      part,
+    );
+  };
   const split = splitTwoParts(cleaned, 1);
   const part2 = (split.ok ? split.part2 : cleaned).trim();
-  const part2Ok =
-    part2.length >= 8 &&
-    looksLikeQuestionEnding(part2) &&
-    countNarrativeChainLabels(part2) < 2 &&
-    !/待确认草稿|整理了以下论证|请回复\s*\*?\*?[「"']?对|逻辑链草稿/.test(
-      part2,
-    );
-  if (part2Ok) {
+  if (looksUsableKickoffAsk(part2)) {
     let part1 = split.ok ? String(split.part1 || "").trim() : "";
     part1 = stripStep3KickoffDumpBlocks(part1);
     if (
@@ -2863,17 +3254,12 @@ function salvageStep3KickoffAskText(rawText: string, label: string): string {
     }
     return `${part1}\n\n---\n\n${part2}`;
   }
-  if (
-    cleaned.length >= 8 &&
-    looksLikeQuestionEnding(cleaned) &&
-    countNarrativeChainLabels(cleaned) < 2 &&
-    !/待确认草稿|请回复\s*\*?\*?[「"']?对|逻辑链草稿/.test(cleaned)
-  ) {
+  if (looksUsableKickoffAsk(cleaned)) {
     return cleaned.includes("\n---\n")
       ? cleaned
       : `我们开始搭这一段的论证链。\n\n---\n\n${cleaned}`;
   }
-  return `我们开始写这一段。\n\n---\n\n先从「${L}」说起：这一点你想怎么用一句话表达？`;
+  return soft;
 }
 
 /**
@@ -2920,8 +3306,9 @@ function prepareStep3KickoffCoachText(
 }
 
 /**
- * Full-text veto: board is truth. Replace illegal coach text with a short
- * firstEmpty ask. Aligns step3SlotEval to expand. Does NOT invent argument prose.
+ * Full-text veto: board is truth. Prefer salvaging the model's ask when it
+ * already targets firstEmpty; else a short soft ask. Aligns step3SlotEval to
+ * expand. Does NOT invent argument prose.
  * Mid-dialogue only — kickoff uses prepareStep3KickoffCoachText instead.
  */
 function vetoStep3TextToFirstEmptyAsk(
@@ -2946,7 +3333,10 @@ function vetoStep3TextToFirstEmptyAsk(
   data.step3SlotEval = data.progressUpdate.step3SlotEval;
   data.progressUpdate.step3SubpointCompleted = false;
   data.progressUpdate.isCompleted = false;
-  data.text = buildStep3VetoFirstEmptyAsk(label);
+  const rawText = String(data?.text || "");
+  // Soft salvage first (esp. key_not_first_empty / expand illegal dumps);
+  // fall back to short soft ask — never the rigid 谁/情况下 boilerplate.
+  data.text = salvageStep3VetoAskText(rawText, label);
   return true;
 }
 
@@ -5413,6 +5803,14 @@ function enforceStep3LogicCompletionInner(
   // Confirmed-only board (model cannot prefill unconfirmed slots).
   enforceConfirmedOnlySlots(plan, prevPlan);
   applyStep3FrameworkGuard(plan, session, activeSp);
+  // Protect confirm activeKey so one-shot reclass can still see the new empty target.
+  pruneUnauthorizedEmptySteps(
+    plan,
+    prevPlan,
+    slotEval?.mode === "confirm" && slotEval.activeKey
+      ? [slotEval.activeKey]
+      : [],
+  );
 
   let pending = loadPending().filter((d) => {
     const loc = findStepLocationByKey(plan, d.key);
@@ -5535,20 +5933,56 @@ function enforceStep3LogicCompletionInner(
         emptyStep?.key ||
           (empty ? `${empty.blockIndex}:${empty.stepIndex}` : ""),
       );
+      let stageKey = slotEval.activeKey;
+      let stageLoc = loc;
       if (empty && emptyKey && emptyKey !== slotEval.activeKey) {
-        setReject("key_not_first_empty");
-        syncPlanProgressFields(data, plan, []);
-        vetoStep3TextToFirstEmptyAsk(data, plan, "key_not_first_empty");
-        console.warn(
-          `[Step3Guard] step3SlotEval key「${slotEval.activeKey}」≠ firstEmpty「${emptyKey}」— vetoed to firstEmpty ask.`,
+        // One-shot reclass before hard key_not_first_empty veto:
+        // student answered a different but reasonable role — absorb onto firstEmpty.
+        const absorbed = absorbStep3ConfirmReclass(
+          plan,
+          empty,
+          emptyKey,
+          slotEval,
+          pending,
         );
-        return;
-      } else {
+        if (absorbed) {
+          stageKey = absorbed.activeKey;
+          stageLoc = {
+            blockIndex: absorbed.blockIndex,
+            stepIndex: absorbed.stepIndex,
+            step:
+              plan.pointBlocks[absorbed.blockIndex]?.steps?.[
+                absorbed.stepIndex
+              ],
+            label: absorbed.label,
+          };
+          slotEval.activeKey = absorbed.activeKey;
+          if (data.progressUpdate) {
+            data.progressUpdate.step3SlotEval = {
+              ...slotEval,
+              activeKey: absorbed.activeKey,
+            };
+            data.step3SlotEval = data.progressUpdate.step3SlotEval;
+          }
+          console.warn(
+            `[Step3Guard] One-shot reclass: relabeled firstEmpty「${emptyKey}」→「${absorbed.label}」; pruned duplicate empty key.`,
+          );
+        } else {
+          setReject("key_not_first_empty");
+          syncPlanProgressFields(data, plan, []);
+          vetoStep3TextToFirstEmptyAsk(data, plan, "key_not_first_empty");
+          console.warn(
+            `[Step3Guard] step3SlotEval key「${slotEval.activeKey}」≠ firstEmpty「${emptyKey}」— vetoed to firstEmpty ask.`,
+          );
+          return;
+        }
+      }
+      {
         const hard = hardRejectSlotText(
           slotEval.pendingText,
           plan,
-          slotEval.activeKey,
-          loc.blockIndex,
+          stageKey,
+          stageLoc.blockIndex,
         );
         if (hard.ok === false) {
           pending = [];
@@ -5562,11 +5996,11 @@ function enforceStep3LogicCompletionInner(
         }
         pending = [
           {
-            key: slotEval.activeKey,
-            label: loc.label,
+            key: stageKey,
+            label: stageLoc.label,
             text: slotEval.pendingText,
-            blockIndex: loc.blockIndex,
-            stepIndex: loc.stepIndex,
+            blockIndex: stageLoc.blockIndex,
+            stepIndex: stageLoc.stepIndex,
           },
         ];
         setReject("");
@@ -5574,11 +6008,11 @@ function enforceStep3LogicCompletionInner(
         if (detectStep3IllegalCoachText(String(data.text || ""), plan)) {
           data.text = `先确认这一句：\n「${slotEval.pendingText}」\n\n---\n\n如果符合你的意思，请回复「对」；要改就直接说怎么改。`;
           console.warn(
-            `[Step3Guard] Staged pending for「${loc.label}」— replaced dump/fake text with single-slot confirm ask.`,
+            `[Step3Guard] Staged pending for「${stageLoc.label}」— replaced dump/fake text with single-slot confirm ask.`,
           );
         } else {
           console.warn(
-            `[Step3Guard] Staged pending from step3SlotEval for「${loc.label}」(slots left empty).`,
+            `[Step3Guard] Staged pending from step3SlotEval for「${stageLoc.label}」(slots left empty).`,
           );
         }
         return;
@@ -7533,7 +7967,7 @@ ${step2Summary}
 ${activeFrameworkStr}
 - Step 3 slot cursor (INTERNAL — firstEmpty / pending / lastRejectCode; do not echo to student):
 ${step3SlotCursorStr}
-- Step 2 mapped brainstorm points are also reusable CONTENT EVIDENCE: organize their already-supplied details into matching Step 3 slots as draft values, without changing meaning or adding facts. Ask the student to confirm this reused bundle once; after confirmation, ask only for genuinely missing links.
+- Step 2 mapped brainstorm points are QUESTION CUES only for this body's coaching: use them to shape the firstEmpty Socratic ask. FORBIDDEN: organizing them into multi-slot draft values / a confirm bundle / mode=confirm on kickoff or before the student has spoken this beat in Step 3.
 - Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. Start diagnosis and paragraphPlan directly. Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
 - Mode hint: If Step 2 framework specifies paragraphDensity, follow STEP 0 mapping. Otherwise, if Step 2 blueprint already gives an overall thesis/position AND this body claim already umbrella-covers two sub-points, prefer direct_points (no separate totalClaim) for multi-point bodies.
 
@@ -8131,9 +8565,11 @@ ${memoryDigestStr}
       - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句并请学生回「对」或修改。SERVER 在 affirm 后才写入 confirmed。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
      - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，应分别用后续轮次的 step3SlotEval 处理，不要合并。合并时：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
+     - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
      - 已经 \`status: "confirmed"\` 的 step 永远不可被合并、删除或吞并。
      - 同时更新扁平 \`step3SubpointSteps\`（结构投影；values 保持空直到 server commit），让它严格成为 paragraphPlan 的兼容投影。
      - 学生 affirm 后的下一轮：用自然苏格拉底问题问下一个空槽（按 ContextSummary firstEmpty）；SERVER 只做状态对齐，不会替你写追问文案。
+     - CRITICAL — NO CROSS-BLOCK SKIP WHILE EMPTY: 只要前面 pointBlock 里还有空槽，FORBIDDEN 宣称该分点/主要方向已全部确认，或把追问跳到后一个分点/次要方向。空槽必须先填；若不需要该格，先从 paragraphPlan 删除再往下走。
      - 数据回填（best-effort，仅用于向后兼容下游，不可与 paragraphPlan 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`paragraphPlan\` 才是最权威结构。
 
   4. 论证策略建议 (Strategy Recommendation, 在涉及“支撑/举例/机制”类步骤时):
@@ -8161,6 +8597,7 @@ ${memoryDigestStr}
   DECIDING COMPLETION:
   - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段保留下来的所有 slot 均为 \`status: "confirmed"\`，且左侧教练已确认本段所需的原因/机制/影响等要素足够完整、充实时，才可设为 true；只要还有空步骤、draft 步骤或关键推导缺口就必须保持 false。右侧 paragraphPlan 只同步这项对话判断。
   - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` and MUST NOT set \`status: "confirmed"\`. Slot writing is SERVER-ONLY after student affirm. Emit quality judgment ONLY via top-level \`step3SlotEval\` { activeKey, mode: "expand"|"confirm", qualified, pendingText?, rejectReason? }. When mode=confirm, pendingText is required and MUST paraphrase the student's own Step 3 utterance for this beat (not a Step 2 rewrite). When mode=expand, ask a beat-specific Socratic question in \`text\` Part 2 — do NOT present a full ready-made sentence for them to rubber-stamp.
+  - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
   - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` must stay empty until the server commits after affirm. You may propose polished wording ONLY in \`step3SlotEval.pendingText\` after the student has spoken this beat — never as an unconfirmed board value, and never as a Step-2-only completion.
   - CRITICAL — KICKOFF / FIRST PLANNING TURN (same step3SlotEval contract): On the opening turn, emit the paragraphPlan skeleton with ALL \`steps[].value\` empty. ALWAYS mode=expand for the firstEmpty beat. YOU own the student-facing Socratic ask in \`text\` (natural Chinese coach voice — do NOT use stiff templates like「请用一句话自己写出…不会替你先写好」). Use Step 2 only as a light hint inside the question. FORBIDDEN on kickoff: mode=confirm / pendingText / listing polished reason+example+impact bullets OR narrative lines like「原因：…」「场景：…」「影响：…」for the student to affirm / say「没问题」. You may briefly name the planned chain shape in abstract (e.g. 原因→场景→影响) WITHOUT writing out full sentences for each beat. Do NOT write into \`steps[].value\` yourself. The SERVER never templates your ask — it only aligns state / writes on affirm.
   - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.

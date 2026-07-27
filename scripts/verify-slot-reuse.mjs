@@ -769,6 +769,54 @@ mustContain(
   "step3 completion: confirmed-only board clears unconfirmed model prefills",
 );
 mustContain(
+  "normalizeStep3SlotLabelForMatch(",
+  "step3 completion: confirmed restore matches by normalized label when key churns",
+);
+mustContain(
+  "confirmedByBlockLabel",
+  "step3 completion: confirmed restore secondary index by blockId+label",
+);
+mustContain(
+  "function pruneUnauthorizedEmptySteps(",
+  "step3 completion: prunes unauthorized empty steps not in prevPlan",
+);
+mustContain(
+  "pruneUnauthorizedEmptySteps(",
+  "step3 completion: prune unauthorized empties wired after framework guard",
+);
+mustContain(
+  'slotEval?.mode === "confirm" && slotEval.activeKey',
+  "step3 completion: prune protects confirm activeKey for one-shot reclass",
+);
+mustContain(
+  "/_beat_\\d+$/",
+  "step3 completion: framework beat key pattern allowed through prune",
+);
+mustContain(
+  "function absorbStep3ConfirmReclass(",
+  "step3 completion: one-shot confirm reclass absorbs onto firstEmpty key",
+);
+mustContain(
+  "One-shot reclass:",
+  "step3 completion: reclass path logs before key_not_first_empty veto",
+);
+mustContain(
+  "OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS",
+  "step3 prompt: off-ask but reasonable one clean reclass rule",
+);
+mustContain(
+  "function salvageStep3VetoAskText(",
+  "step3 server: mid-dialogue veto soft-salvages model ask",
+);
+mustContain(
+  "请先把「${L}」说具体一点。",
+  "step3 server: soft veto ask (not rigid 谁/情况下 template)",
+);
+mustNotContain(
+  "请先用一句话说清「${L}」：谁、在什么情况下、发生了什么？",
+  "step3 server: rigid 谁/情况下 veto template removed",
+);
+mustContain(
   "function commitPendingOnAffirm(",
   "step3 completion: unique write entry commits pending only on affirm",
 );
@@ -923,6 +971,30 @@ mustContain(
 mustContain(
   "function detectStep3IllegalCoachText(",
   "step3 server: illegal coach-text detector (dump/fake-complete)",
+);
+mustContain(
+  "function detectStep3CrossBlockSkipAsk(",
+  "step3 server: forbid skip-ahead asks across pointBlocks while earlier empty",
+);
+mustContain(
+  "skip_ahead_cross_block",
+  "step3 illegal text code for cross-block skip while empty remains",
+);
+mustContain(
+  "QUESTION CUES only",
+  "step3 ContextSummary: Step2 points are ask cues, not confirm bundle",
+);
+mustNotContain(
+  "confirm this reused bundle once",
+  "step3 ContextSummary must not ask to confirm a reused Step2 bundle",
+);
+mustNotContain(
+  "organize their already-supplied details into matching Step 3 slots as draft values",
+  "step3 ContextSummary must not organize Step2 into draft slot values on kickoff",
+);
+mustContain(
+  "请先用你自己的话写",
+  "step3 kickoff salvage soft fallback (not rigid 先从…一句话表达 template)",
 );
 mustContain(
   "STUCK / 「不知道」",
@@ -1721,10 +1793,12 @@ mustContain(
   "step2 prompt: forbids stage/enum names in chat text",
 );
 assert.ok(
-  step3DraftingSource.includes("结构细节写入系统即可，不要在对话里提字段名"),
-  "Missing: step3 kickoff: no internal field names in kickoff prompt",
+  step3DraftingSource.includes("结构细节写入系统即可，对话里不要提字段名") &&
+    step3DraftingSource.includes("禁止 mode=confirm") &&
+    !step3DraftingSource.includes("并先请我一次性确认"),
+  "Missing: step3 kickoff: expand-only, no internal field names, no one-shot confirm",
 );
-console.log("OK: step3 kickoff: no internal field names in kickoff prompt");
+console.log("OK: step3 kickoff: expand-only, no internal field names, no one-shot confirm");
 
 // Memory digest: boardOverrides must change Step1 sourceHash (invalidation rule)
 function stableHashLocal(input) {

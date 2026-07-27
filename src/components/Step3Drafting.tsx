@@ -244,7 +244,7 @@ export default function Step3Drafting({
     (s) => s.id === session.step3.activeSubpointId,
   );
   const kickoffPrompt = activeSubpoint?.content
-    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。先继承第二步已经提供的具体材料：把能对应原因、机制、场景或影响的内容按原意整理成草稿，不要加入新事实，并先请我一次性确认；只有第二步真正没有覆盖的环节才继续追问。再判断这是单点还是多点论点，用大白话简要说明安排；结构细节写入系统即可，不要在对话里提字段名。`
+    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。请先规划本段 paragraphPlan 骨架（分点/角色/步骤标签），所有 steps[].value 保持空。step3SlotEval 必须 mode=expand，对准 firstEmpty，用自然中文苏格拉底问题开问。第二步材料只作提问线索，禁止整理成待确认整链草稿，禁止 mode=confirm / pendingText，禁止让我一次性确认。结构细节写入系统即可，对话里不要提字段名。`
     : "";
 
   // Server is the sole authority for whole-step unlock (via progressUpdate.step3Ui).

@@ -26,7 +26,7 @@ assertTrue(
   "CoachChat.tsx defaults kickoffContextKey to ''"
 );
 assertTrue(
-  coachChat.includes("const kickoffKey = `${stepKey}:${kickoffContextKey}:${firstMsg.id}`;"),
+  coachChat.includes("const kickoffKey = `${stepKey}:${kickoffContextKey}`;"),
   "CoachChat.tsx kickoff key uses generic kickoffContextKey prop"
 );
 assertTrue(
@@ -44,8 +44,18 @@ assertTrue(
   "Step3Drafting.tsx passes kickoffContextKey={activeSubpoint?.id || ''}"
 );
 assertTrue(
-  step3.includes("autoKickoff={!!activeSubpoint}") && step3.includes("kickoffPrompt={kickoffPrompt}"),
+  step3.includes("autoKickoff={true}") && step3.includes("kickoffPrompt={kickoffPrompt}"),
   "Step3Drafting.tsx still wires autoKickoff + kickoffPrompt unchanged (regression check)"
+);
+assertTrue(
+  step3.includes("mode=expand") &&
+    step3.includes("禁止 mode=confirm") &&
+    step3.includes("禁止让我一次性确认"),
+  "Step3Drafting kickoffPrompt requires expand and forbids confirm bundle"
+);
+assertTrue(
+  !step3.includes("整理成草稿") && !step3.includes("并先请我一次性确认"),
+  "Step3Drafting kickoffPrompt no longer asks to organize drafts for one-shot confirm"
 );
 
 // 3. Step2Brainstorm: heuristic keyword branches removed
