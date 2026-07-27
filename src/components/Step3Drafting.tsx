@@ -489,39 +489,41 @@ export default function Step3Drafting({
               </div>
             </div>
           ) : (
-            /* Socratic Visual Logic Chain and Checklists */
-            <div className="p-5 space-y-6 animate-fade-in">
-              <div className="bg-slate-50 border border-slate-150 rounded-xl p-4">
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-150">
+            /* Socratic Visual Logic Chain */
+            <div className="p-5 space-y-5 animate-fade-in">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] font-bold text-indigo-700">
                     {activeSubpoint.targetBody || "当前主体段"}
                   </span>
                   {activeSubpoint.theme && (
-                    <span className="text-[10px] text-slate-500 font-semibold">
+                    <span className="text-[10px] text-slate-500">
                       {activeSubpoint.theme}
                     </span>
                   )}
                 </div>
-                <p className="text-[10px] font-sans font-bold text-indigo-600 uppercase tracking-wider mb-1">段落中心句 (Topic Sentence)</p>
-                <p className="text-slate-800 font-bold text-xs leading-relaxed mb-1">{activeSubpoint.content}</p>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
+                  段落中心句
+                </p>
+                <p className="text-slate-800 font-bold text-xs md:text-[12.5px] leading-relaxed">
+                  {activeSubpoint.content}
+                </p>
                 {activeSubpoint.points && activeSubpoint.points.length > 0 && (
-                  <div className="mt-2 bg-white rounded-lg p-2.5 space-y-1 text-[11px] text-slate-600 border border-slate-200/50">
-                    <p className="font-bold text-slate-500 text-[10px] uppercase tracking-wider">📌 本段需融合的分论点：</p>
+                  <ul className="mt-2 space-y-0.5 text-xs md:text-[12.5px] text-slate-600">
                     {activeSubpoint.points.map((pt: string, pIdx: number) => (
-                      <div key={pIdx} className="flex items-start gap-1">
-                        <span className="text-indigo-500 shrink-0">•</span>
+                      <li key={pIdx} className="flex items-start gap-1.5">
+                        <span className="text-slate-400 shrink-0">·</span>
                         <span>{pt}</span>
-                      </div>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 )}
               </div>
 
-              {/* Socratic logic chain flow chart */}
-              <div className="space-y-4">
+              <div className="space-y-3">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                    🔗 论证链条构建状态（Logic Chain Flow）
+                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                    论证链条
                   </span>
                   {showClearBoardConfirm ? (
                     <div className="flex items-center gap-2 shrink-0">
@@ -547,270 +549,170 @@ export default function Step3Drafting({
                     <button
                       type="button"
                       onClick={() => setShowClearBoardConfirm(true)}
-                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-rose-700 px-2 py-1 rounded-md border border-slate-200 bg-white hover:bg-rose-50 hover:border-rose-200 transition shrink-0"
+                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-rose-700 px-1.5 py-0.5 transition shrink-0"
                       title="清空当前主体段的逻辑链看板数据"
                     >
                       <RotateCcw className="h-3 w-3" />
-                      <span>清空看板</span>
+                      <span>清空</span>
                     </button>
                   )}
                 </div>
-                <p className="text-[10px] text-slate-400 leading-relaxed -mt-2">
-                  仅清除右侧逻辑链与诊断数据；中心句保留。如需从头对话，请用左侧「清空并重新对话」。
-                </p>
 
                 {activeSubpoint.paragraphPlan ? (
-                  <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
+                  <div className="space-y-4">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="px-2 py-1 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
-                        {modeLabel[activeSubpoint.paragraphPlan.mode] || activeSubpoint.paragraphPlan.mode}
-                      </span>
-                      <span className="text-[11px] text-slate-500 leading-relaxed">
-                        {activeSubpoint.paragraphPlan.diagnosis}
+                      <span className="text-[10px] font-bold text-indigo-700">
+                        {modeLabel[activeSubpoint.paragraphPlan.mode] ||
+                          activeSubpoint.paragraphPlan.mode}
                       </span>
                     </div>
 
                     {activeSubpoint.paragraphPlan.totalClaim && (
-                      <div className="bg-white border border-indigo-150 rounded-xl p-3 shadow-3xs">
-                        <p className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider mb-1">总观点 (Total Claim)</p>
-                        <p className="text-xs text-slate-800 font-bold leading-relaxed">
+                      <div className="pb-3 border-b border-slate-100">
+                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
+                          总观点
+                        </p>
+                        <p className="text-xs md:text-[12.5px] text-slate-800 font-bold leading-relaxed">
                           {activeSubpoint.paragraphPlan.totalClaim}
                         </p>
                       </div>
                     )}
 
-                    <div className="space-y-3">
-                      {activeSubpoint.paragraphPlan.pointBlocks.map((block, blockIdx) => (
-                        <div key={block.id || blockIdx} className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-3xs space-y-3">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="h-5 w-5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-150 flex items-center justify-center text-[10px] font-bold">
-                              {blockIdx + 1}
-                            </span>
-                            <span className="font-sans text-xs font-bold text-slate-800">
-                              {block.label || `分点 ${blockIdx + 1}`}
-                            </span>
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
-                              block.role === "major"
-                                ? "bg-emerald-50 text-emerald-700 border-emerald-150"
-                                : "bg-slate-50 text-slate-600 border-slate-200"
-                            }`}>
-                              {block.role === "major" ? "详写" : "略写"}
-                            </span>
-                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-150">
-                              {strategyLabel[block.expansionStrategy] || block.expansionStrategy}
-                            </span>
-                          </div>
+                    <div className="space-y-4">
+                      {activeSubpoint.paragraphPlan.pointBlocks.map(
+                        (block, blockIdx) => (
+                          <div
+                            key={block.id || blockIdx}
+                            className="space-y-2 pt-1 border-t border-slate-100 first:border-t-0 first:pt-0"
+                          >
+                            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                              <span className="font-sans text-xs md:text-[12.5px] font-bold text-slate-800">
+                                {block.label || `分点 ${blockIdx + 1}`}
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                {block.role === "major" ? "详写" : "略写"}
+                                {strategyLabel[block.expansionStrategy]
+                                  ? ` · ${strategyLabel[block.expansionStrategy]}`
+                                  : ""}
+                              </span>
+                            </div>
 
-                          <div className="bg-slate-50 border border-slate-150 rounded-lg p-2.5">
-                            <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">子观点 (Sub-Claim)</p>
-                            <p className="text-xs text-slate-800 font-bold leading-relaxed">
-                              {block.subClaim}
-                            </p>
-                          </div>
+                            {block.subClaim && (
+                              <p className="text-xs md:text-[12.5px] text-slate-700 leading-relaxed">
+                                {block.subClaim}
+                              </p>
+                            )}
 
-                          <div className="space-y-2">
-                            {block.steps.map((step, idx, arr) => {
-                              const iconChar = step.key.charAt(0).toUpperCase();
-                              return (
+                            <div className="space-y-2.5 pl-0.5">
+                              {block.steps.map((step, idx, arr) => (
                                 <div key={step.key} className="flex gap-2.5">
-                                  <div className="flex flex-col items-center shrink-0">
-                                    <div className={`h-5 w-5 rounded-full flex items-center justify-center font-sans font-bold text-[9px] transition ${
-                                      step.value ? "bg-indigo-650 text-white" : "bg-slate-100 text-slate-400"
-                                    }`}>
-                                      {iconChar}
-                                    </div>
+                                  <div className="flex flex-col items-center shrink-0 pt-0.5">
+                                    <div
+                                      className={`h-1.5 w-1.5 rounded-full ${
+                                        step.value
+                                          ? "bg-indigo-600"
+                                          : "bg-slate-300"
+                                      }`}
+                                    />
                                     {idx < arr.length - 1 && (
-                                      <div className="w-0.5 flex-1 bg-slate-200 min-h-[12px]"></div>
+                                      <div className="w-px flex-1 bg-slate-200 min-h-[10px] mt-1" />
                                     )}
                                   </div>
-                                  <div className="flex-1 min-w-0">
-                                    <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">
+                                  <div className="flex-1 min-w-0 pb-0.5">
+                                    <span className="text-[10px] font-sans font-bold text-slate-400">
                                       {step.label}
                                     </span>
                                     <p
-                                      className={`text-[11px] mt-0.5 leading-relaxed bg-slate-50 border border-slate-150 rounded-lg p-2 min-h-[2rem] ${
+                                      className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
                                         step.value
-                                          ? "text-slate-700 font-semibold"
-                                          : "text-transparent"
+                                          ? "text-slate-700"
+                                          : "text-slate-300"
                                       }`}
                                     >
-                                      {step.value || "\u00a0"}
+                                      {step.value || "待填写"}
                                     </p>
                                   </div>
                                 </div>
-                              );
-                            })}
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        ),
+                      )}
                     </div>
 
                     {activeSubpoint.paragraphPlan.optionalShortClosing && (
-                      <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-3xs">
-                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">简短收束</p>
-                        <p className="text-xs text-slate-700 leading-relaxed italic">
+                      <div className="pt-2 border-t border-slate-100">
+                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
+                          简短收束
+                        </p>
+                        <p className="text-xs md:text-[12.5px] text-slate-700 leading-relaxed italic">
                           {activeSubpoint.paragraphPlan.optionalShortClosing}
                         </p>
                       </div>
                     )}
                   </div>
                 ) : (
-                  <div className="relative border border-indigo-100 bg-indigo-50/10 rounded-xl p-4 space-y-4">
-                    {(activeSubpoint.structureSteps || [
-                      {
-                        key: "claim",
-                        label: "核心观点 (Claim)",
-                        value: activeSubpoint.claim
-                      },
-                      {
-                        key: "reason",
-                        label: "展开原因 (Reason)",
-                        value: activeSubpoint.reason
-                      },
-                      {
-                        key: "support",
-                        label: `支撑展开 (${activeSubpoint.supportType ? (activeSubpoint.supportType === 'example' ? 'Example / 举例' : activeSubpoint.supportType === 'mechanism' ? 'Mechanism / 机制' : 'Scenario / 场景') : 'Support'})`,
-                        value: activeSubpoint.supportContent
-                      },
-                      {
-                        key: "impact",
-                        label: "推导结果 (Impact)",
-                        value: activeSubpoint.impact
-                      }
-                    ]).map((step, idx, arr) => {
-                      const iconChar = step.key.charAt(0).toUpperCase();
-                      return (
-                        <div key={step.key} className="flex gap-3">
-                          <div className="flex flex-col items-center shrink-0">
-                            <div className={`h-6 w-6 rounded-full flex items-center justify-center font-sans font-bold text-[10px] transition ${step.value ? 'bg-indigo-650 text-white' : 'bg-slate-100 text-slate-400'}`}>
-                              {iconChar}
-                            </div>
-                            {idx < arr.length - 1 && (
-                              <div className="w-0.5 flex-1 bg-slate-200 min-h-[16px]"></div>
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <span className="text-[10px] font-sans font-bold text-slate-400 uppercase tracking-wider">Step {idx + 1}: {step.label}</span>
-                            <p
-                              className={`text-xs mt-0.5 leading-relaxed bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs min-h-[2.25rem] ${
-                                step.value
-                                  ? "text-slate-800 font-bold"
-                                  : "text-transparent"
-                              }`}
-                            >
-                              {step.value || "\u00a0"}
-                            </p>
-                          </div>
+                  <div className="space-y-2.5">
+                    {(
+                      activeSubpoint.structureSteps || [
+                        {
+                          key: "claim",
+                          label: "核心观点 (Claim)",
+                          value: activeSubpoint.claim,
+                        },
+                        {
+                          key: "reason",
+                          label: "展开原因 (Reason)",
+                          value: activeSubpoint.reason,
+                        },
+                        {
+                          key: "support",
+                          label: `支撑展开 (${
+                            activeSubpoint.supportType
+                              ? activeSubpoint.supportType === "example"
+                                ? "Example / 举例"
+                                : activeSubpoint.supportType === "mechanism"
+                                  ? "Mechanism / 机制"
+                                  : "Scenario / 场景"
+                              : "Support"
+                          })`,
+                          value: activeSubpoint.supportContent,
+                        },
+                        {
+                          key: "impact",
+                          label: "推导结果 (Impact)",
+                          value: activeSubpoint.impact,
+                        },
+                      ]
+                    ).map((step, idx, arr) => (
+                      <div key={step.key} className="flex gap-2.5">
+                        <div className="flex flex-col items-center shrink-0 pt-0.5">
+                          <div
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              step.value ? "bg-indigo-600" : "bg-slate-300"
+                            }`}
+                          />
+                          {idx < arr.length - 1 && (
+                            <div className="w-px flex-1 bg-slate-200 min-h-[10px] mt-1" />
+                          )}
                         </div>
-                      );
-                    })}
+                        <div className="flex-1 min-w-0">
+                          <span className="text-[10px] font-sans font-bold text-slate-400">
+                            {step.label}
+                          </span>
+                          <p
+                            className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
+                              step.value ? "text-slate-800 font-semibold" : "text-slate-300"
+                            }`}
+                          >
+                            {step.value || "待填写"}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
-
-              {/* Three Evaluation Checklists */}
-              {activeSubpoint.isCompleted && (
-                <div className="space-y-5 pt-3 border-t border-slate-150 animate-fade-in">
-                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                    🔍 逻辑闭环诊断报告 (AI Coach Diagnosis)
-                  </span>
-
-                  {/* Check 1: 逻辑完整性 */}
-                  <div className="border border-slate-200 bg-slate-50/50 rounded-xl p-4 space-y-3">
-                    <h4 className="font-sans font-bold text-slate-800 text-xs flex items-center gap-1.5">
-                      <span className="text-emerald-500">✅</span>
-                      <span>1. 逻辑完整性评测 (Logic Completeness)</span>
-                    </h4>
-                    <div className="overflow-hidden border border-slate-150 rounded-lg bg-white">
-                      <table className="w-full text-left text-xs border-collapse">
-                        <thead>
-                          <tr className="bg-slate-50/50 border-b border-slate-150">
-                            <th className="p-2 font-sans font-bold text-slate-600 w-1/3">检查项</th>
-                            <th className="p-2 font-sans font-bold text-slate-600 w-16 text-center">结果</th>
-                            <th className="p-2 font-sans font-bold text-slate-600">诊断说明</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-150">
-                          {(activeSubpoint.completenessChecks || [
-                            { label: "是否有明确观点（Claim）", passed: true, desc: "观点非常明确。" },
-                            { label: "是否解释了原因（Reason）", passed: true, desc: "解释了为什么具有此核心优势。" },
-                            { label: "是否提供了支撑（Support）", passed: true, desc: "提供并锁定了具体的支撑佐证。" },
-                            { label: "是否形成逻辑闭环（Impact）", passed: true, desc: "最终影响推导清晰，与观点高度一致。" }
-                          ]).map((chk, i) => (
-                            <tr key={i} className="hover:bg-slate-50/50">
-                              <td className="p-2 font-medium text-slate-700">{chk.label}</td>
-                              <td className="p-2 text-center text-emerald-600 font-bold">{chk.passed ? "✅" : "❌"}</td>
-                              <td className="p-2 text-slate-500 leading-normal text-[11px]">{chk.desc}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <p className="text-[11px] text-slate-500 leading-relaxed font-semibold">
-                      结论：整个论证逻辑连贯，没有明显跳步。
-                    </p>
-                  </div>
-
-                  {/* Check 2: 自然衔接 */}
-                  <div className="border border-slate-200 bg-slate-50/50 rounded-xl p-4 space-y-3">
-                    <h4 className="font-sans font-bold text-slate-800 text-xs flex items-center gap-1.5">
-                      <span className="text-emerald-500">✅</span>
-                      <span>2. 每一步过渡衔接评估 (Transition Coherence)</span>
-                    </h4>
-                    <div className="space-y-2">
-                      {(activeSubpoint.transitionChecks || [
-                        { label: "Claim → Reason", passed: true, desc: "过渡自然，直接且顺畅地回答了观点之所以成立的核心动因。" },
-                        { label: "Reason → Support", passed: true, desc: "支撑机制/具体例子能精准地服务并巩固前一步骤的理由展开。" },
-                        { label: "Support → Impact", passed: true, desc: "结果推导是佐证材料逻辑自然延伸，达到了完美的逻辑闭环，无任何逻辑断层。" }
-                      ]).map((trans, i) => (
-                        <div key={i} className="flex items-start gap-2 text-xs bg-white border border-slate-150 rounded-lg p-2.5 shadow-3xs">
-                          <span className="text-emerald-600 shrink-0 font-bold">✔</span>
-                          <div className="min-w-0">
-                            <span className="font-bold text-slate-700">{trans.label}：</span>
-                            <span className="text-slate-500 text-[11px] leading-relaxed">{trans.desc}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                    <p className="text-[11px] text-slate-500 leading-relaxed font-semibold">
-                      结论：整体逻辑衔接极其自然顺畅。
-                    </p>
-                  </div>
-
-                  {/* Check 3: 信息量与字数预估 */}
-                  <div className="border border-slate-200 bg-slate-50/50 rounded-xl p-4 space-y-3">
-                    <h4 className="font-sans font-bold text-slate-800 text-xs flex items-center gap-1.5">
-                      <span className="text-indigo-600">📊</span>
-                      <span>3. 段落信息充实度评估 (Information Sufficiency)</span>
-                    </h4>
-                    {activeSubpoint.sufficiencyCheck ? (
-                      <div className="text-xs bg-white border border-slate-150 rounded-lg p-3 space-y-2 shadow-3xs">
-                        <div className="flex items-center justify-between">
-                          <span className="font-sans font-bold text-slate-700">{activeSubpoint.sufficiencyCheck.label}</span>
-                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${activeSubpoint.sufficiencyCheck.passed ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
-                            {activeSubpoint.sufficiencyCheck.passed ? "足量 ✓" : "建议补充"}
-                          </span>
-                        </div>
-                        <p className="text-slate-500 text-[11px] leading-relaxed whitespace-pre-wrap">
-                          {activeSubpoint.sufficiencyCheck.desc}
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="text-xs bg-white border border-slate-150 rounded-lg p-3 space-y-2 shadow-3xs">
-                        <div className="flex items-center justify-between">
-                          <span className="font-sans font-bold text-slate-700">信息量是否足够写成一个主体段</span>
-                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                            足量 ✓
-                          </span>
-                        </div>
-                        <p className="text-slate-500 text-[11px] leading-relaxed">
-                          目前的信息量非常充分，预计可以写成 90–110 字左右的高质量主体段（约包含 1 句 Topic Sentence，2-3 句逻辑展开，1 句结果总结）。对于 250–300 字的 IELTS Task 2 而言完全足够，无需额外补充内容。
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </div>

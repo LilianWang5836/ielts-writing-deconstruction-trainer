@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Layers, Pencil, Plus, Trash2, Check } from 'lucide-react';
+import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Layers, Plus, Trash2, Check } from 'lucide-react';
 import { Topic, PracticeSession } from '../types';
 import CoachChat from './CoachChat';
 
@@ -12,6 +12,25 @@ interface Step1AnalysisProps {
 
 type BoardOverrides = NonNullable<PracticeSession['step1']['boardOverrides']>;
 type EditableField = keyof BoardOverrides;
+
+/** Display-only: strip Step1 status tags; mark expandable (probed+可展开). */
+function formatStep1DimensionForDisplay(dim: string): {
+  label: string;
+  expandable: boolean;
+} {
+  const raw = String(dim || '');
+  const has = (tag: string) => new RegExp(`[（(]\\s*${tag}\\s*[）)]`).test(raw);
+  const expandable =
+    has('可展开') &&
+    has('已探测') &&
+    !has('质量待确认') &&
+    !has('空标签');
+  const label = raw
+    .replace(/[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出)\s*[）)]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return { label: label || raw, expandable };
+}
 
 export default function Step1Analysis({
   topic,
@@ -156,18 +175,6 @@ export default function Step1Analysis({
     cancelEdit();
   };
 
-  const EditButton = ({ onClick }: { onClick: () => void }) => (
-    <button
-      type="button"
-      onClick={onClick}
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-500 hover:bg-slate-100 hover:text-indigo-700"
-      title="编辑"
-    >
-      <Pencil className="h-3 w-3" />
-      编辑
-    </button>
-  );
-
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
       {/* LEFT COLUMN: AI Coach Dialogue Area */}
@@ -266,35 +273,21 @@ ${topic.question}
                     </div>
                   )}
                 </div>
-                <div className="flex items-center gap-1.5 bg-indigo-50 text-indigo-700 px-3 py-1 rounded border border-indigo-100 shadow-sm">
-                  <span className="font-sans text-xs font-semibold">诊断得分: </span>
-                  {evalData.score && evalData.score > 0 ? (
-                    <>
-                      <span className="font-mono text-sm font-extrabold">{evalData.score}</span>
-                      <span className="text-slate-400 font-sans text-xs">/10</span>
-                    </>
-                  ) : (
-                    <span className="font-sans text-xs text-indigo-500 animate-pulse">计算中</span>
-                  )}
-                </div>
               </div>
 
               <div className="space-y-4">
-                <div className="bg-slate-50 border border-slate-200/60 rounded-xl p-4 space-y-4">
+                <div className="space-y-4">
                   {/* ① 题型 */}
                   <div>
-                    <div className="mb-1 flex items-center justify-between gap-2">
+                    <div className="mb-1">
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">① 题型 (Question Type)</span>
-                      {editingField !== 'correctType' && (
-                        <EditButton onClick={() => startEditText('correctType', evalData.correctType || '')} />
-                      )}
                     </div>
                     {editingField === 'correctType' ? (
                       <div className="space-y-2">
                         <input
                           value={draftText}
                           onChange={(e) => setDraftText(e.target.value)}
-                          className="w-full rounded border border-indigo-200 bg-white px-2.5 py-1.5 text-sm text-indigo-900 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                          className="w-full rounded border border-indigo-200 bg-white px-2.5 py-1.5 text-xs md:text-[12.5px] text-indigo-900 font-bold focus:outline-none focus:ring-1 focus:ring-indigo-400"
                           placeholder="例如：Two-part Question"
                           autoFocus
                         />
@@ -306,22 +299,19 @@ ${topic.question}
                         </div>
                       </div>
                     ) : (
-                      <p className={`text-sm ${evalData.correctType ? 'text-indigo-900 font-bold' : 'text-slate-400 italic font-medium'}`}>
+                      <p className={`text-xs md:text-[12.5px] ${evalData.correctType ? 'text-indigo-900 font-bold' : 'text-slate-400 italic font-medium'}`}>
                         {evalData.correctType || "🔍 正在倾听并识别题型..."}
                       </p>
                     )}
                   </div>
 
                   {/* ② 核心议题 & 写作任务 */}
-                  <div>
-                    <div className="mb-1 flex items-center justify-between gap-2">
+                  <div className="pt-3 border-t border-slate-100">
+                    <div className="mb-1">
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">② 核心议题 & 写作任务 (Writing Task)</span>
-                      {editingField !== 'coreIssue' && editingField !== 'writingTask' && (
-                        <EditButton onClick={() => startEditText('coreIssue', evalData.coreIssue || '')} />
-                      )}
                     </div>
                     {editingField === 'coreIssue' || editingField === 'writingTask' ? (
-                      <div className="space-y-2 bg-white p-2.5 rounded border border-indigo-150">
+                      <div className="space-y-2">
                         <label className="block text-[10px] font-semibold text-slate-400">
                           {editingField === 'coreIssue' ? '核心议题' : '写作任务'}
                         </label>
@@ -329,7 +319,7 @@ ${topic.question}
                           value={draftText}
                           onChange={(e) => setDraftText(e.target.value)}
                           rows={2}
-                          className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                          className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs md:text-[12.5px] text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
                           autoFocus
                         />
                         <div className="flex flex-wrap gap-2">
@@ -353,33 +343,30 @@ ${topic.question}
                         </div>
                       </div>
                     ) : evalData.writingTask || evalData.coreIssue ? (
-                      <div className="space-y-1 bg-white p-2.5 rounded border border-slate-150 shadow-3xs">
+                      <div className="space-y-1">
                         {evalData.coreIssue && (
-                          <p className="text-xs text-slate-700 leading-relaxed font-semibold">
+                          <p className="text-xs md:text-[12.5px] text-slate-700 leading-relaxed font-semibold">
                             <span className="text-slate-400 font-normal">核心议题：</span>{evalData.coreIssue}
                           </p>
                         )}
                         {evalData.writingTask && (
-                          <p className="text-xs text-slate-800 leading-relaxed font-bold">
+                          <p className="text-xs md:text-[12.5px] text-slate-800 leading-relaxed font-bold">
                             <span className="text-slate-400 font-normal">写作任务：</span>{evalData.writingTask}
                           </p>
                         )}
                       </div>
                     ) : (
-                      <p className="text-xs text-slate-400 italic">🔍 正在提取核心议题与具体写作任务...</p>
+                      <p className="text-xs md:text-[12.5px] text-slate-400 italic">🔍 正在提取核心议题与具体写作任务...</p>
                     )}
                   </div>
 
                   {/* ③ 关键限定 */}
-                  <div>
-                    <div className="mb-1 flex items-center justify-between gap-2">
+                  <div className="pt-3 border-t border-slate-100">
+                    <div className="mb-1">
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">③ 关键限定词 (Key Qualifiers)</span>
-                      {editingField !== 'constraints' && (
-                        <EditButton onClick={() => startEditList('constraints', evalData.constraints || [])} />
-                      )}
                     </div>
                     {editingField === 'constraints' ? (
-                      <div className="space-y-2 bg-white p-2.5 rounded border border-indigo-150">
+                      <div className="space-y-2">
                         {draftList.map((item, i) => (
                           <div key={i} className="flex items-center gap-1.5">
                             <input
@@ -389,7 +376,7 @@ ${topic.question}
                                 next[i] = e.target.value;
                                 setDraftList(next);
                               }}
-                              className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                              className="flex-1 rounded border border-slate-200 px-2 py-1 text-xs md:text-[12.5px] focus:outline-none focus:ring-1 focus:ring-indigo-400"
                               placeholder="限定词"
                             />
                             <button
@@ -416,32 +403,27 @@ ${topic.question}
                         </div>
                       </div>
                     ) : evalData.keyQualifier || (evalData.constraints && evalData.constraints.length > 0) ? (
-                      <div className="space-y-1.5 bg-white p-2.5 rounded border border-slate-150 shadow-3xs">
-                        <div className="flex flex-wrap gap-1">
-                          {(evalData.constraints || []).map((c, i) => (
-                            <span key={i} className="bg-amber-50 text-amber-800 px-2 py-0.5 rounded text-[10px] font-bold border border-amber-250/50">
-                              {c}
-                            </span>
-                          ))}
-                        </div>
+                      <div className="space-y-1.5">
+                        {(evalData.constraints || []).length > 0 && (
+                          <p className="text-xs md:text-[12.5px] text-slate-700 font-medium leading-relaxed">
+                            {(evalData.constraints || []).join(' · ')}
+                          </p>
+                        )}
                         {evalData.keyQualifier && (
-                          <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-wrap font-medium">
+                          <p className="text-xs md:text-[12.5px] text-slate-700 leading-relaxed whitespace-pre-wrap font-medium">
                             {evalData.keyQualifier}
                           </p>
                         )}
                       </div>
                     ) : (
-                      <p className="text-xs text-slate-400 italic">🔍 正在分析题目中的特殊限定修饰词...</p>
+                      <p className="text-xs md:text-[12.5px] text-slate-400 italic">🔍 正在分析题目中的特殊限定修饰词...</p>
                     )}
                   </div>
 
                   {/* ④ 建议讨论维度 */}
-                  <div>
-                    <div className="mb-1 flex items-center justify-between gap-2">
+                  <div className="pt-3 border-t border-slate-100">
+                    <div className="mb-1">
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">④ 建议讨论维度 (Suggested Dimensions)</span>
-                      {editingField !== 'suggestedDimensions' && (
-                        <EditButton onClick={() => startEditList('suggestedDimensions', evalData.suggestedDimensions || [])} />
-                      )}
                     </div>
                     {editingField === 'suggestedDimensions' ? (
                       <div className="space-y-2 mt-1">
@@ -454,7 +436,7 @@ ${topic.question}
                                 next[i] = e.target.value;
                                 setDraftList(next);
                               }}
-                              className="flex-1 rounded border border-indigo-200 bg-indigo-50/40 px-2.5 py-1.5 text-xs text-indigo-900 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                              className="flex-1 rounded border border-indigo-200 bg-indigo-50/40 px-2.5 py-1.5 text-xs md:text-[12.5px] text-indigo-900 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-400"
                               placeholder="维度标签，如：经济发展"
                             />
                             <button
@@ -481,23 +463,26 @@ ${topic.question}
                         </div>
                       </div>
                     ) : evalData.suggestedDimensions && evalData.suggestedDimensions.length > 0 ? (
-                      <div className="grid grid-cols-2 gap-1.5 mt-1">
-                        {evalData.suggestedDimensions.map((dim, i) => (
-                          <div key={i} className="bg-indigo-50/50 border border-indigo-100 rounded px-2.5 py-1.5 text-xs text-indigo-900 font-semibold flex items-center gap-1.5">
-                            <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 shrink-0" />
-                            <span>{dim}</span>
-                          </div>
-                        ))}
-                      </div>
+                      <ul className="mt-1 space-y-1">
+                        {evalData.suggestedDimensions.map((dim, i) => {
+                          const { label, expandable } = formatStep1DimensionForDisplay(dim);
+                          return (
+                            <li key={i} className="text-xs md:text-[12.5px] text-slate-800 font-semibold flex items-start gap-1.5">
+                              <span className="text-slate-400 shrink-0">·</span>
+                              <span className="min-w-0">
+                                {label}
+                                {expandable ? (
+                                  <span className="ml-1 text-emerald-600" aria-label="可展开">✓</span>
+                                ) : null}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
                     ) : (
-                      <p className="text-xs text-slate-400 italic">🔍 正在梳理可以辩证讨论的对比维度...</p>
+                      <p className="text-xs md:text-[12.5px] text-slate-400 italic">🔍 正在梳理可以辩证讨论的对比维度...</p>
                     )}
                   </div>
-                </div>
-
-                <div className="bg-indigo-50/20 border border-indigo-100/50 rounded-xl p-4">
-                  <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block mb-1">Coach 导师点拨</span>
-                  <p className="text-slate-700 text-xs whitespace-pre-wrap leading-relaxed">{evalData.critique}</p>
                 </div>
               </div>
             </div>

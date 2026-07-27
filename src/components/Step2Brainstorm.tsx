@@ -456,110 +456,49 @@ ${topic.question}
             </div>
           ) : evalData ? (
             <div className="space-y-5 animate-fade-in">
-              {/* Socratic Stage Progress Indicator */}
+              {/* Overall progress bar (replaces discrete stage chips) */}
               {(() => {
-                // requiresStance / taskLabelA/B are stamped server-side every Step2 turn
-                // (stampStep2TaskBrief / applyNoStanceGate) from questionBrief.taskMap.
                 const requiresStance = (evalData as any)?.requiresStance !== false;
                 const taskLabelA = String((evalData as any)?.taskLabelA || '').trim();
                 const taskLabelB = String((evalData as any)?.taskLabelB || '').trim();
                 const labelA = taskLabelA || (requiresStance ? '支持面' : '第一任务');
                 const labelB = taskLabelB || (requiresStance ? '让步/对立面' : '第二任务');
-                const stages = requiresStance
-                  ? [
-                      { id: 'explore_A', label: `1. ${labelA}` },
-                      { id: 'explore_B', label: `2. ${labelB}` },
-                      { id: 'stance', label: '3. 明确立场' },
-                      { id: 'summary', label: '4. 蓝图生成' },
-                    ]
-                  : [
-                      { id: 'explore_A', label: `1. ${labelA || '第一任务'}` },
-                      { id: 'explore_B', label: `2. ${labelB || '第二任务'}` },
-                      { id: 'summary', label: '3. 蓝图生成' },
-                    ];
-                const dispositions = Array.isArray((evalData as any)?.dimensionDispositions)
-                  ? ((evalData as any).dimensionDispositions as {
-                      dimension: string;
-                      disposition: string;
-                      mergedInto?: string;
-                      note?: string;
-                    }[])
-                  : [];
-                const dispositionLabel = (d: string) =>
-                  d === 'expanded'
-                    ? '已展开'
-                    : d === 'merged'
-                      ? '已整合'
-                      : d === 'dropped'
-                        ? '已放下'
-                        : '待处理';
+                const currentStage = String((evalData as any)?.currentStage || 'explore_A');
+                const stageMeta: Record<string, { pct: number; label: string }> = requiresStance
+                  ? {
+                      explore_A: { pct: 25, label: labelA },
+                      explore_B: { pct: 50, label: labelB },
+                      stance: { pct: 75, label: '明确立场' },
+                      summary: { pct: 90, label: '蓝图生成' },
+                    }
+                  : {
+                      explore_A: { pct: 33, label: labelA || '第一任务' },
+                      explore_B: { pct: 66, label: labelB || '第二任务' },
+                      summary: { pct: 90, label: '蓝图生成' },
+                    };
+                const done = !!session.step2.isCompleted;
+                const meta = stageMeta[currentStage] || stageMeta.explore_A;
+                const pct = done ? 100 : meta.pct;
+                const statusLabel = done ? '已完成' : `${meta.label} · 进行中`;
                 return (
-              <>
-              <div className={`grid ${requiresStance ? 'grid-cols-4' : 'grid-cols-3'} gap-1.5 text-center bg-slate-50 border border-slate-200/50 p-2.5 rounded-xl`}>
-                {stages.map((st) => {
-                  const currentStage = (evalData as any)?.currentStage || 'explore_A';
-                  const isCurrent = currentStage === st.id;
-                  const isCompleted = session.step2.isCompleted || (
-                    (currentStage === 'explore_B' && st.id === 'explore_A') ||
-                    (currentStage === 'stance' && (st.id === 'explore_A' || st.id === 'explore_B')) ||
-                    (currentStage === 'summary' && st.id !== 'summary')
-                  );
-                  return (
-                    <div
-                      key={st.id}
-                      title={st.label}
-                      className={`py-1 px-1 rounded text-[10px] font-bold transition-all border truncate ${
-                        isCompleted
-                          ? 'bg-emerald-50 text-emerald-800 border-emerald-250/50'
-                          : isCurrent
-                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-4xs'
-                          : 'bg-white text-slate-400 border-slate-200/60'
-                      }`}
-                    >
-                      {st.label}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                        讨论进度
+                      </span>
+                      <span className="text-[10px] font-semibold text-slate-500">
+                        {statusLabel}
+                      </span>
                     </div>
-                  );
-                })}
-              </div>
-              {dispositions.length > 0 && (
-                <div className="mt-2 rounded-lg border border-slate-200/70 bg-white px-2.5 py-2">
-                  <p className="mb-1.5 text-[10px] font-bold text-slate-500">
-                    Step1 角度处置（展开 / 整合 / 放下）
-                  </p>
-                  <ul className="space-y-1">
-                    {dispositions.map((d, i) => (
-                      <li
-                        key={`${d.dimension}-${i}`}
-                        className="flex items-start justify-between gap-2 text-[10px] text-slate-700"
-                      >
-                        <span className="min-w-0 flex-1 truncate font-medium" title={d.dimension}>
-                          {d.dimension}
-                          {d.disposition === 'merged' && d.mergedInto
-                            ? ` → ${d.mergedInto}`
-                            : ''}
-                          {d.disposition === 'dropped' && d.note
-                            ? `（${d.note}）`
-                            : ''}
-                        </span>
-                        <span
-                          className={
-                            d.disposition === 'expanded'
-                              ? 'shrink-0 font-bold text-emerald-700'
-                              : d.disposition === 'merged'
-                                ? 'shrink-0 font-bold text-sky-700'
-                                : d.disposition === 'dropped'
-                                  ? 'shrink-0 font-bold text-slate-500'
-                                  : 'shrink-0 font-bold text-amber-700'
-                          }
-                        >
-                          {dispositionLabel(d.disposition)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              </>
+                    <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-500 ${
+                          done ? 'bg-emerald-500' : 'bg-indigo-600'
+                        }`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                  </div>
                 );
               })()}
 
@@ -579,23 +518,21 @@ ${topic.question}
                 </div>
               </div>
 
-              <div className="space-y-4">
-                {/* Essay Blueprint Card */}
-                <div className="bg-slate-50 border border-slate-200/60 rounded-xl p-4 space-y-4">
-                  <div className="border-b border-slate-200 pb-2">
-                    <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block mb-1">Essay Blueprint / 文章结构蓝图</span>
-                  </div>
+              <div className="space-y-5">
+                {/* Essay Blueprint */}
+                <div className="space-y-3">
+                  <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block">
+                    文章结构
+                  </span>
 
-                  {/* 题目 (Question) */}
                   <div className="space-y-1">
                     <span className="text-[9px] font-bold text-slate-400 uppercase">写作原题 (Topic)</span>
-                    <p className="text-xs italic text-slate-700 font-serif leading-relaxed font-semibold">
+                    <p className="text-xs md:text-[12.5px] italic text-slate-700 font-serif leading-relaxed font-semibold">
                       {topic.question}
                     </p>
                   </div>
 
-                  {/* 立场 / 概述 (Position or Overview) */}
-                  <div className="space-y-1">
+                  <div className="space-y-1 pt-2 border-t border-slate-100">
                     <span className="text-[9px] font-bold text-slate-400 uppercase">
                       {(() => {
                         const pos = String(evalData.blueprint?.position || evalData.userStance || '');
@@ -605,35 +542,31 @@ ${topic.question}
                           : '全文立场 (Overall Position)';
                       })()}
                     </span>
-                    <p className={`text-xs leading-relaxed ${evalData.blueprint?.position || evalData.userStance ? 'text-slate-900 font-bold' : 'text-slate-400 italic'}`}>
+                    <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.position || evalData.userStance ? 'text-slate-900 font-bold' : 'text-slate-400 italic'}`}>
                       {evalData.blueprint?.position || evalData.userStance || "⏳ 正在整理全文概述 / 立场..."}
                     </p>
                   </div>
 
-                  {/* Dynamic Clustered Body Paragraphs */}
                   {evalData.blueprint?.bodies && evalData.blueprint.bodies.length > 0 ? (
                     evalData.blueprint.bodies.map((b: any, index: number) => (
-                      <div key={index} className="space-y-1 bg-white p-2.5 rounded border border-slate-200/60 shadow-3xs">
+                      <div key={index} className="space-y-1 pt-2 border-t border-slate-100">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">{b.title || `Body Paragraph ${index + 1}`}</span>
-                        <p className="text-xs leading-relaxed text-slate-800 font-semibold">
+                        <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-800 font-semibold">
                           {b.content}
                         </p>
                       </div>
                     ))
                   ) : (
                     <>
-                      {/* Body Paragraph 1 */}
-                      <div className="space-y-1 bg-white p-2.5 rounded border border-slate-200/60 shadow-3xs">
+                      <div className="space-y-1 pt-2 border-t border-slate-100">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 1 (第一主体段核心分论点)</span>
-                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body1 || pointsForBlueprint.body1 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
+                        <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.body1 || pointsForBlueprint.body1 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
                           {evalData.blueprint?.body1 || pointsForBlueprint.body1 || "⏳ 正在总结主体段 1 的核心观点..."}
                         </p>
                       </div>
-
-                      {/* Body Paragraph 2 */}
-                      <div className="space-y-1 bg-white p-2.5 rounded border border-slate-200/60 shadow-3xs">
+                      <div className="space-y-1 pt-2 border-t border-slate-100">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 2 (第二主体段核心分论点)</span>
-                        <p className={`text-xs leading-relaxed ${evalData.blueprint?.body2 || pointsForBlueprint.body2 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
+                        <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.body2 || pointsForBlueprint.body2 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
                           {evalData.blueprint?.body2 || pointsForBlueprint.body2 || "⏳ 正在总结主体段 2 的核心观点..."}
                         </p>
                       </div>
@@ -641,74 +574,60 @@ ${topic.question}
                   )}
                 </div>
 
-                {/* 智能观点聚类规划 (Argument Clustering) */}
+                {/* Argument Clustering */}
                 {evalData.clustering && (
-                  <div className="bg-slate-50 border border-slate-200/60 rounded-xl p-4 space-y-4">
-                    <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block">Argument Clustering / 智能观点聚类规划</span>
-                      <span className="text-[9px] px-1.5 py-0.5 bg-indigo-100 text-indigo-750 font-bold rounded-full">
+                  <div className="space-y-3 pt-1 border-t border-slate-100">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">
+                        观点展开
+                      </span>
+                      <span className="text-[10px] font-semibold text-slate-500">
                         共 {evalData.clustering.totalPoints || 0} 个原始论点
                       </span>
                     </div>
 
-                    {/* Original brainstormed points container */}
                     {evalData.clustering.pointsList && evalData.clustering.pointsList.length > 0 && (
-                      <div className="space-y-1.5 bg-white p-2.5 rounded border border-slate-200/50 shadow-3xs">
+                      <div className="space-y-1.5">
                         <span className="text-[9px] font-bold text-slate-400 uppercase">发散出的原始观点 (Brainstormed Points)</span>
-                        <div className="flex flex-wrap gap-1.5 pt-1">
+                        <div className="flex flex-wrap gap-1.5 pt-0.5">
                           {evalData.clustering.pointsList.map((pt: string, idx: number) => (
-                            <span key={idx} className="text-[11px] px-2 py-0.5 bg-slate-100 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 text-slate-700 font-medium rounded-md transition-colors">
-                              {pt}
+                            <span key={idx} className="text-xs md:text-[12.5px] text-slate-700 font-medium">
+                              {idx > 0 ? ' · ' : ''}{pt}
                             </span>
                           ))}
                         </div>
                       </div>
                     )}
 
-                    {/* Mapping Clusters Flow */}
-                    <div className="space-y-3 pt-1">
+                    <div className="space-y-3">
                       {evalData.clustering.clusters.map((cluster: any, cIdx: number) => (
-                        <div key={cIdx} className="bg-white p-3 rounded-lg border border-slate-200/60 shadow-3xs space-y-2.5 relative overflow-hidden">
-                          {/* Top header badge */}
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-bold text-indigo-950 flex items-center gap-1">
-                              <span className="h-1.5 w-1.5 rounded-full bg-indigo-500"></span>
+                        <div key={cIdx} className="space-y-1.5 pt-2 border-t border-slate-100 first:border-t-0 first:pt-0">
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="text-xs md:text-[12.5px] font-bold text-slate-800">
                               聚类主题: {cluster.theme}
                             </span>
-                            <span className="text-[9px] px-1.5 py-0.5 bg-slate-100 border border-slate-200 text-slate-500 font-bold rounded">
+                            <span className="text-[10px] text-slate-500 shrink-0">
                               {cluster.targetBody || `Body ${cIdx + 1}`}
                             </span>
                           </div>
-
-                          {/* Arrow down and mapping points */}
-                          <div className="flex flex-col items-center justify-center py-1">
-                            <div className="flex flex-wrap gap-1.5 justify-center max-w-md">
-                              {cluster.points.map((p: string, pIdx: number) => (
-                                <span key={pIdx} className="text-[10px] px-2 py-0.5 bg-indigo-50/50 border border-indigo-100/70 text-indigo-850 font-semibold rounded-md shadow-4xs">
-                                  {p}
-                                </span>
-                              ))}
-                            </div>
-                            <div className="text-slate-300 font-mono text-xs my-0.5">↓</div>
-                            <div className="w-full text-center mt-1 border-t border-dashed border-slate-100 pt-2">
-                              <p className="text-[11px] text-slate-700 font-bold leading-relaxed bg-slate-50/50 p-1.5 rounded border border-slate-150/50">
-                                {cluster.content}
-                              </p>
-                            </div>
-                          </div>
+                          <p className="text-xs md:text-[12.5px] text-slate-500 leading-relaxed">
+                            {cluster.points.join(' · ')}
+                          </p>
+                          <p className="text-xs md:text-[12.5px] text-slate-700 font-semibold leading-relaxed">
+                            {cluster.content}
+                          </p>
                         </div>
                       ))}
                     </div>
 
-                    {/* Outliers */}
                     {evalData.clustering.outliers && evalData.clustering.outliers.length > 0 && (
-                      <div className="bg-amber-50/40 border border-amber-200/50 rounded-lg p-3 space-y-2">
-                        <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block">⚠️ 逸出观点与建议 (Outliers & Advice)</span>
+                      <div className="space-y-2 pt-2 border-t border-slate-100">
+                        <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block">逸出观点与建议</span>
                         <div className="space-y-1.5">
                           {evalData.clustering.outliers.map((outlier: any, oIdx: number) => (
-                            <div key={oIdx} className="text-[11px] bg-white border border-amber-100 p-2 rounded shadow-4xs space-y-1">
-                              <span className="font-bold text-amber-900">观点: “{outlier.point}”</span>
-                              <p className="text-amber-850 leading-relaxed font-medium">{outlier.suggestion}</p>
+                            <div key={oIdx} className="text-xs md:text-[12.5px] space-y-0.5">
+                              <span className="font-bold text-amber-900">“{outlier.point}”</span>
+                              <p className="text-slate-600 leading-relaxed">{outlier.suggestion}</p>
                             </div>
                           ))}
                         </div>
@@ -716,95 +635,6 @@ ${topic.question}
                     )}
                   </div>
                 )}
-
-                {/* 逻辑检测看板 */}
-                <div className="bg-slate-50 border border-slate-200/60 rounded-xl p-4 space-y-3">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">🔍 逻辑一致性检测看板</span>
-                  
-                  <div className="space-y-2.5">
-                    {/* Position Check */}
-                    <div className="flex gap-2.5 items-start p-2 rounded bg-white border border-slate-150/60 shadow-3xs">
-                      <div className="mt-0.5">
-                        {evalData.positionCheckPassed === undefined ? (
-                          <span className="h-4 w-4 rounded-full bg-slate-100 flex items-center justify-center text-[9px] text-slate-400 font-bold">⏳</span>
-                        ) : evalData.positionCheckPassed ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
-                        ) : (
-                          <AlertCircle className="h-4 w-4 text-rose-500 shrink-0" />
-                        )}
-                      </div>
-                      <div className="space-y-0.5">
-                        <span className="text-xs font-bold text-slate-800">立场一致性检测 (Position Consistency)</span>
-                        <p className="text-[11px] text-slate-600 leading-normal">
-                          {evalData.positionCheckDesc || "等待观点生成后进行一致性对比..."}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Coverage Check */}
-                    <div className="flex gap-2.5 items-start p-2 rounded bg-white border border-slate-150/60 shadow-3xs">
-                      <div className="mt-0.5">
-                        {evalData.coverageCheckPassed === undefined ? (
-                          <span className="h-4 w-4 rounded-full bg-slate-100 flex items-center justify-center text-[9px] text-slate-400 font-bold">⏳</span>
-                        ) : evalData.coverageCheckPassed ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
-                        ) : (
-                          <AlertCircle className="h-4 w-4 text-rose-500 shrink-0" />
-                        )}
-                      </div>
-                      <div className="space-y-0.5">
-                        <span className="text-xs font-bold text-slate-800">审题覆盖度检测 (Scope Coverage)</span>
-                        <p className="text-[11px] text-slate-600 leading-normal">
-                          {evalData.coverageCheckDesc || "等待分论点生成后检测是否回应了关键限定词..."}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Structure Check */}
-                    <div className="flex gap-2.5 items-start p-2 rounded bg-white border border-slate-150/60 shadow-3xs">
-                      <div className="mt-0.5">
-                        {evalData.structureCheckPassed === undefined ? (
-                          <span className="h-4 w-4 rounded-full bg-slate-100 flex items-center justify-center text-[9px] text-slate-400 font-bold">⏳</span>
-                        ) : evalData.structureCheckPassed ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
-                        ) : (
-                          <AlertCircle className="h-4 w-4 text-rose-500 shrink-0" />
-                        )}
-                      </div>
-                      <div className="space-y-0.5">
-                        <span className="text-xs font-bold text-slate-800">结构可行性检测 (Structural Feasibility)</span>
-                        <p className="text-[11px] text-slate-600 leading-normal">
-                          {evalData.structureCheckDesc || "等待段落规划后检测分论点是否独立且可展开..."}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* AI Review */}
-                <div className="bg-indigo-50/25 border border-indigo-100/50 rounded-xl p-4 space-y-3">
-                  <div>
-                    <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block mb-1">Coach 逻辑诊疗意见</span>
-                    <p className="text-slate-700 text-xs whitespace-pre-wrap leading-relaxed">{evalData.critique}</p>
-                  </div>
-                </div>
-
-                {/* High scoring demo */}
-                <div className="pt-3.5 border-t border-slate-100 space-y-3 bg-slate-50/40 p-4 rounded-xl border border-slate-200/50">
-                  <span className="text-[10px] font-bold text-indigo-900 uppercase tracking-wider block">🎓 考官重构示范 (Band 8.0+)</span>
-                  <div>
-                    <span className="text-[9px] font-bold text-slate-400 uppercase">高分立场示范 (Stance)</span>
-                    <p className={`font-serif italic text-xs leading-relaxed ${evalData.suggestedStance ? 'text-slate-850' : 'text-slate-400 italic font-medium'}`}>
-                      {evalData.suggestedStance || "🔍 确认立场后解锁..."}
-                    </p>
-                  </div>
-                  <div className="pt-2 border-t border-slate-250/30">
-                    <span className="text-[9px] font-bold text-slate-400 uppercase">高分因果分论点示范 (Points)</span>
-                    <p className={`text-xs leading-relaxed whitespace-pre-wrap ${evalData.suggestedPoints ? 'text-slate-700' : 'text-slate-400 italic font-medium'}`}>
-                      {evalData.suggestedPoints || "🔍 确认分论点后解锁..."}
-                    </p>
-                  </div>
-                </div>
               </div>
             </div>
           ) : (
