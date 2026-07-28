@@ -23,6 +23,8 @@ import {
   promoteAcknowledgedFlatStep3Target,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
+import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
+import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
 
 dotenv.config();
 
