@@ -14,6 +14,7 @@ interface CoachChatProps {
   autoKickoff?: boolean;
   kickoffPrompt?: string;
   kickoffContextKey?: string;
+  inputDisabled?: boolean;
   children?: React.ReactNode; // For any extra structured evaluation UI
 }
 
@@ -28,6 +29,7 @@ export default function CoachChat({
   autoKickoff = false,
   kickoffPrompt = '',
   kickoffContextKey = '',
+  inputDisabled = false,
   children,
 }: CoachChatProps) {
   const [inputText, setInputText] = useState('');
@@ -794,7 +796,7 @@ export default function CoachChat({
           type="text"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
-          disabled={loading}
+          disabled={loading || inputDisabled}
           placeholder="向 AI Coach 提问，或讨论你的写作思路..."
           className="flex-1 min-w-0 bg-white border border-slate-200 rounded-lg px-3 py-1.5 font-sans text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 disabled:opacity-50"
         />

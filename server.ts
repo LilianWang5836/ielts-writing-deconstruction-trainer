@@ -22,6 +22,7 @@ import {
   promoteAcknowledgedStep3DraftTarget,
   promoteAcknowledgedFlatStep3Target,
 } from "./src/utils/step3Quality.ts";
+import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 
 dotenv.config();
 
@@ -7503,6 +7504,29 @@ async function startServer() {
         !!process.env.GEMINI_API_KEY &&
         process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY",
     });
+  });
+
+  // 1b. API - Step 2.5 Planner
+  app.post("/api/planner/generate", async (req, res) => {
+    try {
+      const { session } = req.body;
+      const questionType = session?.step1?.coachEvaluation?.correctType || "Agree / Disagree";
+      const fallbackPlans = buildFallbackBodyPlans(questionType);
+
+      res.json({
+        status: "passed",
+        step2_5: {
+          status: "passed",
+          startedAt: Date.now(),
+          updatedAt: Date.now(),
+          attempt: 1,
+          planSignature: `sig-${Date.now()}`,
+          bodyPlans: fallbackPlans,
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "Planner failed" });
+    }
   });
 
   // 2. API - Analyze Topic (Step 1)
