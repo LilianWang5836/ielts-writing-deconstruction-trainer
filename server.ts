@@ -5683,7 +5683,6 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
-    applyStep3FrameworkGuard(plan, session, activeSp);
     data.progressUpdate.paragraphPlan = plan;
   }
 
@@ -5759,7 +5758,6 @@ function enforceStep3LogicCompletionInner(
   if (options?.isHiddenKickoff) {
     if (plan) {
       sanitizeParagraphPlanValues(plan);
-      applyStep3FrameworkGuard(plan, session, activeSp);
       clearAllStep3PlanValues(plan);
       enforceConfirmedOnlySlots(plan, null);
       syncPlanProgressFields(data, plan, []);
@@ -5805,7 +5803,6 @@ function enforceStep3LogicCompletionInner(
 
   // Confirmed-only board (model cannot prefill unconfirmed slots).
   enforceConfirmedOnlySlots(plan, prevPlan);
-  applyStep3FrameworkGuard(plan, session, activeSp);
   // Protect confirm activeKey so one-shot reclass can still see the new empty target.
   pruneUnauthorizedEmptySteps(
     plan,
@@ -9639,15 +9636,9 @@ Student says:
       // clearing also rebuilds the flat step list, and BEFORE completion guard.
       if (currentStepNum === 3 && data?.progressUpdate?.paragraphPlan) {
         applyParagraphModeCorrection(data, session);
-        const activeSpForFramework = (session?.step3?.subpoints || []).find(
-          (sp: any) => sp.id === session?.step3?.activeSubpointId,
-        );
-        applyStep3FrameworkGuard(
-          data.progressUpdate.paragraphPlan,
-          session,
-          activeSpForFramework,
-        );
       }
+
+      // Step 3 completion safety net
 
       // Step 3 completion safety net: merge prior values, backfill a missed last
       // step from the user message, and clear premature completion CTA / flags
