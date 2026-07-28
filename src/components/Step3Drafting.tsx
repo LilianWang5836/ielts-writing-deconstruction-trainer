@@ -100,7 +100,26 @@ export default function Step3Drafting({
     return [];
   };
 
-  const parsedSubpoints: Step3Subpoint[] = clusters && Array.isArray(clusters) && clusters.length > 0
+  // 优先从 Step 2.5 bodyPlans 构建 subpoints（当 Planner 已运行成功时）
+  const step2_5BodyPlans = (session as any).step2_5?.bodyPlans;
+
+  const parsedSubpoints: Step3Subpoint[] = step2_5BodyPlans && step2_5BodyPlans.length > 0
+    ? step2_5BodyPlans.map((bp: any) => ({
+        id: bp.id,
+        content: bp.paragraphPlan?.pointBlocks?.[0]?.subClaim || bp.theme || bp.targetBody,
+        points: bp.mappedPoints || [bp.paragraphPlan?.pointBlocks?.[0]?.subClaim || ''].filter(Boolean),
+        targetBody: bp.targetBody,
+        theme: bp.theme || bp.role,
+        paragraphDensity: bp.paragraphDensity,
+        pointRoles: bp.pointRoles,
+        argumentRelation: bp.argumentRelation,
+        stanceRelation: bp.argumentRelation,
+        layoutRationale: (session as any).step2_5?.rationale || '',
+        paragraphPlan: bp.paragraphPlan,
+        frameworkSignature: `${bp.id}-${bp.argumentRelation || ''}`,
+        isCompleted: false,
+      }))
+    : clusters && Array.isArray(clusters) && clusters.length > 0
     ? clusters.map((cluster: any, i: number) => ({
         id: `body-${i + 1}`,
         content: resolveSubpointContent(
@@ -243,7 +262,9 @@ export default function Step3Drafting({
   const activeSubpoint = subpoints.find(
     (s) => s.id === session.step3.activeSubpointId,
   );
-  const kickoffPrompt = activeSubpoint?.content
+  const kickoffPrompt = activeSubpoint?.paragraphPlan
+    ? `请基于右侧已展示的段落结构直接开始，对准第一个空槽（${activeSubpoint.paragraphPlan.pointBlocks?.[0]?.steps?.[0]?.label || '分论点'}）用中文苏格拉底式提问。不要重新规划结构，不要一次性确认所有步骤，不要输出 pendingText。只问一个问题。`
+    : activeSubpoint?.content
     ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。请先规划本段 paragraphPlan 骨架（分点/角色/步骤标签），所有 steps[].value 保持空。step3SlotEval 必须 mode=expand，对准 firstEmpty，用自然中文苏格拉底问题开问。第二步材料只作提问线索，禁止整理成待确认整链草稿，禁止 mode=confirm / pendingText，禁止让我一次性确认。结构细节写入系统即可，对话里不要提字段名。`
     : "";
 
