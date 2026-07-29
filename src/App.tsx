@@ -102,7 +102,7 @@ export default function App() {
         apiKeyMissing={apiKeyMissing}
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 pb-4 min-h-0 flex flex-col lg:overflow-hidden">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 pb-4 min-h-0 flex flex-col overflow-y-auto">
         <AnimatePresence mode="wait">
           {!activeTopic || !session ? (
             <motion.div
