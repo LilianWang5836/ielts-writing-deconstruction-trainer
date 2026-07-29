@@ -70,9 +70,52 @@ export default function Header({
             </button>
             <button
               onClick={() => {
-                const sessionId = localStorage.getItem('ielts_deconstruct_session');
-                const id = sessionId ? JSON.parse(sessionId)?.id || 'session' : 'session';
-                window.open(`/api/log/session/${id}`, '_blank');
+                try {
+                  const raw = localStorage.getItem('ielts_deconstruct_session');
+                  if (!raw) { alert('没有可导出的对话记录'); return; }
+                  const session = JSON.parse(raw);
+                  const lines: string[] = [
+                    `# 雅思写作拆解训练 — 对话导出`,
+                    `- **题目**: ${session.topic?.question || '未知'}`,
+                    `- **题型**: ${session.topic?.questionType || '未知'}`,
+                    `- **导出时间**: ${new Date().toISOString()}`,
+                    '',
+                    '---',
+                    '',
+                  ];
+                  // 收集所有 step 的对话历史
+                  for (const stepKey of ['step1', 'step2', 'step3', 'step4']) {
+                    const step = session[stepKey]?.chatHistory || [];
+                    if (stepKey === 'step3' && Array.isArray(session.step3?.subpoints)) {
+                      for (const sp of session.step3.subpoints) {
+                        if (Array.isArray(sp.chatHistory)) {
+                          lines.push(`## ${sp.targetBody || sp.theme || 'Body Subpoint'}\n`);
+                          for (const msg of sp.chatHistory) {
+                            const role = msg.sender === 'ai' ? '**Coach**' : '**User**';
+                            lines.push(`${role}: ${msg.text}\n`);
+                          }
+                        }
+                      }
+                    }
+                    if (step.length > 0) {
+                      lines.push(`## Step ${stepKey.slice(-1)} 对话\n`);
+                      for (const msg of step) {
+                        const role = msg.sender === 'ai' ? '**Coach**' : '**User**';
+                        lines.push(`${role}: ${msg.text}\n`);
+                      }
+                    }
+                  }
+                  const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `ielts-conversation-${Date.now()}.md`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                } catch (e) {
+                  console.error('导出失败:', e);
+                  alert('导出对话失败');
+                }
               }}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-sans text-xs font-medium text-slate-600 shadow-sm transition hover:bg-indigo-50 hover:text-indigo-700"
               title="导出对话记录为 Markdown"
