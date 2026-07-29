@@ -25,6 +25,7 @@ import {
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
+import { log } from "./src/server/logger";
 
 dotenv.config();
 
@@ -6599,11 +6600,14 @@ async function generateContentWithFallback(params: {
         console.log(
           `[Gemini] Attempting generation with model: ${model} (attempt ${attempt}/${retries})`,
         );
+        log.llmRequest(model, JSON.stringify(params.contents).slice(0, 300));
         const response = await ai.models.generateContent({
           model,
           contents: params.contents,
           config: params.config,
         });
+        const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        log.llmResponse(model, rawText);
         return response;
       } catch (error: any) {
         lastError = error;
@@ -6611,6 +6615,7 @@ async function generateContentWithFallback(params: {
           `[Gemini] Model ${model} (attempt ${attempt}) failed. Error:`,
           error.message || error,
         );
+        log.llmError(model, error);
 
         if (
           error.message?.includes("API_KEY") ||
@@ -7862,6 +7867,9 @@ async function startServer() {
           });
         return;
       }
+
+      const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      log.startTurn(turnId, Number(step), String(userMessage));
 
       const promptHistory = (messages || [])
         .slice(-15)
@@ -9704,6 +9712,7 @@ Student says:
         data.progressUpdate,
       );
 
+      log.endTurn(turnId, String(data.text || ''), data.progressUpdate);
       res.json(data);
     } catch (error: any) {
       console.error("Error in /api/coach/chat:", error);
