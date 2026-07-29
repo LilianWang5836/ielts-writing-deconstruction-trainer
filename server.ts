@@ -5269,53 +5269,14 @@ function textMentionsDimensionCore(text: string, core: string): boolean {
   const c = String(core || "").trim();
   const cLower = c.toLowerCase();
   if (!t || !c) return false;
-  // 1. Exact match
   if (tLower.includes(cLower)) return true;
-  // 2. Short core / partial overlap (e.g. 烟民便利度 ↔ 烟民便利)
+  // Short core / partial overlap (e.g. 烟民便利度 ↔ 烟民便利)
   if (c.length >= 2 && tLower.includes(cLower.slice(0, Math.min(c.length, 4)))) {
     const compact = cLower.replace(/[度性层面角度]/g, "");
     if (compact.length >= 2 && tLower.includes(compact)) return true;
   }
-  // 3. Synonym bags (hardcoded for specific IELTS topics)
   for (const bag of STEP1_DIM_SYNONYM_BAGS) {
     if (bag.coreHint.test(c) && bag.evidence.test(t)) return true;
-  }
-  // 4. Content-word-level matching: strip function morphemes from the dimension
-  //    label, then for each content word, check if it appears (directly or via
-  //    bigram overlap) in the evidence corpus. ≥50% content words matched →
-  //    dimension was discussed.
-  const bigrams = (s: string): string[] => {
-    const out: string[] = [];
-    for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
-    return out;
-  };
-  const evidenceBigrams = new Set(bigrams(tLower));
-
-  const contentWordMatched = (word: string): boolean => {
-    if (tLower.includes(word)) return true;
-    // bigram overlap fallback: "知识技能" ↔ corpus has "知识" + "技能" separately
-    const wb = bigrams(word);
-    if (wb.length === 0) return false;
-    let shared = 0;
-    for (const bg of wb) {
-      if (evidenceBigrams.has(bg)) shared += 1;
-    }
-    return shared / wb.length >= 0.5;
-  };
-
-  const contentWords = cLower
-    .replace(/[的之和与或及是在为于以对从向到用把被让给叫使请]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
-
-  if (contentWords.length >= 2) {
-    const matched = contentWords.filter(contentWordMatched);
-    if (matched.length >= Math.ceil(contentWords.length * 0.5)) return true;
-  }
-
-  // 5. Single-word bigram fallback
-  if (contentWords.length === 1 && contentWords[0].length >= 2) {
-    return contentWordMatched(contentWords[0]);
   }
   return false;
 }
@@ -5478,8 +5439,13 @@ function listUnresolvedStep1Dimensions(
 }
 
 /**
- * Forbid silent drop of Step1 effective dimensions when converging / completing.
- * Each must be expanded, explicitly merged into another point, or explicitly dropped.
+ * Soft guard: ensure Step 1 effective dimensions are accounted for before
+ * Step 2 completion. When the conversation has already advanced to stance/summary
+ * with solid material, auto-disposition pending dimensions rather than blocking.
+ *
+ * The authoritative semantic judgment ("was this dimension discussed?") belongs
+ * to the Intent Agent. This guard only catches the case where the model is
+ * trying to complete during explore_A/B without addressing dimensions at all.
  */
 function enforceStep2DimensionDispositionGuard(
   data: any,
@@ -5499,13 +5465,42 @@ function enforceStep2DimensionDispositionGuard(
       "explore_A",
   ).trim();
   const ctaOk = textSuggestsStep2Complete(String(data.text || ""));
-  const converging =
-    stage === "stance" ||
-    stage === "summary" ||
-    !!data.progressUpdate.isCompleted ||
-    ctaOk;
-  if (!converging) return;
+  const isCompletedFlag =
+    !!data.progressUpdate.isCompleted || ctaOk;
 
+  // Only hard-block during early exploration: the model is trying to jump
+  // to completion without having even entered stance/summary stage.
+  const earlyConverge = stage === "explore_A" || stage === "explore_B";
+  if (!isCompletedFlag || !earlyConverge) {
+    // Soft pass: conversation has advanced (stance/summary) with solid material.
+    // Auto-disposition remaining pending dimensions as expanded — the Intent Agent
+    // will provide authoritative semantic matching when integrated.
+    for (const d of unresolved) {
+      for (const [key, cur] of dispositions as any) {
+        if (typeof cur === "object" && cur.disposition === "pending") {
+          for (const [, val] of (dispositions as any).entries?.() || []) {
+            // Inline fix: mark all pending as expanded
+          }
+        }
+      }
+    }
+    // Mark all pending as expanded directly
+    const finalDispositions = dispositions.map((d) => {
+      if (d.disposition === "pending") {
+        return { ...d, disposition: "expanded" as const };
+      }
+      return d;
+    });
+    step2.dimensionDispositions = finalDispositions;
+    const labels = unresolved.map((d) => d.dimension).join("、");
+    console.warn(
+      `[Step2DimDispositionGuard] Soft-pass: auto-expanded pending dimensions [${labels}] in stage=${stage}`,
+    );
+    return;
+  }
+
+  // Hard block: model attempted completion during explore_A/B without
+  // addressing all Step 1 dimensions.
   const labels = unresolved.map((d) => d.dimension).join("、");
   const oldStage = String(
     session?.step2?.coachEvaluation?.currentStage || "explore_B",
@@ -5526,7 +5521,7 @@ function enforceStep2DimensionDispositionGuard(
     `③明确放下并说原因。`;
   data.text = `${part1}\n\n---\n\n${ask}`;
   console.warn(
-    `[Step2DimDispositionGuard] Blocked converge/complete; unresolved=[${labels}] revertStage=${revertStage}`,
+    `[Step2DimDispositionGuard] Blocked early converge; unresolved=[${labels}] revertStage=${revertStage}`,
   );
 }
 

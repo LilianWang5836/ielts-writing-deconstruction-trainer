@@ -55,6 +55,9 @@ ${userMessage}
   "completionFlag": { "isCompleted": true|false, "reason": "..." } | null,
   "dimensionUpdates": [
     { "label": "维度名", "status": "probed"|"expandable"|"thin"|"quality_pending" }
+  ],
+  "dimensionDispositions": [
+    { "dimension": "维度标签原文", "disposition": "expanded"|"merged"|"dropped", "side": "A"|"B"|"", "mergedInto": "并入的目标维度(仅merged时)", "note": "简要理由" }
   ]
 }
 
@@ -63,7 +66,8 @@ ${userMessage}
 - stageTransition 仅在步骤确实需要切换时输出
 - slotUpdates 仅在 Step 3 中使用（其他 step 为空数组）
 - 不要修改 status 为 "confirmed" 的槽位
-- completionFlag 仅在步骤确实完成时输出`;
+- completionFlag 仅在步骤确实完成时输出
+- dimensionDispositions（Step 2 专用）：当对话中已讨论了某些 Step 1 维度时，标记状态。一个维度只要在对话中有实质性内容提到（不要求精确匹配标签文字，语义相关即可），就标记为 "expanded"。如果模型/Coach 明确建议放下某个维度，标记为 "dropped"。如果建议并入另一个维度，标记为 "merged" 并填写 mergedInto。不要留 pending`;
 
   return prompt;
 }
