@@ -7567,6 +7567,23 @@ async function startServer() {
     }
   });
 
+  // 1c. API - 对话导出
+  app.get("/api/log/session/:sessionId", (req, res) => {
+    const { sessionId } = req.params;
+    const markdown = log.exportSession(sessionId);
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="session-${sessionId}.md"`);
+    res.send(markdown);
+  });
+
+  app.get("/api/log/turn/:turnId", (req, res) => {
+    const { turnId } = req.params;
+    const markdown = log.exportTurn(turnId);
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="turn-${turnId}.md"`);
+    res.send(markdown);
+  });
+
   // 2. API - Analyze Topic (Step 1)
   app.post("/api/analyze-topic", async (req, res) => {
     try {

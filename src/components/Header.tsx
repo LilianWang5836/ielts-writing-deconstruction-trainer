@@ -1,5 +1,5 @@
 import React from 'react';
-import { BookOpen, RefreshCw, Layers, ArrowLeft } from 'lucide-react';
+import { BookOpen, RefreshCw, Layers, ArrowLeft, Share2 } from 'lucide-react';
 import { Topic } from '../types';
 
 interface HeaderProps {
@@ -67,6 +67,18 @@ export default function Header({
             >
               <ArrowLeft className="h-3.5 w-3.5" />
               <span>更换题目</span>
+            </button>
+            <button
+              onClick={() => {
+                const sessionId = localStorage.getItem('ielts_deconstruct_session');
+                const id = sessionId ? JSON.parse(sessionId)?.id || 'session' : 'session';
+                window.open(`/api/log/session/${id}`, '_blank');
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-sans text-xs font-medium text-slate-600 shadow-sm transition hover:bg-indigo-50 hover:text-indigo-700"
+              title="导出对话记录为 Markdown"
+            >
+              <Share2 className="h-3.5 w-3.5" />
+              <span>分享对话</span>
             </button>
           </div>
         )}
