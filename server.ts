@@ -5476,16 +5476,6 @@ function enforceStep2DimensionDispositionGuard(
     // Soft pass: conversation has advanced (stance/summary) with solid material.
     // Auto-disposition remaining pending dimensions as expanded — the Intent Agent
     // will provide authoritative semantic matching when integrated.
-    for (const d of unresolved) {
-      for (const [key, cur] of dispositions as any) {
-        if (typeof cur === "object" && cur.disposition === "pending") {
-          for (const [, val] of (dispositions as any).entries?.() || []) {
-            // Inline fix: mark all pending as expanded
-          }
-        }
-      }
-    }
-    // Mark all pending as expanded directly
     const finalDispositions = dispositions.map((d) => {
       if (d.disposition === "pending") {
         return { ...d, disposition: "expanded" as const };
