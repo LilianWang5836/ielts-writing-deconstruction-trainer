@@ -5269,14 +5269,53 @@ function textMentionsDimensionCore(text: string, core: string): boolean {
   const c = String(core || "").trim();
   const cLower = c.toLowerCase();
   if (!t || !c) return false;
+  // 1. Exact match
   if (tLower.includes(cLower)) return true;
-  // Short core / partial overlap (e.g. 烟民便利度 ↔ 烟民便利)
+  // 2. Short core / partial overlap (e.g. 烟民便利度 ↔ 烟民便利)
   if (c.length >= 2 && tLower.includes(cLower.slice(0, Math.min(c.length, 4)))) {
     const compact = cLower.replace(/[度性层面角度]/g, "");
     if (compact.length >= 2 && tLower.includes(compact)) return true;
   }
+  // 3. Synonym bags (hardcoded for specific IELTS topics)
   for (const bag of STEP1_DIM_SYNONYM_BAGS) {
     if (bag.coreHint.test(c) && bag.evidence.test(t)) return true;
+  }
+  // 4. Content-word-level matching: strip function morphemes from the dimension
+  //    label, then for each content word, check if it appears (directly or via
+  //    bigram overlap) in the evidence corpus. ≥50% content words matched →
+  //    dimension was discussed.
+  const bigrams = (s: string): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
+    return out;
+  };
+  const evidenceBigrams = new Set(bigrams(tLower));
+
+  const contentWordMatched = (word: string): boolean => {
+    if (tLower.includes(word)) return true;
+    // bigram overlap fallback: "知识技能" ↔ corpus has "知识" + "技能" separately
+    const wb = bigrams(word);
+    if (wb.length === 0) return false;
+    let shared = 0;
+    for (const bg of wb) {
+      if (evidenceBigrams.has(bg)) shared += 1;
+    }
+    return shared / wb.length >= 0.5;
+  };
+
+  const contentWords = cLower
+    .replace(/[的之和与或及是在为于以对从向到用把被让给叫使请]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+
+  if (contentWords.length >= 2) {
+    const matched = contentWords.filter(contentWordMatched);
+    if (matched.length >= Math.ceil(contentWords.length * 0.5)) return true;
+  }
+
+  // 5. Single-word bigram fallback
+  if (contentWords.length === 1 && contentWords[0].length >= 2) {
+    return contentWordMatched(contentWords[0]);
   }
   return false;
 }
