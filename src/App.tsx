@@ -66,6 +66,7 @@ export default function App() {
     setActiveTopic(topic);
     setSession(initialSession);
     localStorage.setItem('ielts_deconstruct_session', JSON.stringify(initialSession));
+    saveHistoryItem(initialSession);
   };
 
   const handleUpdateSession = (updates: Partial<PracticeSession> | ((prev: PracticeSession) => Partial<PracticeSession>)) => {

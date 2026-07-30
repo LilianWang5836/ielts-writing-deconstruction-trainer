@@ -144,5 +144,10 @@ export function exportHistoryAsMarkdown(item: ConversationHistoryItem): string {
 
 /** 判断当前是否为 debug 模式 */
 export function isDebugMode(): boolean {
-  return process.env.NODE_ENV !== 'production';
+  // Vite 暴露 import.meta.env.MODE，开发模式为 'development'
+  try {
+    return (import.meta as any).env?.DEV === true;
+  } catch {
+    return false;
+  }
 }

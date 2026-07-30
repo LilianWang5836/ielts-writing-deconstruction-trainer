@@ -15,8 +15,6 @@ interface HistoryDialogProps {
 }
 
 export default function HistoryDialog({ open, onClose, onOpenSession }: HistoryDialogProps) {
-  if (!open) return null;
-
   const [history, setHistory] = React.useState(getHistory());
 
   // Refresh list when dialog opens
@@ -38,7 +36,6 @@ export default function HistoryDialog({ open, onClose, onOpenSession }: HistoryD
   const handleExportWithLogs = (item: ConversationHistoryItem) => {
     // Debug 模式：尝试同时下载日志（如果存在）
     if (isDebugMode()) {
-      const logDate = new Date().toISOString().slice(0, 10);
       const logUrl = `/api/log/session/${item.id}`;
       window.open(logUrl, '_blank');
     }
@@ -67,6 +64,8 @@ export default function HistoryDialog({ open, onClose, onOpenSession }: HistoryD
     3: '论证',
     4: '写作',
   };
+
+  if (!open) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
