@@ -8336,6 +8336,7 @@ ${memoryDigestStr}
      - Agree/Disagree example shape: "根据你前面给出的材料，我更推荐『部分同意』：你对……的论据更具体，而另一面可以作为限制条件。这个方向符合你的本意吗？" Rephrase naturally; do not force this literal wording.
      - Positive / Negative (or outweigh-style) example shape: "我更推荐『利大于弊』：你给出的两个好处都能展开成具体场景，而缺点更适合作为可缓解的让步。你愿意采用这个立场吗？" Rephrase naturally and cite the student's actual points.
      - Wording rule: call ②/③ "带让步的立场". NEVER call 弊大于利 / 利大于弊 a "折中立场".
+     - TYPE-AWARE STANCE RULE (CRITICAL for Discuss Both Views): when questionType is "Discuss Both Views", \`different_situations\` (按工作/场景/人群分情况讨论) IS an equally valid and often BETTER stance than concession. Before recommending concession, explicitly evaluate whether the student's material splits naturally by job type / scenario / stakeholder group. If it does, offer \`different_situations\` as Option A and concession as Option B, with a brief rationale for both. Do NOT silently default to concession just because one side has more material — that collapses Discuss Both into an Agree/Disagree pattern, which breaks the task type.
      - FORBIDDEN: recommending a stance merely because it is generally safer/better/more common. The recommendation must be evidence-based from THIS student's brainstorm.
      - Exhaustion respect: if the student says "没有更多了/先这样/就这些", do NOT re-ask the same side for more points; converge with the solid points already on record (one solid support point is acceptable when they explicitly stop).
      - Wait for student answer.
@@ -8386,8 +8387,9 @@ ${memoryDigestStr}
     2. When two points on the SAME side both have strong material, you MAY split into separate bodies OR combine as dual_point with major/minor — pick the option that best fits stance, word budget (~90–110 words per body), and retention tags.
     3. When one point is thin (略写/待补例子), prefer dual_point (major + minor in one body) rather than giving it its own body.
     4. For 利大于弊 / 弊大于利 / partial-agreement stances: the body presenting the weaker/opposite side MUST be argumentRelation: "concedes" (and stanceRelation: "concedes").
-    5. Keep \`blueprint.bodyCount\`, \`blueprint.layoutPattern\`, and \`clustering\` consistent. Mirror framework fields on matching \`blueprint.bodies[]\` entries when emitted.
-    6. Stance–material fit (CRITICAL, converge-stage only): before finalizing an outweigh stance, check whether the SUPPORT side has enough expandable points. Concession bodies may rely on one major opposite-side point; support bodies should prefer two complementary points OR one very solid point. If the student has already said they have no more points and at least one solid support point exists, finalize with that package — do NOT re-ask the same question.
+    5. TYPE-AWARE RELATION RULE (CRITICAL for Discuss Both Views): when the question type is Discuss Both Views and the stance is NOT outweigh/concession, each body should use argumentRelation: "elaborates" (parallel explanation from the respective viewpoint's perspective). Do NOT assign "supports" to one body and "concedes" to the other — that collapses Discuss Both into an Agree/Disagree pattern. If the student chose "different_situations", use "compares" or "elaborates" depending on whether the bodies directly compare or independently explain two situations.
+    6. Keep \`blueprint.bodyCount\`, \`blueprint.layoutPattern\`, and \`clustering\` consistent. Mirror framework fields on matching \`blueprint.bodies[]\` entries when emitted.
+    7. Stance–material fit (CRITICAL, converge-stage only): before finalizing an outweigh stance, check whether the SUPPORT side has enough expandable points. Concession bodies may rely on one major opposite-side point; support bodies should prefer two complementary points OR one very solid point. If the student has already said they have no more points and at least one solid support point exists, finalize with that package — do NOT re-ask the same question.
 
   ## Layered Output Definition (层级划分与降压设计)
   To reduce JSON complexity and LLM generation errors, the output is strictly split:
@@ -8473,10 +8475,18 @@ ${memoryDigestStr}
     - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major: 2–3 steps; minor: 1–2 steps).
     - Set each pointBlock.\`subClaim\` from the mapped point text; set \`role\` from \`pointRoles\`.
     - \`argumentRelation\` (or legacy \`stanceRelation\`) selects REQUIRED argument beats for this body. Cover those beats with open student-filled steps; do NOT force a fixed step count or fixed canned labels:
-      - supports / elaborates: ordinary causal chain as needed by the content.
+      - supports / elaborates: no mandatory beats. Choose 2–4 steps from the expansion strategies below that best fit the student's STEP 2 materials. NEVER default to a fixed "claim → reason → mechanism → example" template — different materials need different chains (e.g. a material strong on causal logic uses mechanism→impact; a material strong on concrete situations uses example→explanation).
       - concedes: must cover (1) acknowledge the opposite side exists (2) show why it does not overturn the overall thesis — step count flexible.
       - compares: both sides → key difference → which is better (flexible phrasing).
       - solves: problem/gap → solution → why it works.
+  - EXPANSION STRATEGY CHOICE (applies to ALL relation types): BEFORE you write any \`pointBlock.steps[]\`, decide the \`expansionStrategy\` for each pointBlock by inspecting the Step 2 material quality:
+    - \`explanation\`: the material focuses on clarifying a concept or definition → steps build a logical explanation chain.
+    - \`example\`: the material naturally lends itself to a concrete scene/case → steps build around a vivid example.
+    - \`mechanism\`: the material traces a cause→effect process → steps follow the causal chain.
+    - \`impact\`: the material emphasizes consequences or significance → steps lead toward impact/outcome.
+    - \`contrast\`: the material compares two sides or before/after → steps highlight the contrast.
+    - \`hybrid\`: the material requires 2+ strategies mixed (e.g. mechanism + example) → combine as needed within budget.
+    - Record your choice in \`pointBlock.expansionStrategy\`. DO NOT write every block as "mechanism" or follow the same template for every body paragraph. Two body paragraphs with the same relation but different material SHOULD produce different step layouts.
   - CONTENT REUSE FROM STEP 2 (CRITICAL): \`mappedPoints\` / userPoints are APPROVED EVIDENCE FOR ASKING ONLY. On every empty slot (including kickoff), use Step 2 as clues for a beat-specific Socratic question (mode=expand). FORBIDDEN: polishing / completing Step 2 into a full sentence and putting it in \`step3SlotEval.pendingText\` for the student to merely affirm — that is LLM代劳. mode=confirm is allowed ONLY after the student has themselves stated this beat in Step 3 chat; then pendingText may paraphrase THEIR words (no new facts). Keep all \`steps[].value\` empty until the server commits on affirm. Omit beats Step 2 never covered — ask, do not invent.
   - After the student affirms (「对/是的/没问题」), the SERVER writes confirmed values. Your next turn asks the next empty slot with mode=expand (Socratic) unless the student already answered that next beat in this Step 3 dialogue. Do not make the student restate already-confirmed material.
   - Record \`[inherited-step2-framework]\` in \`paragraphPlan.diagnosis\` when inheriting.
