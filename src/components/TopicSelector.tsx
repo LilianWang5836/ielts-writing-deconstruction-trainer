@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Filter, Sparkles, BookOpen, PlusCircle, ChevronRight, HelpCircle, Upload } from 'lucide-react';
+import { Filter, Sparkles, BookOpen, PlusCircle, ChevronRight, HelpCircle, Upload, History } from 'lucide-react';
 import { Topic } from '../types';
 import { PRESET_TOPICS } from '../topics';
 import { getImportedTopics, normalizeQuestionText } from '../topicStorage';
@@ -7,9 +7,10 @@ import { getImportedTopics, normalizeQuestionText } from '../topicStorage';
 interface TopicSelectorProps {
   onSelectTopic: (topic: Topic) => void;
   onOpenImporter?: () => void;
+  onOpenHistory?: () => void;
 }
 
-export default function TopicSelector({ onSelectTopic, onOpenImporter }: TopicSelectorProps) {
+export default function TopicSelector({ onSelectTopic, onOpenImporter, onOpenHistory }: TopicSelectorProps) {
   // Filters
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [selectedType, setSelectedType] = useState<string>('All');
@@ -115,6 +116,16 @@ export default function TopicSelector({ onSelectTopic, onOpenImporter }: TopicSe
           >
             <Upload className="h-3.5 w-3.5" />
             导入题目
+          </button>
+        )}
+        {onOpenHistory && (
+          <button
+            onClick={onOpenHistory}
+            className="mb-[-1px] inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-indigo-50 hover:text-indigo-700"
+            title="查看历史对话记录"
+          >
+            <History className="h-3.5 w-3.5" />
+            历史对话
           </button>
         )}
       </div>

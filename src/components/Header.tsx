@@ -1,5 +1,5 @@
 import React from 'react';
-import { BookOpen, RefreshCw, Layers, ArrowLeft, Share2 } from 'lucide-react';
+import { BookOpen, RefreshCw, Layers, ArrowLeft, Share2, History } from 'lucide-react';
 import { Topic } from '../types';
 
 interface HeaderProps {
@@ -8,6 +8,7 @@ interface HeaderProps {
   onStepClick: (step: number) => void;
   onReset: () => void;
   apiKeyMissing: boolean;
+  onOpenHistory?: () => void;
 }
 
 const STEPS = [
@@ -23,6 +24,7 @@ export default function Header({
   onStepClick,
   onReset,
   apiKeyMissing,
+  onOpenHistory,
 }: HeaderProps) {
   return (
     <header className="sticky top-0 z-40 w-full border-b border-slate-200 bg-white/95 backdrop-blur-md px-6 py-4">
@@ -68,6 +70,16 @@ export default function Header({
               <ArrowLeft className="h-3.5 w-3.5" />
               <span>更换题目</span>
             </button>
+            {onOpenHistory && (
+              <button
+                onClick={onOpenHistory}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-sans text-xs font-medium text-slate-600 shadow-sm transition hover:bg-indigo-50 hover:text-indigo-700"
+                title="查看历史对话记录"
+              >
+                <History className="h-3.5 w-3.5" />
+                <span>历史对话</span>
+              </button>
+            )}
             <button
               onClick={() => {
                 try {
