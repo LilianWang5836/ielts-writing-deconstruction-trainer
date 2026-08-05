@@ -315,17 +315,27 @@ export default function Step2Brainstorm({
     }
   };
 
+  // Effect A: 状态机 — CTA 出现且 idle 时置 running。
+  // 注意：绝不能在同一个 effect 里又创建 controller 又 setState('running')，
+  // 否则状态变化触发 cleanup 会立刻 abort 掉刚发起的请求（竞态）。
   useEffect(() => {
     if (!showNextStepButton) return;
     if (plannerStatus !== 'idle') return;
     setPlannerStatus('running');
+  }, [showNextStepButton, plannerStatus]);
+
+  // Effect B: 真正发起请求 — 仅在 running 时执行；cleanup 只在状态离开
+  // running（成功/失败/卸载）时 abort，属于正常收尾，不会误杀请求。
+  useEffect(() => {
+    if (plannerStatus !== 'running') return;
     const controller = new AbortController();
     plannerAbortRef.current = controller;
     // 单一超时源：到点即 abort 请求并把状态置为 failed（可重试）。
+    // 180s 覆盖服务端最多 2 次 LLM 尝试（正常网络单次 30-80s）。
     plannerTimerRef.current = setTimeout(() => {
       controller.abort();
       setPlannerStatus('failed');
-    }, 90000);
+    }, 180000);
     triggerPlanner(controller);
     return () => {
       if (plannerTimerRef.current) {
@@ -335,7 +345,7 @@ export default function Step2Brainstorm({
       plannerAbortRef.current?.abort();
       plannerAbortRef.current = null;
     };
-  }, [showNextStepButton, plannerStatus]);
+  }, [plannerStatus]);
 
   const handleNextStepWithPlanner = () => {
     if (plannerStatus === 'passed') {

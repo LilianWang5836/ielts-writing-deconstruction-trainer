@@ -7615,18 +7615,32 @@ async function startServer() {
             "",
         ).trim() || "Agree / Disagree";
 
-      const input = collectPlannerInput(session, question, questionType);
-
       // --- 首选：真实 Planner LLM（材料驱动的结构推理） ---
       // 解析/QA 失败时重试一次（LLM 输出有随机性，二次尝试常能成功）。
       let bodyPlans: any[] | null = null;
       let errorMessage = "";
       let degraded = false;
       let qaIssues: string[] = [];
-      const request = buildPlannerRequest(input);
+      let request: any = null;
+      let input: any = null;
+
+      // collectPlannerInput / buildPlannerRequest 若抛错（session 结构异常等），
+      // 直接走兜底，不返回 500（500 会让前端显示“重试”而不是降级出计划）。
+      try {
+        input = collectPlannerInput(session, question, questionType);
+        request = buildPlannerRequest(input);
+      } catch (ce: any) {
+        errorMessage = String(ce?.message || "Planner 输入构造失败");
+        console.warn(`[Planner] 输入构造失败：${errorMessage}`);
+      }
+
       const MAX_PLANNER_ATTEMPTS = 2;
 
-      for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS && !bodyPlans; attempt++) {
+      for (
+        let attempt = 1;
+        attempt <= MAX_PLANNER_ATTEMPTS && !bodyPlans && request;
+        attempt++
+      ) {
         try {
           const response = await generateContentWithFallback(request);
           const rawText =
@@ -7672,7 +7686,7 @@ async function startServer() {
       // --- 兜底：数据感知的保守结构（携带 Step 2 subClaim） ---
       if (!bodyPlans) {
         degraded = true;
-        bodyPlans = buildFallbackBodyPlans(questionType, input);
+        bodyPlans = buildFallbackBodyPlans(questionType, input || undefined);
         console.warn(
           `[Planner] Degraded to programmatic fallback. Reason: ${errorMessage || "unknown"}`,
         );
