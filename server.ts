@@ -5875,6 +5875,57 @@ function enforceStep3LogicCompletionInner(
 
   // Bare「对」with nothing pending — never pretend success / complete.
   if (pending.length === 0 && isStep3AffirmativeConfirmation(userMessage)) {
+    // Defense (protocol hole fix): the model may have declared a confirm with
+    // pendingText in THIS response while the student's「对」is approving it
+    // (e.g. the model asked "请回复对确认这句话" in text, but the pending was
+    // never staged — a prior post-affirm turn that got overwritten to expand).
+    // Commit the declared pending directly instead of vetoing — otherwise the
+    // flow deadlocks with「请先把 X 说具体一点」despite the student affirming.
+    if (
+      slotEval?.mode === "confirm" &&
+      slotEval.qualified &&
+      String(slotEval.pendingText || "").trim().length >= 4
+    ) {
+      const loc = findStepLocationByKey(plan, slotEval.activeKey);
+      if (loc && !isStep3Confirmed(loc.step)) {
+        const hard = hardRejectSlotText(
+          slotEval.pendingText,
+          plan,
+          slotEval.activeKey,
+          loc.blockIndex,
+        );
+        if (hard.ok) {
+          const committed = commitPendingOnAffirm(plan, [
+            {
+              key: slotEval.activeKey,
+              label: loc.label,
+              text: slotEval.pendingText,
+              blockIndex: loc.blockIndex,
+              stepIndex: loc.stepIndex,
+            },
+          ]);
+          if (committed > 0) {
+            syncPlanProgressFields(data, plan, []);
+            setReject("");
+            console.warn(
+              "[Step3Guard] Affirm with no pending but model declared confirm — committed directly.",
+            );
+            if (finishBodyIfComplete()) return;
+            const vetoed = enforceStep3TextBoardConsistency(
+              data,
+              plan,
+              "post_affirm_expand",
+            );
+            console.warn(
+              vetoed
+                ? "[Step3Guard] Post-direct-commit — vetoed illegal next-ask text."
+                : "[Step3Guard] Post-direct-commit — kept model next-slot ask.",
+            );
+            return;
+          }
+        }
+      }
+    }
     syncPlanProgressFields(data, plan, []);
     setReject("affirm_no_pending");
     vetoStep3TextToFirstEmptyAsk(data, plan, "affirm_no_pending");
@@ -5925,6 +5976,46 @@ function enforceStep3LogicCompletionInner(
       `[Step3Guard] Applied confirmed pending draft(s) to slots after student affirmation (confirm-then-write via commitPendingOnAffirm).`,
     );
     if (finishBodyIfComplete()) return;
+
+    // Protocol-hole fix: the model may, in the SAME affirm turn, also organize the
+    // NEXT slot's sentence and ask the student to confirm it ("我将它提炼为一句
+    // 话：... 请回复对"). If it declared mode=confirm + pendingText for an empty
+    // slot, STAGE it here. Otherwise the sentence lives only in text, never gets
+    // staged, and the student's next「对」hits the "affirm with no pending" veto
+    // (observed deadlock: 运作过程 confirmed OK → 具体实例 confirm lost → stuck).
+    if (
+      slotEval?.mode === "confirm" &&
+      slotEval.qualified &&
+      String(slotEval.pendingText || "").trim().length >= 4
+    ) {
+      const loc = findStepLocationByKey(plan, slotEval.activeKey);
+      if (loc && !isStep3Confirmed(loc.step)) {
+        const hard = hardRejectSlotText(
+          slotEval.pendingText,
+          plan,
+          slotEval.activeKey,
+          loc.blockIndex,
+        );
+        if (hard.ok) {
+          pending = [
+            {
+              key: slotEval.activeKey,
+              label: loc.label,
+              text: slotEval.pendingText,
+              blockIndex: loc.blockIndex,
+              stepIndex: loc.stepIndex,
+            },
+          ];
+          syncPlanProgressFields(data, plan, pending);
+          setReject("");
+          console.warn(
+            "[Step3Guard] Post-affirm staged next-slot confirm from model step3SlotEval (confirm-then-write).",
+          );
+          return;
+        }
+      }
+    }
+
     // Affirm done — keep model next ask unless it dumps/fakes complete.
     const vetoed = enforceStep3TextBoardConsistency(
       data,
@@ -8854,6 +8945,10 @@ ${memoryDigestStr}
   - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.
   - CRITICAL — STUCK / 「不知道」: If the student cannot answer, give at most ONE short clue from Step 2 or a narrower follow-up question. FORBIDDEN: writing a complete ready-made sentence and asking them to rubber-stamp it (「用这句话…合适吗」).
   - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise THIS sentence (「对」或修改). Do not stack a long next-slot lecture in the same turn; after they affirm, your NEXT reply asks the next empty beat naturally.
+  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages a confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, activeKey, pendingText}\`. If you write an organized sentence in \`text\` and ask the student to「回复对」but do NOT declare mode=confirm with that pendingText, the sentence is never staged and the student's next「对」will be rejected as "no pending" — a deadlock. Therefore:
+    1. When mode=expand, NEVER present a ready-made sentence and ask the student to confirm it in text; ask a Socratic question instead.
+    2. After a student affirms (a mode=confirm turn), your next turn should normally ask the NEXT empty slot with mode=expand. Do NOT, in the SAME affirm turn, also organize the next slot's sentence — that second confirm would be lost.
+    3. The ONLY case you may present a confirm sentence in text is when you ALSO declare \`mode:"confirm"\` + \`pendingText\` for that exact \`activeKey\` in this same response.
   - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
   - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
   - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
