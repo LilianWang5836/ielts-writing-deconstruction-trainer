@@ -6606,6 +6606,31 @@ function enforceStep1SlotCompletion(
   }
 }
 
+/** Network-level errors shared by every Gemini model — retrying other models is futile. */
+function isNetworkLevelError(error: any): boolean {
+  if (!error) return false;
+  const msg = String(
+    error?.message || error?.cause?.message || error?.toString?.() || "",
+  );
+  const causeCode = String(error?.cause?.code || "");
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ENOTFOUND") ||
+    msg.includes("EAI_AGAIN") ||
+    msg.includes("socket hang up") ||
+    msg.includes("UND_ERR_CONNECT_TIMEOUT") ||
+    msg.includes("UND_ERR_SOCKET") ||
+    msg.includes("connect ETIMEDOUT") ||
+    causeCode.startsWith("UND_ERR") ||
+    causeCode === "ECONNREFUSED" ||
+    causeCode === "ECONNRESET" ||
+    causeCode === "ENOTFOUND" ||
+    causeCode === "ETIMEDOUT"
+  );
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
@@ -6637,6 +6662,17 @@ async function generateContentWithFallback(params: {
           error.message || error,
         );
         log.llmError(model, error);
+
+        // Network-level failures (fetch failed / connect timeout / refused / DNS)
+        // are shared by every model — trying the remaining models only wastes time
+        // (each attempt can block ~10s+). Fast-fail so the caller can fall back
+        // (e.g. Planner fallback, coach error) without a ~110s stall.
+        if (isNetworkLevelError(error)) {
+          console.warn(
+            `[Gemini] Network-level failure — skipping remaining models (${models.length} models × 2 attempts avoided).`,
+          );
+          throw error;
+        }
 
         if (
           error.message?.includes("API_KEY") ||
@@ -7633,7 +7669,11 @@ async function startServer() {
           attempt: 1,
           planSignature: `sig-${Date.now()}`,
           bodyPlans,
-          qaDepth: degraded ? "mechanical" : "full",
+          degraded,
+          errorMessage: degraded ? errorMessage || undefined : undefined,
+          // 目前仅执行机械 QA（value 空 / 2-3 body / key 唯一 / mode 合法）；
+          // 完整自适应 QA（rubric + 忠实性 + 段内有效性）为后续 Phase C。
+          qaDepth: "mechanical",
         },
       });
     } catch (error: any) {

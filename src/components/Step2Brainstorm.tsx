@@ -61,6 +61,7 @@ export default function Step2Brainstorm({
   const [activeTab, setActiveTab] = useState<'step1' | 'step2' | 'step3' | 'step4'>('step2');
   const [plannerStatus, setPlannerStatus] = useState<'idle' | 'running' | 'passed' | 'failed'>('idle');
   const plannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const plannerAbortRef = useRef<AbortController | null>(null);
   const eval1 = session.step1.coachEvaluation;
   const userNotes = session.step1.userAnalysisNotes?.trim();
   const step1SuggestedDimensions = (eval1?.suggestedDimensions || [])
@@ -284,12 +285,13 @@ export default function Step2Brainstorm({
   ]);
 
   // Planner: 当 CTA 出现且 planner 未运行时自动触发
-  const triggerPlanner = async () => {
+  const triggerPlanner = async (controller: AbortController) => {
     try {
       const res = await fetch('/api/planner/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session }),
+        signal: controller.signal,
       });
       const data = await res.json();
       if (plannerTimerRef.current) {
@@ -303,7 +305,13 @@ export default function Step2Brainstorm({
         setPlannerStatus('failed');
       }
     } catch {
+      if (plannerTimerRef.current) {
+        clearTimeout(plannerTimerRef.current);
+        plannerTimerRef.current = null;
+      }
       setPlannerStatus('failed');
+    } finally {
+      plannerAbortRef.current = null;
     }
   };
 
@@ -311,8 +319,22 @@ export default function Step2Brainstorm({
     if (!showNextStepButton) return;
     if (plannerStatus !== 'idle') return;
     setPlannerStatus('running');
-    plannerTimerRef.current = setTimeout(() => setPlannerStatus('failed'), 60000);
-    triggerPlanner();
+    const controller = new AbortController();
+    plannerAbortRef.current = controller;
+    // 单一超时源：到点即 abort 请求并把状态置为 failed（可重试）。
+    plannerTimerRef.current = setTimeout(() => {
+      controller.abort();
+      setPlannerStatus('failed');
+    }, 90000);
+    triggerPlanner(controller);
+    return () => {
+      if (plannerTimerRef.current) {
+        clearTimeout(plannerTimerRef.current);
+        plannerTimerRef.current = null;
+      }
+      plannerAbortRef.current?.abort();
+      plannerAbortRef.current = null;
+    };
   }, [showNextStepButton, plannerStatus]);
 
   const handleNextStepWithPlanner = () => {

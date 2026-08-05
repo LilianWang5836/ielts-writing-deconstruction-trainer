@@ -206,6 +206,12 @@ export function normalizePlannerBodyPlans(bodyPlans: BodyPlan[]): BodyPlan[] {
       first.status = 'confirmed';
       // 额外标记：该槽来自 Step 2 继承，防被误当学生本轮新答
       first.inheritedFromStep2 = true;
+      // 防 placeholder-echo 误伤：若 placeholder 与 subClaim 相同/互相包含，
+      // 会被 isPlaceholderEchoValue 判为非真实值而清除。这里改成通用占位。
+      const ph = String(first.placeholder || '').trim();
+      if (ph && (ph === subClaim || subClaim.includes(ph) || ph.includes(subClaim))) {
+        first.placeholder = '用一句话写出本段核心主张（已从第二步预填）';
+      }
     }
   }
   return bodyPlans;

@@ -455,6 +455,8 @@ export interface Step2_5State {
   rationale?: string;
   bodyPlans: BodyPlan[];
   errorMessage?: string;
+  /** True when the plan came from the programmatic fallback instead of the Planner LLM. */
+  degraded?: boolean;
 }
 
 export interface BodyPlan {
