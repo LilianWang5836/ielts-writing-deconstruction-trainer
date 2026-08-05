@@ -19,6 +19,48 @@ View your app in AI Studio: https://ai.studio/apps/8997f192-d0c0-42c6-a864-d4af1
 3. Run the app:
    `npm run dev`
 
+## LLM 提供商配置
+
+应用默认使用 **Gemini**，也支持切换到任意 **OpenAI 兼容** 提供商
+（OpenAI / DeepSeek / Moonshot(Kimi) / OpenRouter / 本地 vLLM、Ollama 等）。
+全部通过环境变量控制（参考 [.env.example](.env.example)）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LLM_PROVIDER` | `gemini` | `gemini` 或 `openai-compatible` |
+| `GEMINI_API_KEY` | — | Gemini 必填 |
+| `GEMINI_MODELS` | 内置 5 个模型 | 逗号分隔，按顺序回退 |
+| `OPENAI_API_KEY` | — | openai-compatible 必填 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 兼容端点（DeepSeek/Kimi/Ollama 等） |
+| `OPENAI_MODEL` | `gpt-4o-mini` | 使用的模型名 |
+
+### 示例：改用 DeepSeek
+
+```bash
+# .env
+LLM_PROVIDER=openai-compatible
+OPENAI_API_KEY=sk-xxxx
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-chat
+```
+
+### 示例：本地 Ollama（无需云 API Key）
+
+```bash
+# 先启动 ollama serve 并拉取模型，例如 ollama pull qwen2.5:14b
+LLM_PROVIDER=openai-compatible
+OPENAI_API_KEY=ollama            # 任意非空值即可
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_MODEL=qwen2.5:14b
+```
+
+### 说明
+
+- 所有步骤的 prompt 与 JSON 契约与提供商无关，切换后无需改代码。
+- openai-compatible 模式下请求会带上 `response_format: {type:"json_object"}`（结构化输出），
+  若你的端点不支持可忽略（模型仍会尽力输出 JSON）。
+- 健康检查 `/api/health` 会返回当前 `provider` 与 `hasKey`，前端据此显示配置提示。
+
 ## Logging
 
 项目内置结构化日志系统（`src/server/logger.ts`），通过环境变量控制。

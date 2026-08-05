@@ -35,6 +35,11 @@ import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/inten
 import { log } from "./src/server/logger";
 
 dotenv.config();
+// 本地覆盖：.env.local 优先（便于本地测试时切换 LLM 提供商/Key，而不影响共享 .env）
+dotenv.config({
+  path: path.resolve(process.cwd(), ".env.local"),
+  override: true,
+});
 
 // Lazy-initialize Gemini API client to avoid startup crashes if key is missing
 let aiInstance: GoogleGenAI | null = null;
@@ -6722,12 +6727,162 @@ function isNetworkLevelError(error: any): boolean {
   );
 }
 
+/** 当前 LLM 提供商：gemini（默认）| openai-compatible */
+function getLLMProvider(): "gemini" | "openai-compatible" {
+  const p = String(process.env.LLM_PROVIDER || "").trim().toLowerCase();
+  return p === "openai" || p === "openai-compatible"
+    ? "openai-compatible"
+    : "gemini";
+}
+
+/** Gemini 模型列表（可用 GEMINI_MODELS=model1,model2 覆盖）。 */
+function getGeminiModels(): string[] {
+  const raw = String(process.env.GEMINI_MODELS || "").trim();
+  if (raw) {
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+  ];
+}
+
+/**
+ * OpenAI 兼容提供商调用（DeepSeek / Kimi / OpenRouter / 本地 vLLM、Ollama 等）。
+ * 通过环境变量配置：
+ *   LLM_PROVIDER=openai-compatible
+ *   OPENAI_API_KEY=<key>
+ *   OPENAI_BASE_URL=<例如 https://api.deepseek.com/v1>
+ *   OPENAI_MODEL=<例如 deepseek-chat>
+ * 返回与 Gemini 相同的信封结构 { candidates: [{ content: { parts: [{ text }] } }] }，
+ * 调用方无需改动。
+ */
+async function generateOpenAICompat(params: {
+  contents: any;
+  config?: any;
+}): Promise<any> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey === "MY_OPENAI_API_KEY") {
+    throw new Error(
+      "OPENAI_API_KEY is not set (LLM_PROVIDER=openai-compatible). Add your key in .env or Settings > Secrets.",
+    );
+  }
+  const baseUrl = (
+    process.env.OPENAI_BASE_URL || "https://api.openai.com/v1"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+  const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+
+  const messages = (Array.isArray(params.contents) ? params.contents : [])
+    .map((c: any) => {
+      const parts = Array.isArray(c?.parts) ? c.parts : [];
+      const text = parts
+        .map((p: any) => String(p?.text || ""))
+        .join("")
+        .trim();
+      if (!text) return null;
+      const role = c?.role === "assistant" ? "assistant" : "user";
+      return { role, content: text };
+    })
+    .filter(Boolean);
+
+  const body: Record<string, any> = {
+    model,
+    messages,
+    temperature:
+      typeof params.config?.temperature === "number"
+        ? params.config.temperature
+        : 0.7,
+    max_tokens: params.config?.maxOutputTokens ?? 32768,
+  };
+  if (params.config?.responseMimeType === "application/json") {
+    body.response_format = { type: "json_object" };
+  }
+
+  const url = `${baseUrl}/chat/completions`;
+  log.llmRequest(model, JSON.stringify(messages).slice(0, 300));
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const err = new Error(
+      `OpenAI-compatible API error ${res.status}: ${errText.slice(0, 300)}`,
+    ) as any;
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const content = String(
+    data?.choices?.[0]?.message?.content || "",
+  );
+  return {
+    candidates: [{ content: { parts: [{ text: content }] } }],
+  };
+}
+
+/** OpenAI 兼容路径：单模型 + 3 次重试。 */
+async function generateOpenAICompatWithRetry(params: {
+  contents: any;
+  config?: any;
+}): Promise<any> {
+  const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(
+        `[LLM] Attempting generation via openai-compatible (${model}) attempt ${attempt}/3`,
+      );
+      const response = await generateOpenAICompat(params);
+      const rawText =
+        response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      log.llmResponse(model, rawText);
+      return response;
+    } catch (error: any) {
+      lastError = error;
+      console.warn(
+        `[LLM] openai-compatible attempt ${attempt} failed:`,
+        error.message || error,
+      );
+      log.llmError(model, error);
+      if (
+        error?.status === 401 ||
+        error?.status === 403 ||
+        isNetworkLevelError(error)
+      ) {
+        throw error;
+      }
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, attempt * 1000));
+      }
+    }
+  }
+  throw lastError || new Error("OpenAI-compatible LLM failed after retries.");
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
 }): Promise<any> {
+  // 多提供商分派：openai-compatible 走 OpenAI 兼容端点，其余走 Gemini。
+  if (getLLMProvider() === "openai-compatible") {
+    return generateOpenAICompatWithRetry(params);
+  }
+
   const ai = getAI();
-  const models = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-3.1-pro-preview", "gemini-2.5-pro"];
+  const models = getGeminiModels();
   let lastError: any = null;
 
   for (const model of models) {
@@ -7684,11 +7839,14 @@ async function startServer() {
 
   // 1. API - Health check
   app.get("/api/health", (req, res) => {
+    const provider = getLLMProvider();
+    const key =
+      provider === "openai-compatible" ? "OPENAI_API_KEY" : "GEMINI_API_KEY";
+    const val = process.env[key];
     res.json({
       status: "ok",
-      hasKey:
-        !!process.env.GEMINI_API_KEY &&
-        process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY",
+      provider,
+      hasKey: !!val && val !== `MY_${key}`,
     });
   });
 
