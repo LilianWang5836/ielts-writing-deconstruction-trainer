@@ -277,6 +277,20 @@ export default function Step3Drafting({
     return '分论点';
   };
 
+  // 待确认草稿（服务端暂存的 pending）：右侧看板同步显示在对应槽位，
+  // 让看板随聊天推进即时更新，而不是等确认后才一次性出现。
+  const pendingByKey = (() => {
+    const map = new Map<string, string>();
+    const drafts = Array.isArray(activeSubpoint?.kickoffPendingDrafts)
+      ? activeSubpoint.kickoffPendingDrafts
+      : [];
+    for (const d of drafts) {
+      const t = String(d?.text || '').trim();
+      if (t) map.set(String(d?.key || ''), t);
+    }
+    return map;
+  })();
+
   const kickoffPrompt = activeSubpoint?.paragraphPlan
     ? `请基于右侧已展示的段落结构直接开始，对准第一个空槽（${findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)}）用中文苏格拉底式提问。如果「分论点」槽已预填（来自第二步已确认的主张），不要重复问它，直接跳过去问下一个空槽。不要重新规划结构，不要一次性确认所有步骤，不要输出 pendingText。只问一个问题。`
     : activeSubpoint?.content
@@ -640,13 +654,20 @@ export default function Step3Drafting({
                             )}
 
                             <div className="space-y-2.5 pl-0.5">
-                              {block.steps.map((step, idx, arr) => (
+                              {block.steps.map((step, idx, arr) => {
+                                const pendingText = step.value
+                                  ? ""
+                                  : pendingByKey.get(String(step.key || "")) ||
+                                    "";
+                                return (
                                 <div key={step.key} className="flex gap-2.5">
                                   <div className="flex flex-col items-center shrink-0 pt-0.5">
                                     <div
                                       className={`h-1.5 w-1.5 rounded-full ${
                                         step.value
                                           ? "bg-indigo-600"
+                                          : pendingText
+                                          ? "bg-amber-400"
                                           : "bg-slate-300"
                                       }`}
                                     />
@@ -658,18 +679,28 @@ export default function Step3Drafting({
                                     <span className="text-[10px] font-sans font-bold text-slate-400">
                                       {step.label}
                                     </span>
-                                    <p
-                                      className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
-                                        step.value
-                                          ? "text-slate-700"
-                                          : "text-slate-300"
-                                      }`}
-                                    >
-                                      {step.value || "待填写"}
-                                    </p>
+                                    {pendingText ? (
+                                      <p className="text-xs md:text-[12.5px] mt-0.5 leading-relaxed bg-amber-50/70 border border-amber-200/70 rounded-md px-2 py-1 text-slate-700">
+                                        <span className="text-amber-600 font-bold">
+                                          待确认：
+                                        </span>
+                                        {pendingText}
+                                      </p>
+                                    ) : (
+                                      <p
+                                        className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
+                                          step.value
+                                            ? "text-slate-700"
+                                            : "text-slate-300"
+                                        }`}
+                                      >
+                                        {step.value || "待填写"}
+                                      </p>
+                                    )}
                                   </div>
                                 </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
                         ),

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw } from 'lucide-react';
+import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
 
@@ -51,6 +51,18 @@ export default function CoachChat({
     stepKey === 'step3'
       ? activeStep3Subpoint?.chatHistory || []
       : session[stepKey]?.chatHistory || [];
+
+  // Step 3 确认按钮：服务端已暂存 pending（kickoffPendingDrafts）时，
+  // 在输入区上方给出「确认」按钮，替代“请回复对”的自然语言交互。
+  const pendingDrafts =
+    stepKey === 'step3'
+      ? Array.isArray(activeStep3Subpoint?.kickoffPendingDrafts)
+        ? activeStep3Subpoint.kickoffPendingDrafts.filter(
+            (d: any) => String(d?.text || '').trim().length >= 4,
+          )
+        : []
+      : [];
+  const hasPendingConfirm = pendingDrafts.length > 0 && !loading;
 
   useEffect(() => {
     if (stepKey !== 'step3') return;
@@ -786,6 +798,45 @@ export default function CoachChat({
 
         <div ref={messagesEndRef} />
       </div>
+
+      {/* Step 3 Confirm Strip — 服务端暂存了待确认句时显示按钮，替代“回复对” */}
+      {hasPendingConfirm && (
+        <div className="bg-amber-50/80 border-t border-amber-200 px-3 py-2 shrink-0">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider">
+              ✍️ 教练已整理，待你确认
+            </span>
+            <span className="text-[9px] text-amber-500">确认后写入右侧看板</span>
+          </div>
+          <div className="space-y-1.5 mb-2">
+            {pendingDrafts.map((d: any) => (
+              <div
+                key={String(d.key || '')}
+                className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5 text-xs text-slate-700"
+              >
+                <span className="font-bold text-amber-700">
+                  {d.label || '当前一环'}：
+                </span>
+                {d.text}
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={loading}
+              onClick={() => sendUserMessage('对')}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              确认无误，写入看板
+            </button>
+            <span className="text-[10px] text-slate-400">
+              需要调整？直接在下方输入框里写修改内容即可
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Dynamic Chat Input Bar at the Bottom */}
       <form
