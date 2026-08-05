@@ -7618,32 +7618,55 @@ async function startServer() {
       const input = collectPlannerInput(session, question, questionType);
 
       // --- 首选：真实 Planner LLM（材料驱动的结构推理） ---
+      // 解析/QA 失败时重试一次（LLM 输出有随机性，二次尝试常能成功）。
       let bodyPlans: any[] | null = null;
       let errorMessage = "";
       let degraded = false;
       let qaIssues: string[] = [];
+      const request = buildPlannerRequest(input);
+      const MAX_PLANNER_ATTEMPTS = 2;
 
-      try {
-        const request = buildPlannerRequest(input);
-        const response = await generateContentWithFallback(request);
-        const rawText =
-          response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        const parsed = parsePlannerResponse(rawText);
-        if (parsed && Array.isArray(parsed.bodyPlans)) {
-          const qa = runMechanicalQa(parsed.bodyPlans);
-          if (qa.pass) {
-            bodyPlans = parsed.bodyPlans;
+      for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS && !bodyPlans; attempt++) {
+        try {
+          const response = await generateContentWithFallback(request);
+          const rawText =
+            response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          const parsed = parsePlannerResponse(rawText);
+          if (parsed && Array.isArray(parsed.bodyPlans)) {
+            const qa = runMechanicalQa(parsed.bodyPlans);
+            if (qa.pass) {
+              bodyPlans = parsed.bodyPlans;
+            } else {
+              qaIssues = qa.issues
+                .filter((i) => i.severity === "fail")
+                .map((i) => i.reason);
+              errorMessage = `Planner QA 未通过：${qaIssues.join("；")}`;
+            }
           } else {
-            qaIssues = qa.issues
-              .filter((i) => i.severity === "fail")
-              .map((i) => i.reason);
-            errorMessage = `Planner QA 未通过：${qaIssues.join("；")}`;
+            // 诊断：记录解析失败原因与响应首尾，便于定位截断/格式问题
+            let parseHint = "";
+            try {
+              JSON.parse(rawText);
+              parseHint = "JSON 语法合法，但缺 bodyPlans 或非数组";
+            } catch (pe: any) {
+              parseHint = `JSON.parse: ${String(pe?.message || pe)}`;
+            }
+            const tail = rawText.slice(-600);
+            console.warn(
+              `[Planner] 解析失败。长度=${rawText.length}\n首200: ${rawText
+                .slice(0, 200)
+                .replace(/\n/g, "\\n")}\n尾600: ${tail.replace(/\n/g, "\\n")}\n${parseHint}`,
+            );
+            errorMessage = `Planner 响应无法解析为有效 bodyPlans（${parseHint}）`;
           }
-        } else {
-          errorMessage = "Planner 响应无法解析为有效 bodyPlans";
+        } catch (e: any) {
+          errorMessage = String(e?.message || "Planner LLM 调用失败");
         }
-      } catch (e: any) {
-        errorMessage = String(e?.message || "Planner LLM 调用失败");
+        if (!bodyPlans && attempt < MAX_PLANNER_ATTEMPTS) {
+          console.warn(
+            `[Planner] Attempt ${attempt} failed (${errorMessage}) — retrying once...`,
+          );
+        }
       }
 
       // --- 兜底：数据感知的保守结构（携带 Step 2 subClaim） ---

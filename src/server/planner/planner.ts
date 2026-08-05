@@ -29,7 +29,10 @@ export function buildPlannerRequest(input: PlannerInput) {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     config: {
       temperature: 0.3,
-      maxOutputTokens: 4096,
+      // 2–3 个 Body 的完整 paragraphPlan（中文 label/placeholder/subClaim +
+      // rationale + plannerIntermediate）很容易超过 4096 tokens；
+      // 输出被截断会导致 JSON 无法解析 → 提升到 8192 留足余量。
+      maxOutputTokens: 8192,
       responseMimeType: 'application/json',
     },
   };
@@ -62,23 +65,40 @@ export function collectPlannerInput(session: any, question: string, questionType
 }
 
 /**
- * 解析 Planner 的 LLM 响应
+ * 解析 Planner 的 LLM 响应。
+ * 依次尝试：直接 JSON.parse → jsonrepair（截断/尾逗号/缺引号）→
+ * 提取最外层 {...} 块后再 parse/repair（容忍前后多余文本）。
  */
 export function parsePlannerResponse(rawText: string): PlannerOutput | null {
-  try {
-    const parsed = JSON.parse(rawText);
-    if (!parsed.bodyPlans || !Array.isArray(parsed.bodyPlans)) {
-      return null;
+  const valid = (obj: any): obj is PlannerOutput =>
+    !!obj &&
+    Array.isArray(obj.bodyPlans) &&
+    obj.bodyPlans.length >= 2 &&
+    obj.bodyPlans.length <= 3;
+
+  const tryParse = (text: string): PlannerOutput | null => {
+    try {
+      const parsed = JSON.parse(text);
+      return valid(parsed) ? parsed : null;
+    } catch {
+      const repaired = parseAIResponse(text);
+      return valid(repaired) ? repaired : null;
     }
-    return parsed as PlannerOutput;
-  } catch {
-    // 尝试 jsonrepair
-    const repaired = parseAIResponse(rawText);
-    if (repaired?.bodyPlans && Array.isArray(repaired.bodyPlans)) {
-      return repaired as PlannerOutput;
-    }
-    return null;
+  };
+
+  const direct = tryParse(rawText);
+  if (direct) return direct;
+
+  // 容忍模型在 JSON 前后附加了说明文字：提取最外层 {...} 子串再尝试。
+  const firstBrace = rawText.indexOf('{');
+  const lastBrace = rawText.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const inner = rawText.slice(firstBrace, lastBrace + 1);
+    const extracted = tryParse(inner);
+    if (extracted) return extracted;
   }
+
+  return null;
 }
 
 /**
