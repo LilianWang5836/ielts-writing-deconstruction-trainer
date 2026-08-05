@@ -179,4 +179,36 @@ export function processPlannerOutput(rawText: string): {
   };
 }
 
+/**
+ * 规范化 Planner 产出的 bodyPlans（LLM 或 fallback 共用）：
+ *
+ * 1. 把 pointBlock.subClaim（Step 2 已确认的完整主张句）预填/确认为该块第一个
+ *    空「分论点」槽 → 修复 Step 3 重复问「分论点是什么」。
+ *    仅当 subClaim 是完整句（≥ 8 字）且首槽为空、首槽 label 属于主张类时生效。
+ * 2. 其余槽位保持空（等待 affirm 写入），符合「value 空直到 server commit」契约。
+ */
+export function normalizePlannerBodyPlans(bodyPlans: BodyPlan[]): BodyPlan[] {
+  const claimLabelRe = /分论点|核心观点|核心主张|主张|观点|claim/i;
+  for (const bp of bodyPlans) {
+    const plan = bp?.paragraphPlan;
+    if (!plan || !Array.isArray(plan?.pointBlocks)) continue;
+    for (const block of plan.pointBlocks) {
+      const subClaim = String(block?.subClaim || '').trim();
+      if (subClaim.length < 8) continue;
+      if (!Array.isArray(block?.steps) || block.steps.length === 0) continue;
+      const first = block.steps[0];
+      if (!first) continue;
+      const label = String(first.label || '').trim();
+      if (!claimLabelRe.test(label)) continue;
+      if (String(first.value || '').trim()) continue;
+      // 继承自 Step 2 的已确认主张 → 预填并标记 confirmed
+      first.value = subClaim;
+      first.status = 'confirmed';
+      // 额外标记：该槽来自 Step 2 继承，防被误当学生本轮新答
+      first.inheritedFromStep2 = true;
+    }
+  }
+  return bodyPlans;
+}
+
 export { buildFallbackBodyPlans };

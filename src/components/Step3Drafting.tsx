@@ -262,8 +262,23 @@ export default function Step3Drafting({
   const activeSubpoint = subpoints.find(
     (s) => s.id === session.step3.activeSubpointId,
   );
+
+  // Find the first EMPTY slot in the plan (prefilled/confirmed claim slots are skipped).
+  const findFirstEmptyStepLabel = (plan: any): string => {
+    if (!plan || !Array.isArray(plan.pointBlocks)) return '分论点';
+    for (const block of plan.pointBlocks) {
+      if (!Array.isArray(block?.steps)) continue;
+      for (const step of block.steps) {
+        if (!String(step?.value || '').trim()) {
+          return String(step?.label || '当前这一环').trim();
+        }
+      }
+    }
+    return '分论点';
+  };
+
   const kickoffPrompt = activeSubpoint?.paragraphPlan
-    ? `请基于右侧已展示的段落结构直接开始，对准第一个空槽（${activeSubpoint.paragraphPlan.pointBlocks?.[0]?.steps?.[0]?.label || '分论点'}）用中文苏格拉底式提问。不要重新规划结构，不要一次性确认所有步骤，不要输出 pendingText。只问一个问题。`
+    ? `请基于右侧已展示的段落结构直接开始，对准第一个空槽（${findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)}）用中文苏格拉底式提问。如果「分论点」槽已预填（来自第二步已确认的主张），不要重复问它，直接跳过去问下一个空槽。不要重新规划结构，不要一次性确认所有步骤，不要输出 pendingText。只问一个问题。`
     : activeSubpoint?.content
     ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。请先规划本段 paragraphPlan 骨架（分点/角色/步骤标签），所有 steps[].value 保持空。step3SlotEval 必须 mode=expand，对准 firstEmpty，用自然中文苏格拉底问题开问。第二步材料只作提问线索，禁止整理成待确认整链草稿，禁止 mode=confirm / pendingText，禁止让我一次性确认。结构细节写入系统即可，对话里不要提字段名。`
     : "";

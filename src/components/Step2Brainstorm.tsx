@@ -289,7 +289,7 @@ export default function Step2Brainstorm({
       const res = await fetch('/api/planner/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ session }),
       });
       const data = await res.json();
       if (plannerTimerRef.current) {

@@ -140,6 +140,8 @@ export interface LogicStep {
   value?: string;
   /** draft = written but still updatable; confirmed = argument-ready and frozen. */
   status?: "draft" | "confirmed";
+  /** True when the value was inherited from Step 2 (subClaim prefill), not a new student utterance. */
+  inheritedFromStep2?: boolean;
 }
 
 /**

@@ -23,6 +23,13 @@ import {
   promoteAcknowledgedFlatStep3Target,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
+import {
+  buildPlannerRequest,
+  collectPlannerInput,
+  parsePlannerResponse,
+  runMechanicalQa,
+  normalizePlannerBodyPlans,
+} from "./src/server/planner/planner";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
 import { log } from "./src/server/logger";
@@ -1968,6 +1975,9 @@ function clearAllStep3PlanValues(plan: any): void {
     if (!Array.isArray(block?.steps)) continue;
     for (const step of block.steps) {
       if (step && typeof step === "object") {
+        // Preserve values inherited & confirmed from Step 2 (subClaim prefill).
+        // Confirmed values are frozen and must not be wiped at kickoff.
+        if (isStep3Confirmed(step) && step.inheritedFromStep2) continue;
         step.value = "";
         step.status = "";
       }
@@ -2566,6 +2576,12 @@ function enforceConfirmedOnlySlots(plan: any, prevPlan: any): number {
         }
         confirmedByKey.delete(prevKey || key);
         restored += 1;
+      } else if (
+        isStep3Confirmed(step) &&
+        step.inheritedFromStep2 &&
+        isGenuineStep3StepValue(step)
+      ) {
+        // Already confirmed & inherited from Step 2 (subClaim prefill) — keep as-is.
       } else {
         step.value = "";
         step.status = "";
@@ -3079,7 +3095,22 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
       /对/.test(t) &&
       confirmed === 0) ||
     (chainLabels >= 3 && confirmed === 0);
-  if (dumpSignals) return "illegal_dump";
+
+  // Structure-discussion exemption (issue 1.3): the student asked about the chain
+  // shape (e.g. "一定要按分论点→机制→例证来写么"), and the model is legitimately
+  // offering ALTERNATIVE chain shapes and asking the student to choose. This is NOT
+  // a rubber-stamp dump — do not veto it to a canned firstEmpty ask.
+  const structureDiscussion =
+    !/待确认草稿|已确认）】|整理了以下论证|逻辑链草稿是否符合/.test(t) &&
+    /死板的公式|换一种|当然不是|换一个思路|可以不用|不一定|顺序不是固定的|看情况|根据内容|也可以先|也可以换成/.test(
+      t,
+    ) &&
+    /你更想|你更倾向|想尝试|选哪一种|选择哪一种|用哪一种|要不要|你看呢|你觉得呢|哪个更好/.test(
+      t,
+    ) &&
+    confirmed === 0;
+
+  if (dumpSignals && !structureDiscussion) return "illegal_dump";
 
   if (confirmed === 0 && step3TextClaimsPrematureProgress(t)) {
     return "illegal_dump";
@@ -7538,18 +7569,71 @@ async function startServer() {
   app.post("/api/planner/generate", async (req, res) => {
     try {
       const { session } = req.body;
-      const questionType = session?.step1?.coachEvaluation?.correctType || "Agree / Disagree";
-      const fallbackPlans = buildFallbackBodyPlans(questionType);
+      const question =
+        String(session?.topic?.question || "").trim() ||
+        String(req.body?.question || "").trim();
+      const questionType =
+        String(
+          session?.step1?.coachEvaluation?.correctType ||
+            session?.topic?.questionType ||
+            "",
+        ).trim() || "Agree / Disagree";
+
+      const input = collectPlannerInput(session, question, questionType);
+
+      // --- 首选：真实 Planner LLM（材料驱动的结构推理） ---
+      let bodyPlans: any[] | null = null;
+      let errorMessage = "";
+      let degraded = false;
+      let qaIssues: string[] = [];
+
+      try {
+        const request = buildPlannerRequest(input);
+        const response = await generateContentWithFallback(request);
+        const rawText =
+          response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const parsed = parsePlannerResponse(rawText);
+        if (parsed && Array.isArray(parsed.bodyPlans)) {
+          const qa = runMechanicalQa(parsed.bodyPlans);
+          if (qa.pass) {
+            bodyPlans = parsed.bodyPlans;
+          } else {
+            qaIssues = qa.issues
+              .filter((i) => i.severity === "fail")
+              .map((i) => i.reason);
+            errorMessage = `Planner QA 未通过：${qaIssues.join("；")}`;
+          }
+        } else {
+          errorMessage = "Planner 响应无法解析为有效 bodyPlans";
+        }
+      } catch (e: any) {
+        errorMessage = String(e?.message || "Planner LLM 调用失败");
+      }
+
+      // --- 兜底：数据感知的保守结构（携带 Step 2 subClaim） ---
+      if (!bodyPlans) {
+        degraded = true;
+        bodyPlans = buildFallbackBodyPlans(questionType, input);
+        console.warn(
+          `[Planner] Degraded to programmatic fallback. Reason: ${errorMessage || "unknown"}`,
+        );
+      }
+
+      // --- 规范化：subClaim 预填「分论点」槽（修复 Step3 重复询问） ---
+      bodyPlans = normalizePlannerBodyPlans(bodyPlans);
 
       res.json({
         status: "passed",
+        degraded,
+        errorMessage: degraded ? errorMessage || undefined : undefined,
         step2_5: {
           status: "passed",
           startedAt: Date.now(),
           updatedAt: Date.now(),
           attempt: 1,
           planSignature: `sig-${Date.now()}`,
-          bodyPlans: fallbackPlans,
+          bodyPlans,
+          qaDepth: degraded ? "mechanical" : "full",
         },
       });
     } catch (error: any) {
@@ -8474,6 +8558,7 @@ ${memoryDigestStr}
     - \`paragraphDensity: "single_point"\` → \`mode: "single_point"\`, exactly ONE pointBlock for the major mapped point.
     - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major: 2–3 steps; minor: 1–2 steps).
     - Set each pointBlock.\`subClaim\` from the mapped point text; set \`role\` from \`pointRoles\`.
+    - ALREADY-PREFILLED CLAIM SLOT (CRITICAL): when a pointBlock has a non-empty \`subClaim\` (a full claim sentence inherited from Step 2), the server has ALREADY pre-filled that pointBlock's first claim slot (「分论点」/「核心观点」) with the subClaim and marked it confirmed. Treat it as DONE: do NOT re-ask "你的分论点是什么", do NOT echo it back for confirmation, do NOT treat it as the firstEmpty. Start your Socratic ask from the first EMPTY slot (the slot cursor in ContextSummary is authoritative).
     - \`argumentRelation\` (or legacy \`stanceRelation\`) selects REQUIRED argument beats for this body. Cover those beats with open student-filled steps; do NOT force a fixed step count or fixed canned labels:
       - supports / elaborates: no mandatory beats. Choose 2–4 steps from the expansion strategies below that best fit the student's STEP 2 materials. NEVER default to a fixed "claim → reason → mechanism → example" template — different materials need different chains (e.g. a material strong on causal logic uses mechanism→impact; a material strong on concrete situations uses example→explanation).
       - concedes: must cover (1) acknowledge the opposite side exists (2) show why it does not overturn the overall thesis — step count flexible.
@@ -8538,7 +8623,12 @@ ${memoryDigestStr}
   - 'subClaim': the exact sub-claim being developed.
   - 'role': honor Step 2 \`pointRoles\` when present; otherwise 'major' for the point that deserves more detail, or 'minor' for a concise point.
   - 'expansionStrategy': the most natural strategy for THIS point ('explanation', 'example', 'mechanism', 'impact', 'contrast', or 'hybrid').
-  - 'steps': flexible count based on content + role + required argumentRelation beats (major often 2-3; minor often 1-2; concedes/compares/solves may need their required beats covered without forcing a canned 3-step template).
+  - SLOT-COUNT SPEC (CRITICAL — follow these budgets):
+    - Whole Body total (all pointBlocks + optional totalClaim): 4–7 slots.
+    - single_point (1 pointBlock): 4–5 slots. Do NOT stop at 3 — a single point needs a full reasoning chain (e.g. 分论点 → 展开原因 → 具体机制 → 典型场景, or 分论点 → 具体实例 → 危害后果 → 干预必要性). Include a claim slot even if it is pre-filled.
+    - multi-point (each pointBlock): 2–3 slots per pointBlock (major 3, minor 2), plus optional totalClaim.
+    - These are budgets, not rigid templates: pick the labels and order from the content (see the toolbox below), but respect the slot COUNT so each body is developed deeply enough.
+  - 'steps': flexible count based on content + role + required argumentRelation beats, within the SLOT-COUNT SPEC above (major often 3; minor often 2; single_point 4–5; concedes/compares/solves may need their required beats covered without forcing a canned 3-step template).
   - The flat logic-chain schemes are a per-point toolbox ONLY — pick by content fit, not by habit:
     1. **演绎型逻辑链 (Deductive)**: 核心观点 (Claim) -> 展开原因 (Reason) -> 支撑展开 (Support) -> 推导结果 (Impact)。适合直接立论、原理清晰的论点。
     2. **折中让步型 (Concession/Contrast)**: 核心观点 (Claim) -> 让步承认 (Concession) -> 转折反驳 (Rebuttal/Contrast) -> 总结收尾 (Concluding Clincher)。最适合讨论对立观点或进行有保留的支持。
@@ -8600,9 +8690,11 @@ ${memoryDigestStr}
 
   - OVERRIDE HANDLING (CRITICAL):
     - If the student explicitly requests a different structure/order/strategy after your recommendation (e.g., "两个点都展开", "先举例再讲原因", "换成问题-解决"), you MUST adopt that preference unless it would clearly break core constraints (especially severe word-budget overflow).
+    - STRUCTURE META-QUESTION (CRITICAL — issue 1.3): if the student questions the chain shape itself (e.g. "我一定要按照 分论点→机制→例证 这个逻辑来写么？"), treat it as a legitimate meta-question. Respond naturally: confirm no fixed formula, briefly offer 1–2 alternative chain shapes that fit THIS argument (concrete, tied to the material), and ask which they prefer. You MAY update \`paragraphPlan\` (labels/order) immediately once they choose. This is NOT a rubber-stamp dump and NOT "请先把分论点说具体一点" territory.
     - After adopting, you MUST immediately update 'progressUpdate.paragraphPlan' and the compatible flattened 'progressUpdate.step3SubpointSteps' to reflect the new structure.
     - In chat text, acknowledge the switch in one plain sentence, then continue guidance. Do NOT silently keep the old plan.
     - If you cannot fully satisfy the requested override due to constraints, explain the constraint briefly in plain Chinese and provide the closest feasible variant, then proceed.
+    - OFF-ASK BUT REASONABLE (issue 1.3): if the student's reply does not match the current slot's label but is a logically valid argument beat (e.g. asked for 分论点 but they give the 具体实例; or they say "分论点我已经给了" pointing to an established claim), DO NOT force a re-confirm of the same slot. Either (a) accept their point as the current slot's content via mode=confirm (reclassing the slot label once if needed), or (b) if they reference an already-established claim, recognize it is done and move to the next empty slot.
 
   - Reason vs. Support Crisp Boundary:
     - Reason is the underlying principle/why on a conceptual level (e.g., "在教室里，学生每天都能和同学面对面说话，所以更容易交上朋友").
