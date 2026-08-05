@@ -8987,7 +8987,9 @@ Student says:
       const response = await generateContentWithFallback({
         contents: prompt,
         config: {
-          maxOutputTokens: 8192,
+          // Step 3 输出含完整 paragraphPlan + step3SubpointSteps 投影，
+          // 多点结构下可能超 8K → 提升到 32K 消除截断（Gemini 上限 64K）。
+          maxOutputTokens: 32768,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -9561,7 +9563,8 @@ Student says:
         const retryResponse = await generateContentWithFallback({
           contents: `${prompt}${correctionSuffix}`,
           config: {
-            maxOutputTokens: 8192,
+            // 与主调用保持一致，避免修复轮次因输出截断再次失败。
+            maxOutputTokens: 32768,
             responseMimeType: "application/json",
           },
         });

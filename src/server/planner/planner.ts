@@ -30,9 +30,9 @@ export function buildPlannerRequest(input: PlannerInput) {
     config: {
       temperature: 0.3,
       // 2–3 个 Body 的完整 paragraphPlan（中文 label/placeholder/subClaim +
-      // rationale + plannerIntermediate）很容易超过 4096 tokens；
-      // 输出被截断会导致 JSON 无法解析 → 提升到 8192 留足余量。
-      maxOutputTokens: 8192,
+      // rationale + plannerIntermediate）较大；Gemini 输出上限为 64K，
+      // 取 32K 彻底消除截断风险（多余预算无副作用，模型生成完即停）。
+      maxOutputTokens: 32768,
       responseMimeType: 'application/json',
     },
   };
