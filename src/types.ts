@@ -152,8 +152,15 @@ export interface Step3SlotEval {
   activeKey: string;
   mode: "expand" | "confirm";
   qualified: boolean;
-  /** Required when mode=confirm — polished draft awaiting student affirm. */
+  /** Required when mode=confirm (single-slot) — polished draft awaiting student affirm. */
   pendingText?: string;
+  /**
+   * Optional multi-slot batch confirm: consecutive empty slots from firstEmpty
+   * covered by the student's current utterance. When length ≥ 2, server stages
+   * all of them; student「对」writes the whole batch. Single-slot may omit this
+   * and use pendingText only.
+   */
+  pendingDrafts?: { activeKey: string; pendingText: string }[];
   rejectReason?: string;
 }
 

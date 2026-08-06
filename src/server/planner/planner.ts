@@ -16,8 +16,11 @@ import type {
   BodyPlan,
 } from '../../types';
 import { buildPlannerPrompt } from '../prompts/planner-prompts';
+import { prefillClaimSlotsFromSubClaims } from '../../utils/step3ClaimPrefill';
 import { buildFallbackBodyPlans } from './planner-fallback';
 import { parseAIResponse } from './planner-utils';
+
+export { prefillClaimSlotsFromSubClaims } from '../../utils/step3ClaimPrefill';
 
 /**
  * 构建 Planner 的 LLM 请求参数
@@ -208,31 +211,8 @@ export function processPlannerOutput(rawText: string): {
  * 2. 其余槽位保持空（等待 affirm 写入），符合「value 空直到 server commit」契约。
  */
 export function normalizePlannerBodyPlans(bodyPlans: BodyPlan[]): BodyPlan[] {
-  const claimLabelRe = /分论点|核心观点|核心主张|主张|观点|claim/i;
   for (const bp of bodyPlans) {
-    const plan = bp?.paragraphPlan;
-    if (!plan || !Array.isArray(plan?.pointBlocks)) continue;
-    for (const block of plan.pointBlocks) {
-      const subClaim = String(block?.subClaim || '').trim();
-      if (subClaim.length < 8) continue;
-      if (!Array.isArray(block?.steps) || block.steps.length === 0) continue;
-      const first = block.steps[0];
-      if (!first) continue;
-      const label = String(first.label || '').trim();
-      if (!claimLabelRe.test(label)) continue;
-      if (String(first.value || '').trim()) continue;
-      // 继承自 Step 2 的已确认主张 → 预填并标记 confirmed
-      first.value = subClaim;
-      first.status = 'confirmed';
-      // 额外标记：该槽来自 Step 2 继承，防被误当学生本轮新答
-      first.inheritedFromStep2 = true;
-      // 防 placeholder-echo 误伤：若 placeholder 与 subClaim 相同/互相包含，
-      // 会被 isPlaceholderEchoValue 判为非真实值而清除。这里改成通用占位。
-      const ph = String(first.placeholder || '').trim();
-      if (ph && (ph === subClaim || subClaim.includes(ph) || ph.includes(subClaim))) {
-        first.placeholder = '用一句话写出本段核心主张（已从第二步预填）';
-      }
-    }
+    prefillClaimSlotsFromSubClaims(bp?.paragraphPlan);
   }
   return bodyPlans;
 }

@@ -1017,6 +1017,18 @@ mustContain(
   "step3 server: bare affirm with no pending is vetoed",
 );
 mustContain(
+  "function resolvePostAffirmNextSlotPending(",
+  "step3 server: post-affirm next-slot confirm resolver",
+);
+mustContain(
+  "function stagePostAffirmNextSlotConfirm(",
+  "step3 server: post-affirm next-slot confirm staging",
+);
+mustContain(
+  "Post-affirm staged next-slot confirm (declare or text-salvage)",
+  "step3 server: logs post-affirm next-slot staging",
+);
+mustContain(
   "function alignFirstEmptyExpandState(",
   "step3 server: alignFirstEmptyExpandState keeps legal model ask",
 );

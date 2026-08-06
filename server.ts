@@ -29,6 +29,7 @@ import {
   parsePlannerResponse,
   runMechanicalQa,
   normalizePlannerBodyPlans,
+  prefillClaimSlotsFromSubClaims,
 } from "./src/server/planner/planner";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
@@ -2891,29 +2892,251 @@ function hardRejectSlotText(
   return { ok: true, code: "" };
 }
 
+type Step3SlotEvalPendingDraft = {
+  activeKey: string;
+  pendingText: string;
+};
+
 type Step3SlotEvalPayload = {
   activeKey: string;
   mode: "expand" | "confirm";
   qualified: boolean;
   pendingText?: string;
+  /** ≥2 items → multi-slot batch confirm from firstEmpty consecutive empties. */
+  pendingDrafts?: Step3SlotEvalPendingDraft[];
   rejectReason?: string;
 };
 
 function normalizeStep3SlotEval(raw: any): Step3SlotEvalPayload | null {
   if (!raw || typeof raw !== "object") return null;
-  const activeKey = String(raw.activeKey || "").trim();
   const mode =
     raw.mode === "confirm" ? "confirm" : raw.mode === "expand" ? "expand" : "";
-  if (!activeKey || !mode) return null;
-  const pendingText = String(raw.pendingText || "").trim();
+  if (!mode) return null;
+
+  const pendingDrafts: Step3SlotEvalPendingDraft[] = Array.isArray(
+    raw.pendingDrafts,
+  )
+    ? raw.pendingDrafts
+        .map((d: any) => ({
+          activeKey: String(d?.activeKey || d?.key || "").trim(),
+          pendingText: String(d?.pendingText || d?.text || "").trim(),
+        }))
+        .filter(
+          (d: Step3SlotEvalPendingDraft) =>
+            !!d.activeKey && d.pendingText.length >= 4,
+        )
+    : [];
+
+  let activeKey = String(raw.activeKey || "").trim();
+  let pendingText = String(raw.pendingText || "").trim();
+  // Promote a lone pendingDrafts[0] into the single-slot fields.
+  if (pendingDrafts.length === 1) {
+    if (!activeKey) activeKey = pendingDrafts[0].activeKey;
+    if (!pendingText) pendingText = pendingDrafts[0].pendingText;
+  } else if (pendingDrafts.length >= 2) {
+    if (!activeKey) activeKey = pendingDrafts[0].activeKey;
+    if (!pendingText) pendingText = pendingDrafts[0].pendingText;
+  }
+  if (!activeKey) return null;
+
   const rejectReason = String(raw.rejectReason || "").trim();
   return {
     activeKey,
     mode,
     qualified: !!raw.qualified,
     pendingText: pendingText || undefined,
+    pendingDrafts: pendingDrafts.length >= 2 ? pendingDrafts : undefined,
     rejectReason: rejectReason || undefined,
   };
+}
+
+/** Unconfirmed steps in board order (same walk as findFirstEmptyPlanStep). */
+function listUnconfirmedPlanSteps(plan: any): Array<{
+  key: string;
+  label: string;
+  blockIndex: number;
+  stepIndex: number;
+}> {
+  const out: Array<{
+    key: string;
+    label: string;
+    blockIndex: number;
+    stepIndex: number;
+  }> = [];
+  if (!plan || !Array.isArray(plan.pointBlocks)) return out;
+  for (let bi = 0; bi < plan.pointBlocks.length; bi++) {
+    const block = plan.pointBlocks[bi];
+    const steps = Array.isArray(block?.steps) ? block.steps : [];
+    const blockLabel = String(block?.label || `分点${bi + 1}`);
+    for (let si = 0; si < steps.length; si++) {
+      if (isStep3Confirmed(steps[si])) continue;
+      const key = String(steps[si]?.key || "").trim();
+      if (!key) continue;
+      const rawLabel = String(steps[si]?.label || "展开");
+      out.push({
+        key,
+        label: stripStep3BlockLabelPrefix(blockLabel, rawLabel),
+        blockIndex: bi,
+        stepIndex: si,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve multi-slot batch confirm: drafts must cover the first N consecutive
+ * unconfirmed steps in the same pointBlock (starting at firstEmpty).
+ */
+function resolveBatchConfirmPending(
+  plan: any,
+  drafts: Step3SlotEvalPendingDraft[],
+): { ok: true; pending: KickoffPendingDraft[] } | { ok: false; code: string } {
+  if (!Array.isArray(drafts) || drafts.length < 2) {
+    return { ok: false, code: "batch_too_short" };
+  }
+  // Cap runaway model batches.
+  if (drafts.length > 5) {
+    return { ok: false, code: "batch_too_long" };
+  }
+  const empties = listUnconfirmedPlanSteps(plan);
+  if (empties.length < drafts.length) {
+    return { ok: false, code: "batch_exceeds_empty" };
+  }
+  const blockIndex = empties[0].blockIndex;
+  const pending: KickoffPendingDraft[] = [];
+  for (let i = 0; i < drafts.length; i++) {
+    const slot = empties[i];
+    const draft = drafts[i];
+    if (!slot || slot.key !== draft.activeKey) {
+      return { ok: false, code: "batch_not_prefix_of_empty" };
+    }
+    if (slot.blockIndex !== blockIndex) {
+      return { ok: false, code: "batch_cross_block" };
+    }
+    const hard = hardRejectSlotText(
+      draft.pendingText,
+      plan,
+      slot.key,
+      slot.blockIndex,
+    );
+    if (!hard.ok) {
+      return { ok: false, code: hard.code || "batch_hard_reject" };
+    }
+    pending.push({
+      key: slot.key,
+      label: slot.label,
+      text: draft.pendingText,
+      blockIndex: slot.blockIndex,
+      stepIndex: slot.stepIndex,
+    });
+  }
+  return { ok: true, pending };
+}
+
+function normalizeConfirmLabel(s: string): string {
+  return String(s || "")
+    .replace(/\*\*/g, "")
+    .replace(/[【】\[\]（）()\s]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function labelsRoughMatch(a: string, b: string): boolean {
+  const na = normalizeConfirmLabel(a);
+  const nb = normalizeConfirmLabel(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 2 && nb.length >= 2 && (na.includes(nb) || nb.includes(na))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Pull numbered labeled confirm lines from coach text, e.g.
+ * `1. **【赋能机制】**：……\n2. **【典型场景】**：……`
+ */
+function extractNumberedLabeledConfirmItems(
+  text: string,
+): Array<{ label: string; text: string }> {
+  const t = String(text || "");
+  const items: Array<{ label: string; text: string }> = [];
+  const re =
+    /(?:^|\n)\s*\d+\s*[\.、．)]\s*(?:\*\*)?\s*【?\s*([^*\n：:】]{1,24}?)\s*】?\s*(?:\*\*)?\s*[：:]\s*([^\n]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) !== null) {
+    const label = String(m[1] || "")
+      .replace(/\*\*/g, "")
+      .trim();
+    const body = String(m[2] || "")
+      .replace(/\*\*/g, "")
+      .replace(/^[「"“]+|[」"”]+$/g, "")
+      .trim();
+    if (label.length >= 2 && body.length >= 8) {
+      items.push({ label, text: body });
+    }
+  }
+  return items;
+}
+
+/**
+ * When chat lists ≥2 consecutive same-block slots and asks for one「对」,
+ * but step3SlotEval only declared a single pendingText — rebuild pendingDrafts
+ * from the numbered list so one affirm writes the whole batch.
+ */
+function salvageBatchDraftsFromConfirmText(
+  text: string,
+  plan: any,
+  slotEval: Step3SlotEvalPayload,
+): Step3SlotEvalPendingDraft[] | null {
+  if (!coachTextAsksSlotConfirm(text)) return null;
+  const items = extractNumberedLabeledConfirmItems(text);
+  if (items.length < 2) return null;
+
+  const empties = listUnconfirmedPlanSteps(plan);
+  if (empties.length < 2) return null;
+  const blockIndex = empties[0].blockIndex;
+  const sameBlock = empties.filter((e) => e.blockIndex === blockIndex);
+  if (sameBlock.length < 2) return null;
+
+  const usedItem = new Set<number>();
+  const matched: Step3SlotEvalPendingDraft[] = [];
+  for (let si = 0; si < sameBlock.length && matched.length < 5; si++) {
+    const slot = sameBlock[si];
+    let hitIdx = -1;
+    for (let ii = 0; ii < items.length; ii++) {
+      if (usedItem.has(ii)) continue;
+      if (labelsRoughMatch(items[ii].label, slot.label)) {
+        hitIdx = ii;
+        break;
+      }
+    }
+    // First empty may use model's pendingText even if label wording drifts.
+    if (
+      hitIdx < 0 &&
+      si === 0 &&
+      slotEval.pendingText &&
+      String(slotEval.pendingText).trim().length >= 4 &&
+      (!slotEval.activeKey || slotEval.activeKey === slot.key)
+    ) {
+      hitIdx = 0;
+    }
+    if (hitIdx < 0) break; // must stay a contiguous prefix from firstEmpty
+    usedItem.add(hitIdx);
+    const fromModel =
+      si === 0 &&
+      slotEval.pendingText &&
+      String(slotEval.pendingText).trim().length >= 4
+        ? String(slotEval.pendingText).trim()
+        : items[hitIdx].text;
+    matched.push({ activeKey: slot.key, pendingText: fromModel });
+  }
+
+  if (matched.length < 2) return null;
+  // Must cover firstEmpty key.
+  if (matched[0].activeKey !== sameBlock[0].key) return null;
+  return matched;
 }
 
 /** Only when text is empty / missing --- ; never long Socratic templates. */
@@ -3428,6 +3651,155 @@ function enforceStep3TextBoardConsistency(
   }
   const reject = preferRejectCode || illegal;
   vetoStep3TextToFirstEmptyAsk(data, plan, reject);
+  return true;
+}
+
+/** True when coach text is asking the student to affirm an organized sentence. */
+function coachTextAsksSlotConfirm(text: string): boolean {
+  const t = String(text || "");
+  return (
+    /请回复|请确认|合适吗|符合你的意思|这样整理|整理合适/.test(t) &&
+    /对|是的|没问题/.test(t)
+  );
+}
+
+/**
+ * Pull a ready-made confirm sentence from post-affirm coach text
+ * (e.g. **「例如，一个后端工程师…」** before 请回复「对」).
+ */
+function extractPostAffirmConfirmSentence(text: string): string {
+  const t = String(text || "");
+  if (!coachTextAsksSlotConfirm(t)) return "";
+  // Support ASCII / CJK corner / curly quotes around the organized sentence.
+  const patterns = [
+    /\*\*[「"“]([^」"”]{8,200})[」"”]\*\*/g,
+    /[「"“]([^」"”]{8,200})[」"”]/g,
+    /\*\*([^*「」\n]{8,200})\*\*/g,
+  ];
+  let last = "";
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(t)) !== null) {
+      const s = String(m[1] || "")
+        .replace(/\*\*/g, "")
+        .replace(/^[「"“]+|[」"”]+$/g, "")
+        .trim();
+      if (!s || /^(对|是的|没问题|合适吗)$/.test(s)) continue;
+      // Skip short meta fragments.
+      if (/具体机制|已经确认|太棒了/.test(s) && s.length < 20) continue;
+      last = s;
+    }
+  }
+  return last;
+}
+
+/**
+ * After affirming slot N, the model often organizes slot N+1 in the SAME turn
+ * (chat asks「请回复对」) but forgets mode=confirm+pendingText — or declares
+ * confirm while detectStep3IllegalCoachText would still veto the text
+ * (e.g. cross-block preview). Resolve a pending draft for firstEmpty when
+ * possible so the student's next「对」can commit.
+ */
+function resolvePostAffirmNextSlotPending(
+  plan: any,
+  slotEval: Step3SlotEvalPayload | null | undefined,
+  coachText: string,
+): KickoffPendingDraft | null {
+  const empty = findFirstEmptyPlanStep(plan);
+  if (!empty) return null;
+  const emptyStep =
+    plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+  if (!emptyStep || isStep3Confirmed(emptyStep)) return null;
+  const emptyKey = String(
+    emptyStep?.key || `${empty.blockIndex}:${empty.stepIndex}`,
+  );
+  const emptyLabel =
+    String(empty.cleanStepLabel || emptyStep?.label || "").trim() ||
+    "当前这一环";
+
+  const asksConfirm = coachTextAsksSlotConfirm(coachText);
+  const pendingText = String(slotEval?.pendingText || "").trim();
+  const activeKey = String(slotEval?.activeKey || "").trim();
+  const modeConfirm = slotEval?.mode === "confirm";
+
+  // Need a confirm signal: declared confirm, or text-level「请回复对」salvage.
+  if (!modeConfirm && !asksConfirm && pendingText.length < 4) return null;
+
+  let stageKey = emptyKey;
+  let stageLabel = emptyLabel;
+  let stageBlock = empty.blockIndex;
+  let stageStep = empty.stepIndex;
+  let candidate = "";
+
+  if (pendingText.length >= 4) {
+    const loc = activeKey ? findStepLocationByKey(plan, activeKey) : null;
+    if (loc && !isStep3Confirmed(loc.step)) {
+      stageKey = String(loc.step?.key || activeKey);
+      stageLabel = String(loc.label || "").trim() || emptyLabel;
+      stageBlock = loc.blockIndex;
+      stageStep = loc.stepIndex;
+      candidate = pendingText;
+    } else if (modeConfirm || asksConfirm) {
+      // Bind onto firstEmpty when activeKey is missing / already confirmed.
+      candidate = pendingText;
+    }
+  }
+
+  if (!candidate && asksConfirm) {
+    const extracted = extractPostAffirmConfirmSentence(coachText);
+    if (extracted.length >= 8) candidate = extracted;
+  }
+
+  if (candidate.length < 4) return null;
+
+  const hard = hardRejectSlotText(candidate, plan, stageKey, stageBlock);
+  if (!hard.ok) return null;
+
+  return {
+    key: stageKey,
+    label: stageLabel,
+    text: candidate,
+    blockIndex: stageBlock,
+    stepIndex: stageStep,
+  };
+}
+
+/**
+ * Stage post-affirm next-slot confirm; keep model text; set step3SlotEval confirm.
+ * Returns true when pending was staged.
+ */
+function stagePostAffirmNextSlotConfirm(
+  data: any,
+  plan: any,
+  slotEval: Step3SlotEvalPayload | null | undefined,
+  syncPending: (pending: KickoffPendingDraft[]) => void,
+  clearReject: () => void,
+): boolean {
+  const draft = resolvePostAffirmNextSlotPending(
+    plan,
+    slotEval,
+    String(data?.text || ""),
+  );
+  if (!draft) return false;
+  syncPending([draft]);
+  clearReject();
+  if (data.progressUpdate) {
+    data.progressUpdate.step3SlotEval = {
+      activeKey: draft.key,
+      mode: "confirm",
+      qualified: true,
+      pendingText: draft.text,
+    };
+    data.step3SlotEval = data.progressUpdate.step3SlotEval;
+  }
+  // Keep the model's confirm ask in chat (do not veto to short firstEmpty).
+  if (typeof data.text === "string") {
+    data.text = stripStep3EnglishTranslationShow(
+      stripStep3MetaProcessPhrases(data.text),
+    );
+  }
+  ensureMinimalStep3Text(data);
   return true;
 }
 
@@ -5703,8 +6075,9 @@ function enforceStep3LogicCompletion(
 /**
  * Step 3 confirm-then-write state machine (LLM ask+eval / server write+flow):
  * 1) Freeze confirmed slots; clear all unconfirmed (ignore model prefill).
- * 2) Pending ONLY from validated step3SlotEval.pendingText after a substantive
- *    student utterance (kickoff never stages confirm — no LLM-complete-then-confirm).
+ * 2) Pending from validated step3SlotEval.pendingText (1 slot) or pendingDrafts
+ *    (≥2 consecutive same-block) after a substantive student utterance
+ *    (kickoff never stages confirm — no LLM-complete-then-confirm).
  * 3) Affirm → commitPendingOnAffirm; keep model next ask unless illegal.
  * 4) Board is truth: illegal dump / fake-complete text is fully vetoed to a short
  *    firstEmpty ask (safety net — not the primary coach voice).
@@ -5821,6 +6194,14 @@ function enforceStep3LogicCompletionInner(
       sanitizeParagraphPlanValues(plan);
       clearAllStep3PlanValues(plan);
       enforceConfirmedOnlySlots(plan, null);
+      // Coach-emitted skeletons often keep subClaim but leave claim steps empty.
+      // Re-sync so the board matches chat (which already skips the claim beat).
+      const claimFilled = prefillClaimSlotsFromSubClaims(plan);
+      if (claimFilled > 0) {
+        console.warn(
+          `[Step3Guard] Kickoff synced ${claimFilled} claim slot(s) from subClaim.`,
+        );
+      }
       syncPlanProgressFields(data, plan, []);
       const rawKickoffText = String(data.text || "");
       const forceSalvage = slotEval?.mode === "confirm";
@@ -5864,6 +6245,15 @@ function enforceStep3LogicCompletionInner(
 
   // Confirmed-only board (model cannot prefill unconfirmed slots).
   enforceConfirmedOnlySlots(plan, prevPlan);
+  // Keep claim slots in sync with subClaim after model plan churn / wipe.
+  {
+    const claimFilled = prefillClaimSlotsFromSubClaims(plan);
+    if (claimFilled > 0) {
+      console.warn(
+        `[Step3Guard] Synced ${claimFilled} claim slot(s) from subClaim.`,
+      );
+    }
+  }
   // Protect confirm activeKey so one-shot reclass can still see the new empty target.
   pruneUnauthorizedEmptySteps(
     plan,
@@ -5916,6 +6306,20 @@ function enforceStep3LogicCompletionInner(
               "[Step3Guard] Affirm with no pending but model declared confirm — committed directly.",
             );
             if (finishBodyIfComplete()) return;
+            if (
+              stagePostAffirmNextSlotConfirm(
+                data,
+                plan,
+                slotEval,
+                (next) => syncPlanProgressFields(data, plan, next),
+                () => setReject(""),
+              )
+            ) {
+              console.warn(
+                "[Step3Guard] Post-direct-commit — staged next-slot confirm (salvage).",
+              );
+              return;
+            }
             const vetoed = enforceStep3TextBoardConsistency(
               data,
               plan,
@@ -5982,43 +6386,27 @@ function enforceStep3LogicCompletionInner(
     );
     if (finishBodyIfComplete()) return;
 
-    // Protocol-hole fix: the model may, in the SAME affirm turn, also organize the
-    // NEXT slot's sentence and ask the student to confirm it ("我将它提炼为一句
-    // 话：... 请回复对"). If it declared mode=confirm + pendingText for an empty
-    // slot, STAGE it here. Otherwise the sentence lives only in text, never gets
-    // staged, and the student's next「对」hits the "affirm with no pending" veto
-    // (observed deadlock: 运作过程 confirmed OK → 具体实例 confirm lost → stuck).
+    // Protocol-hole fix (extended): same-turn next-slot confirm.
+    // Prefer declared mode=confirm+pendingText; also salvage when the model only
+    // puts the organized sentence +「请回复对」in text (common flash omission).
+    // Staging MUST happen before illegal-text veto — otherwise cross-block
+    // previews (e.g. mentioning 催生新型岗位) wipe a valid 典型场景 confirm ask.
     if (
-      slotEval?.mode === "confirm" &&
-      slotEval.qualified &&
-      String(slotEval.pendingText || "").trim().length >= 4
+      stagePostAffirmNextSlotConfirm(
+        data,
+        plan,
+        slotEval,
+        (next) => {
+          pending = next;
+          syncPlanProgressFields(data, plan, next);
+        },
+        () => setReject(""),
+      )
     ) {
-      const loc = findStepLocationByKey(plan, slotEval.activeKey);
-      if (loc && !isStep3Confirmed(loc.step)) {
-        const hard = hardRejectSlotText(
-          slotEval.pendingText,
-          plan,
-          slotEval.activeKey,
-          loc.blockIndex,
-        );
-        if (hard.ok) {
-          pending = [
-            {
-              key: slotEval.activeKey,
-              label: loc.label,
-              text: slotEval.pendingText,
-              blockIndex: loc.blockIndex,
-              stepIndex: loc.stepIndex,
-            },
-          ];
-          syncPlanProgressFields(data, plan, pending);
-          setReject("");
-          console.warn(
-            "[Step3Guard] Post-affirm staged next-slot confirm from model step3SlotEval (confirm-then-write).",
-          );
-          return;
-        }
-      }
+      console.warn(
+        "[Step3Guard] Post-affirm staged next-slot confirm (declare or text-salvage).",
+      );
+      return;
     }
 
     // Affirm done — keep model next ask unless it dumps/fakes complete.
@@ -6039,6 +6427,7 @@ function enforceStep3LogicCompletionInner(
   if (pending.length > 0 && isStep3RejectMessage(userMessage)) {
     pending = [];
     enforceConfirmedOnlySlots(plan, prevPlan);
+    prefillClaimSlotsFromSubClaims(plan);
     syncPlanProgressFields(data, plan, []);
     setReject("");
     ensureMinimalStep3Text(data);
@@ -6050,11 +6439,19 @@ function enforceStep3LogicCompletionInner(
 
   // --- Apply step3SlotEval → pending (unique staging source) ---
   // Confirm only after a substantive student utterance (not Step2-only polish, not bare「对」).
-  if (
+  // Supports single pendingText OR multi-slot pendingDrafts (≥2, consecutive same-block).
+  const batchDrafts =
     slotEval?.mode === "confirm" &&
     slotEval.qualified &&
-    slotEval.pendingText
-  ) {
+    Array.isArray(slotEval.pendingDrafts) &&
+    slotEval.pendingDrafts.length >= 2
+      ? slotEval.pendingDrafts
+      : null;
+  const hasConfirmPayload =
+    !!batchDrafts ||
+    !!(slotEval?.mode === "confirm" && slotEval.qualified && slotEval.pendingText);
+
+  if (hasConfirmPayload && slotEval) {
     if (!isSubstantiveStep3Answer(userMessage)) {
       pending = [];
       syncPlanProgressFields(data, plan, []);
@@ -6069,6 +6466,82 @@ function enforceStep3LogicCompletionInner(
       );
       return;
     }
+
+    // --- Multi-slot batch confirm (declared pendingDrafts OR text salvage) ---
+    // Model often lists 1…N labeled sentences + asks one「对」, but only declares
+    // a single pendingText — promote that numbered list into a real batch.
+    let effectiveBatch = batchDrafts;
+    let batchFromTextSalvage = false;
+    if (!effectiveBatch && slotEval.pendingText) {
+      const salvaged = salvageBatchDraftsFromConfirmText(
+        String(data.text || ""),
+        plan,
+        slotEval,
+      );
+      if (salvaged && salvaged.length >= 2) {
+        effectiveBatch = salvaged;
+        batchFromTextSalvage = true;
+      }
+    }
+    if (effectiveBatch) {
+      const resolved = resolveBatchConfirmPending(plan, effectiveBatch);
+      if (!("pending" in resolved)) {
+        // Declared batch failed hard — fall through to single-slot if possible.
+        // Text-salvage failure should not block the original single pendingText.
+        if (!batchFromTextSalvage) {
+          const rejectCode = resolved.code;
+          pending = [];
+          syncPlanProgressFields(data, plan, []);
+          setReject(rejectCode);
+          vetoStep3TextToFirstEmptyAsk(data, plan, rejectCode);
+          console.warn(
+            `[Step3Guard] Batch confirm refused (${rejectCode}) — vetoed to firstEmpty ask.`,
+          );
+          return;
+        }
+        console.warn(
+          `[Step3Guard] Text-salvage batch refused (${resolved.code}) — falling back to single-slot confirm.`,
+        );
+      } else {
+        pending = resolved.pending;
+        slotEval.activeKey = pending[0].key;
+        slotEval.pendingText = pending[0].text;
+        slotEval.pendingDrafts = effectiveBatch;
+        if (data.progressUpdate) {
+          data.progressUpdate.step3SlotEval = {
+            ...slotEval,
+            activeKey: pending[0].key,
+            pendingText: pending[0].text,
+            pendingDrafts: effectiveBatch,
+          };
+          data.step3SlotEval = data.progressUpdate.step3SlotEval;
+        }
+        setReject("");
+        syncPlanProgressFields(data, plan, pending);
+        if (detectStep3IllegalCoachText(String(data.text || ""), plan)) {
+          rewriteStep3AskText(
+            data,
+            buildContinuousConfirmAsk(pending),
+            "我根据你刚说的整理了这几环。",
+            { forceNeutralPart1: true },
+          );
+          console.warn(
+            batchFromTextSalvage
+              ? `[Step3Guard] Salvaged batch pending (${pending.length}) from confirm text — replaced dump/fake text.`
+              : `[Step3Guard] Staged batch pending (${pending.length}) — replaced dump/fake text with multi-slot confirm ask.`,
+          );
+        } else {
+          console.warn(
+            batchFromTextSalvage
+              ? `[Step3Guard] Salvaged batch pending (${pending.length}) from confirm text (model omitted pendingDrafts).`
+              : `[Step3Guard] Staged batch pending (${pending.length} slots) from step3SlotEval.pendingDrafts.`,
+          );
+        }
+        return;
+      }
+    }
+
+    // --- Single-slot confirm (existing path) ---
     const empty = findFirstEmptyPlanStep(plan);
     const loc = findStepLocationByKey(plan, slotEval.activeKey);
     if (!loc) {
@@ -6131,7 +6604,7 @@ function enforceStep3LogicCompletionInner(
       }
       {
         const hard = hardRejectSlotText(
-          slotEval.pendingText,
+          slotEval.pendingText!,
           plan,
           stageKey,
           stageLoc.blockIndex,
@@ -6150,7 +6623,7 @@ function enforceStep3LogicCompletionInner(
           {
             key: stageKey,
             label: stageLoc.label,
-            text: slotEval.pendingText,
+            text: slotEval.pendingText!,
             blockIndex: stageLoc.blockIndex,
             stepIndex: stageLoc.stepIndex,
           },
@@ -9063,8 +9536,9 @@ ${memoryDigestStr}
     - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
       - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
       - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句并请学生回「对」或修改。SERVER 在 affirm 后才写入 confirmed。
+      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 里列出 1…N 句并请一次回复「对」。FORBIDDEN: 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
-     - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，应分别用后续轮次的 step3SlotEval 处理，不要合并。合并时：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
+     - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
      - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
      - 已经 \`status: "confirmed"\` 的 step 永远不可被合并、删除或吞并。
      - 同时更新扁平 \`step3SubpointSteps\`（结构投影；values 保持空直到 server commit），让它严格成为 paragraphPlan 的兼容投影。
@@ -9096,17 +9570,17 @@ ${memoryDigestStr}
 
   DECIDING COMPLETION:
   - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段保留下来的所有 slot 均为 \`status: "confirmed"\`，且左侧教练已确认本段所需的原因/机制/影响等要素足够完整、充实时，才可设为 true；只要还有空步骤、draft 步骤或关键推导缺口就必须保持 false。右侧 paragraphPlan 只同步这项对话判断。
-  - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` and MUST NOT set \`status: "confirmed"\`. Slot writing is SERVER-ONLY after student affirm. Emit quality judgment ONLY via top-level \`step3SlotEval\` { activeKey, mode: "expand"|"confirm", qualified, pendingText?, rejectReason? }. When mode=confirm, pendingText is required and MUST paraphrase the student's own Step 3 utterance for this beat (not a Step 2 rewrite). When mode=expand, ask a beat-specific Socratic question in \`text\` Part 2 — do NOT present a full ready-made sentence for them to rubber-stamp.
+  - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` and MUST NOT set \`status: "confirmed"\`. Slot writing is SERVER-ONLY after student affirm. Emit quality judgment ONLY via top-level \`step3SlotEval\` { activeKey, mode: "expand"|"confirm", qualified, pendingText?, pendingDrafts?, rejectReason? }. When mode=confirm: single-slot needs pendingText; multi-slot (≥2 consecutive same-block empties covered by THIS utterance) use pendingDrafts. pendingText/pendingDrafts MUST paraphrase the student's own Step 3 words (not a Step 2 rewrite). When mode=expand, ask a beat-specific Socratic question in \`text\` Part 2 — do NOT present a full ready-made sentence for them to rubber-stamp.
   - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
   - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` must stay empty until the server commits after affirm. You may propose polished wording ONLY in \`step3SlotEval.pendingText\` after the student has spoken this beat — never as an unconfirmed board value, and never as a Step-2-only completion.
   - CRITICAL — KICKOFF / FIRST PLANNING TURN (same step3SlotEval contract): On the opening turn, emit the paragraphPlan skeleton with ALL \`steps[].value\` empty. ALWAYS mode=expand for the firstEmpty beat. YOU own the student-facing Socratic ask in \`text\` (natural Chinese coach voice — do NOT use stiff templates like「请用一句话自己写出…不会替你先写好」). Use Step 2 only as a light hint inside the question. FORBIDDEN on kickoff: mode=confirm / pendingText / listing polished reason+example+impact bullets OR narrative lines like「原因：…」「场景：…」「影响：…」for the student to affirm / say「没问题」. You may briefly name the planned chain shape in abstract (e.g. 原因→场景→影响) WITHOUT writing out full sentences for each beat. Do NOT write into \`steps[].value\` yourself. The SERVER never templates your ask — it only aligns state / writes on affirm.
   - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.
   - CRITICAL — STUCK / 「不知道」: If the student cannot answer, give at most ONE short clue from Step 2 or a narrower follow-up question. FORBIDDEN: writing a complete ready-made sentence and asking them to rubber-stamp it (「用这句话…合适吗」).
-  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise THIS sentence (「对」或修改). Do not stack a long next-slot lecture in the same turn; after they affirm, your NEXT reply asks the next empty beat naturally.
-  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages a confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, activeKey, pendingText}\`. If you write an organized sentence in \`text\` and ask the student to「回复对」but do NOT declare mode=confirm with that pendingText, the sentence is never staged and the student's next「对」will be rejected as "no pending" — a deadlock. Therefore:
+  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise the pending sentence(s) (「对」或修改). For pendingDrafts, list all items once. Do not lecture about slots outside the batch; after they affirm, your NEXT reply asks the next empty beat with mode=expand.
+  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, ...}\` with either \`pendingText\` (one slot) or \`pendingDrafts\` (≥2). If you write organized sentences in \`text\` and ask「回复对」but do NOT declare confirm + pendingText/pendingDrafts, the next「对」deadlocks. Therefore:
     1. When mode=expand, NEVER present a ready-made sentence and ask the student to confirm it in text; ask a Socratic question instead.
-    2. After a student affirms (a mode=confirm turn), your next turn should normally ask the NEXT empty slot with mode=expand. Do NOT, in the SAME affirm turn, also organize the next slot's sentence — that second confirm would be lost.
-    3. The ONLY case you may present a confirm sentence in text is when you ALSO declare \`mode:"confirm"\` + \`pendingText\` for that exact \`activeKey\` in this same response.
+    2. After a student affirms, your next turn asks the NEXT empty slot with mode=expand (batch already wrote everything that utterance covered).
+    3. The ONLY case you may present confirm sentence(s) in text is when you ALSO declare \`mode:"confirm"\` with \`pendingText\` and/or \`pendingDrafts\` in this same response.
   - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
   - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
   - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
@@ -9255,12 +9729,12 @@ Student says:
               step3SlotEval: {
                 type: Type.OBJECT,
                 description:
-                  "Step 3 ONLY. LLM-owned quality judgment for the current firstEmpty slot. mode=confirm ONLY after the student uttered this beat in Step 3 (pendingText paraphrases THEIR words). Kickoff / Step2-only polish must use mode=expand. Server stages pending only after hard-reject + substantive-utterance checks; model must NOT write unconfirmed steps[].value.",
+                  "Step 3 ONLY. LLM-owned quality judgment. mode=confirm ONLY after the student uttered the beat(s) in Step 3. Use pendingText for one slot, or pendingDrafts (≥2) when one utterance covers consecutive same-block empties from firstEmpty. Kickoff / Step2-only polish must use mode=expand. Server stages pending after hard-reject + substantive-utterance checks; model must NOT write unconfirmed steps[].value.",
                 properties: {
                   activeKey: {
                     type: Type.STRING,
                     description:
-                      "Key of the current firstEmpty step (must match ContextSummary).",
+                      "Key of the current firstEmpty step (must match ContextSummary). For batch confirm, use the first draft's key.",
                   },
                   mode: {
                     type: Type.STRING,
@@ -9271,12 +9745,25 @@ Student says:
                   qualified: {
                     type: Type.BOOLEAN,
                     description:
-                      "True when mode=confirm and pendingText is argument-ready from the student's words.",
+                      "True when mode=confirm and pendingText/pendingDrafts are argument-ready from the student's words.",
                   },
                   pendingText: {
                     type: Type.STRING,
                     description:
-                      "Required when mode=confirm: one-sentence paraphrase of the student's Step 3 utterance for this beat (not a Step 2 rewrite).",
+                      "Single-slot confirm: one-sentence paraphrase of the student's Step 3 utterance for this beat (not a Step 2 rewrite). For batch, may repeat the first pendingDrafts item.",
+                  },
+                  pendingDrafts: {
+                    type: Type.ARRAY,
+                    description:
+                      "Optional multi-slot batch confirm (≥2). Each item covers one consecutive empty step from firstEmpty in the SAME pointBlock; pendingText paraphrases what the student said for that beat. Omit for single-slot confirm.",
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        activeKey: { type: Type.STRING },
+                        pendingText: { type: Type.STRING },
+                      },
+                      required: ["activeKey", "pendingText"],
+                    },
                   },
                   rejectReason: {
                     type: Type.STRING,

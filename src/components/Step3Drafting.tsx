@@ -18,6 +18,15 @@ import {
   computeEssayFrameworkSignature,
   computeSubpointFrameworkSignature,
 } from "../utils/step3Quality";
+import { prefillClaimSlotsFromSubClaims } from "../utils/step3ClaimPrefill";
+
+/** Clone plan and sync subClaim → empty claim slots for immediate board display. */
+function planWithClaimPrefill<T>(plan: T): T {
+  if (!plan || typeof plan !== "object") return plan;
+  const next = JSON.parse(JSON.stringify(plan));
+  prefillClaimSlotsFromSubClaims(next);
+  return next as T;
+}
 
 type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
 
@@ -115,7 +124,7 @@ export default function Step3Drafting({
         argumentRelation: bp.argumentRelation,
         stanceRelation: bp.argumentRelation,
         layoutRationale: (session as any).step2_5?.rationale || '',
-        paragraphPlan: bp.paragraphPlan,
+        paragraphPlan: planWithClaimPrefill(bp.paragraphPlan),
         frameworkSignature: `${bp.id}-${bp.argumentRelation || ''}`,
         isCompleted: false,
       }))
@@ -192,7 +201,7 @@ export default function Step3Drafting({
       return {
         ...parsed,
         frameworkSignature: parsedSig,
-        paragraphPlan: existing.paragraphPlan,
+        paragraphPlan: planWithClaimPrefill(existing.paragraphPlan),
         structureSteps: existing.structureSteps,
         chatHistory: existing.chatHistory,
         isCompleted: existing.isCompleted,
@@ -221,9 +230,21 @@ export default function Step3Drafting({
         );
         return prevSig !== computeSubpointFrameworkSignature(parsed, session);
       });
-    if (
-      shapeChanged
-    ) {
+    // Stale boards: subClaim present but claim step still empty (coach plan churn).
+    const claimSyncNeeded = (existing || []).some((sp) => {
+      const plan = sp?.paragraphPlan;
+      if (!plan || !Array.isArray(plan.pointBlocks)) return false;
+      return plan.pointBlocks.some((block: any) => {
+        const sub = String(block?.subClaim || "").trim();
+        const first = block?.steps?.[0];
+        if (sub.length < 8 || !first) return false;
+        if (!/分论点|核心观点|核心主张|主张|论点|观点|claim/i.test(String(first.label || ""))) {
+          return false;
+        }
+        return !String(first.value || "").trim();
+      });
+    });
+    if (shapeChanged || claimSyncNeeded) {
       const currentActive = session.step3.activeSubpointId;
       const activeStillExists =
         currentActive && parsedSubpoints.some((sp) => sp.id === currentActive);
