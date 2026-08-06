@@ -140,6 +140,8 @@ export interface LogicStep {
   value?: string;
   /** draft = written but still updatable; confirmed = argument-ready and frozen. */
   status?: "draft" | "confirmed";
+  /** True when the value was inherited from Step 2 (subClaim prefill), not a new student utterance. */
+  inheritedFromStep2?: boolean;
 }
 
 /**
@@ -381,6 +383,8 @@ export interface PracticeSession {
     isCompleted: boolean;
     chatHistory?: ChatMessage[];
   };
+  /** Step 2.5 Planner 状态与产出 */
+  step2_5?: Step2_5State;
   /**
    * Cross-step stable digests. Rebuilt only when sourceHash mismatches
    * (canonical fields changed, including boardOverrides). Never student-facing.
@@ -429,4 +433,195 @@ export interface SessionMemory {
   step1?: Step1Digest;
   step2?: Step2Digest;
   step3?: Step3Digest;
+}
+
+// ============================================================
+// Step 2.5 Planner 类型
+// ============================================================
+
+export interface Step2_5State {
+  status: 'idle' | 'running' | 'passed' | 'failed' | 'stale';
+  startedAt?: number;
+  updatedAt?: number;
+  attempt?: number;
+  planSignature?: string;
+  plannerIntermediate?: {
+    stance: string;
+    argumentStrategy: string;
+    argumentRelation: string;
+    layoutPattern: string;
+    bodyCount: number;
+  };
+  rationale?: string;
+  bodyPlans: BodyPlan[];
+  errorMessage?: string;
+  /** True when the plan came from the programmatic fallback instead of the Planner LLM. */
+  degraded?: boolean;
+}
+
+export interface BodyPlan {
+  id: string;
+  targetBody: string;
+  role: string;
+  theme?: string;
+  content?: string;
+  paragraphDensity?: 'single_point' | 'dual_point';
+  argumentRelation?: string;
+  pointRoles?: BodyPointRole[];
+  mappedPoints?: string[];
+  paragraphPlan: ParagraphPlan;
+}
+
+// ============================================================
+// Coach / Intent Agent 类型
+// ============================================================
+
+export interface CoachOutput {
+  text: string;
+  hint?: string;
+}
+
+export interface IntentOutput {
+  stageTransition?: {
+    from: string;
+    to: string;
+    reason: string;
+  };
+  slotUpdates?: Array<{
+    key: string;
+    action: 'draft' | 'confirm' | 'reject';
+    value?: string;
+    rejectReason?: string;
+  }>;
+  adaptations?: Array<{
+    op: 'reclass' | 'merge' | 'add' | 'skip';
+    key?: string;
+    newLabel?: string;
+    fromKeys?: string[];
+    intoKey?: string;
+    blockId?: string;
+    afterKey?: string;
+    label?: string;
+    placeholder?: string;
+    keys?: string[];
+  }>;
+  structureChangeOffer?: {
+    kind: 'body_argument_change';
+    summary: string;
+    awaitConfirm: true;
+  };
+  completionFlag?: {
+    isCompleted: boolean;
+    reason: string;
+  };
+  dimensionUpdates?: Array<{
+    label: string;
+    status: 'probed' | 'expandable' | 'thin' | 'quality_pending';
+  }>;
+}
+
+// ============================================================
+// Board Patch 类型（替代 progressUpdate）
+// ============================================================
+
+export interface CoachTurnResponse {
+  text: string;
+  boardPatch: BoardPatch;
+  plannerStatus?: 'running' | 'passed' | 'failed';
+}
+
+export interface BoardPatch {
+  step1?: Partial<Step1Board>;
+  step2?: Partial<Step2Board>;
+  step3?: Partial<Step3Board>;
+  isCompleted?: boolean;
+}
+
+/** Step 1 看板可更新字段 */
+export interface Step1Board {
+  correctType: string;
+  coreIssue: string;
+  writingTask: string;
+  constraints: string[];
+  suggestedDimensions: string[];
+  critique: string;
+  dimensionsSufficient: boolean;
+  exitOffered: boolean;
+}
+
+/** Step 2 看板可更新字段 */
+export interface Step2Board {
+  currentStage: string;
+  userStance: string;
+  userPoints: string;
+  suggestedStance: string;
+  suggestedPoints: string;
+  blueprint: {
+    position: string;
+    bodies: Array<{ title: string; content: string }>;
+  };
+  clustering: any;
+  requiresStance: boolean;
+  taskLabelA: string;
+  taskLabelB: string;
+  positionCheckPassed?: boolean;
+  positionCheckDesc?: string;
+  coverageCheckPassed?: boolean;
+  coverageCheckDesc?: string;
+  structureCheckPassed?: boolean;
+  structureCheckDesc?: string;
+}
+
+/** Step 3 看板可更新字段 */
+export interface Step3Board {
+  activeSubpointId?: string;
+  subpoints?: any[];
+  isCompleted?: boolean;
+  currentSlotUpdate?: {
+    key: string;
+    value: string;
+    status: '' | 'draft' | 'confirmed';
+  };
+  adaptations?: any[];
+  structureChangeOffer?: any;
+  step3SlotEval?: any;
+  paragraphPlan?: ParagraphPlan;
+}
+
+// ============================================================
+// Planner 相关类型
+// ============================================================
+
+export interface PlannerInput {
+  question: string;
+  questionType: string;
+  requiresStance: boolean;
+  materials: {
+    aSide: string;
+    bSide: string;
+    stance: string;
+    clusters: any[];
+    userRawText: string;
+  };
+}
+
+export interface PlannerOutput {
+  layoutPattern: string;
+  rationale: string;
+  bodyPlans: BodyPlan[];
+  plannerIntermediate: Step2_5State['plannerIntermediate'];
+}
+
+export interface MechanicalQaResult {
+  pass: boolean;
+  issues: Array<{
+    severity: 'fail' | 'warn';
+    field: string;
+    reason: string;
+  }>;
+}
+
+export interface ConsistencyResult {
+  valid: boolean;
+  issues: string[];
 }

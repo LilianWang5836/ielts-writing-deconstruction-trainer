@@ -22,8 +22,24 @@ import {
   promoteAcknowledgedStep3DraftTarget,
   promoteAcknowledgedFlatStep3Target,
 } from "./src/utils/step3Quality.ts";
+import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
+import {
+  buildPlannerRequest,
+  collectPlannerInput,
+  parsePlannerResponse,
+  runMechanicalQa,
+  normalizePlannerBodyPlans,
+} from "./src/server/planner/planner";
+import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
+import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
+import { log } from "./src/server/logger";
 
 dotenv.config();
+// 本地覆盖：.env.local 优先（便于本地测试时切换 LLM 提供商/Key，而不影响共享 .env）
+dotenv.config({
+  path: path.resolve(process.cwd(), ".env.local"),
+  override: true,
+});
 
 // Lazy-initialize Gemini API client to avoid startup crashes if key is missing
 let aiInstance: GoogleGenAI | null = null;
@@ -1964,6 +1980,9 @@ function clearAllStep3PlanValues(plan: any): void {
     if (!Array.isArray(block?.steps)) continue;
     for (const step of block.steps) {
       if (step && typeof step === "object") {
+        // Preserve values inherited & confirmed from Step 2 (subClaim prefill).
+        // Confirmed values are frozen and must not be wiped at kickoff.
+        if (isStep3Confirmed(step) && step.inheritedFromStep2) continue;
         step.value = "";
         step.status = "";
       }
@@ -2562,6 +2581,12 @@ function enforceConfirmedOnlySlots(plan: any, prevPlan: any): number {
         }
         confirmedByKey.delete(prevKey || key);
         restored += 1;
+      } else if (
+        isStep3Confirmed(step) &&
+        step.inheritedFromStep2 &&
+        isGenuineStep3StepValue(step)
+      ) {
+        // Already confirmed & inherited from Step 2 (subClaim prefill) — keep as-is.
       } else {
         step.value = "";
         step.status = "";
@@ -3075,7 +3100,22 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
       /对/.test(t) &&
       confirmed === 0) ||
     (chainLabels >= 3 && confirmed === 0);
-  if (dumpSignals) return "illegal_dump";
+
+  // Structure-discussion exemption (issue 1.3): the student asked about the chain
+  // shape (e.g. "一定要按分论点→机制→例证来写么"), and the model is legitimately
+  // offering ALTERNATIVE chain shapes and asking the student to choose. This is NOT
+  // a rubber-stamp dump — do not veto it to a canned firstEmpty ask.
+  const structureDiscussion =
+    !/待确认草稿|已确认）】|整理了以下论证|逻辑链草稿是否符合/.test(t) &&
+    /死板的公式|换一种|当然不是|换一个思路|可以不用|不一定|顺序不是固定的|看情况|根据内容|也可以先|也可以换成/.test(
+      t,
+    ) &&
+    /你更想|你更倾向|想尝试|选哪一种|选择哪一种|用哪一种|要不要|你看呢|你觉得呢|哪个更好/.test(
+      t,
+    ) &&
+    confirmed === 0;
+
+  if (dumpSignals && !structureDiscussion) return "illegal_dump";
 
   if (confirmed === 0 && step3TextClaimsPrematureProgress(t)) {
     return "illegal_dump";
@@ -5436,8 +5476,13 @@ function listUnresolvedStep1Dimensions(
 }
 
 /**
- * Forbid silent drop of Step1 effective dimensions when converging / completing.
- * Each must be expanded, explicitly merged into another point, or explicitly dropped.
+ * Soft guard: ensure Step 1 effective dimensions are accounted for before
+ * Step 2 completion. When the conversation has already advanced to stance/summary
+ * with solid material, auto-disposition pending dimensions rather than blocking.
+ *
+ * The authoritative semantic judgment ("was this dimension discussed?") belongs
+ * to the Intent Agent. This guard only catches the case where the model is
+ * trying to complete during explore_A/B without addressing dimensions at all.
  */
 function enforceStep2DimensionDispositionGuard(
   data: any,
@@ -5457,13 +5502,32 @@ function enforceStep2DimensionDispositionGuard(
       "explore_A",
   ).trim();
   const ctaOk = textSuggestsStep2Complete(String(data.text || ""));
-  const converging =
-    stage === "stance" ||
-    stage === "summary" ||
-    !!data.progressUpdate.isCompleted ||
-    ctaOk;
-  if (!converging) return;
+  const isCompletedFlag =
+    !!data.progressUpdate.isCompleted || ctaOk;
 
+  // Only hard-block during early exploration: the model is trying to jump
+  // to completion without having even entered stance/summary stage.
+  const earlyConverge = stage === "explore_A" || stage === "explore_B";
+  if (!isCompletedFlag || !earlyConverge) {
+    // Soft pass: conversation has advanced (stance/summary) with solid material.
+    // Auto-disposition remaining pending dimensions as expanded — the Intent Agent
+    // will provide authoritative semantic matching when integrated.
+    const finalDispositions = dispositions.map((d) => {
+      if (d.disposition === "pending") {
+        return { ...d, disposition: "expanded" as const };
+      }
+      return d;
+    });
+    step2.dimensionDispositions = finalDispositions;
+    const labels = unresolved.map((d) => d.dimension).join("、");
+    console.warn(
+      `[Step2DimDispositionGuard] Soft-pass: auto-expanded pending dimensions [${labels}] in stage=${stage}`,
+    );
+    return;
+  }
+
+  // Hard block: model attempted completion during explore_A/B without
+  // addressing all Step 1 dimensions.
   const labels = unresolved.map((d) => d.dimension).join("、");
   const oldStage = String(
     session?.step2?.coachEvaluation?.currentStage || "explore_B",
@@ -5484,7 +5548,7 @@ function enforceStep2DimensionDispositionGuard(
     `③明确放下并说原因。`;
   data.text = `${part1}\n\n---\n\n${ask}`;
   console.warn(
-    `[Step2DimDispositionGuard] Blocked converge/complete; unresolved=[${labels}] revertStage=${revertStage}`,
+    `[Step2DimDispositionGuard] Blocked early converge; unresolved=[${labels}] revertStage=${revertStage}`,
   );
 }
 
@@ -5680,7 +5744,6 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
-    applyStep3FrameworkGuard(plan, session, activeSp);
     data.progressUpdate.paragraphPlan = plan;
   }
 
@@ -5756,7 +5819,6 @@ function enforceStep3LogicCompletionInner(
   if (options?.isHiddenKickoff) {
     if (plan) {
       sanitizeParagraphPlanValues(plan);
-      applyStep3FrameworkGuard(plan, session, activeSp);
       clearAllStep3PlanValues(plan);
       enforceConfirmedOnlySlots(plan, null);
       syncPlanProgressFields(data, plan, []);
@@ -5802,7 +5864,6 @@ function enforceStep3LogicCompletionInner(
 
   // Confirmed-only board (model cannot prefill unconfirmed slots).
   enforceConfirmedOnlySlots(plan, prevPlan);
-  applyStep3FrameworkGuard(plan, session, activeSp);
   // Protect confirm activeKey so one-shot reclass can still see the new empty target.
   pruneUnauthorizedEmptySteps(
     plan,
@@ -5819,6 +5880,57 @@ function enforceStep3LogicCompletionInner(
 
   // Bare「对」with nothing pending — never pretend success / complete.
   if (pending.length === 0 && isStep3AffirmativeConfirmation(userMessage)) {
+    // Defense (protocol hole fix): the model may have declared a confirm with
+    // pendingText in THIS response while the student's「对」is approving it
+    // (e.g. the model asked "请回复对确认这句话" in text, but the pending was
+    // never staged — a prior post-affirm turn that got overwritten to expand).
+    // Commit the declared pending directly instead of vetoing — otherwise the
+    // flow deadlocks with「请先把 X 说具体一点」despite the student affirming.
+    if (
+      slotEval?.mode === "confirm" &&
+      slotEval.qualified &&
+      String(slotEval.pendingText || "").trim().length >= 4
+    ) {
+      const loc = findStepLocationByKey(plan, slotEval.activeKey);
+      if (loc && !isStep3Confirmed(loc.step)) {
+        const hard = hardRejectSlotText(
+          slotEval.pendingText,
+          plan,
+          slotEval.activeKey,
+          loc.blockIndex,
+        );
+        if (hard.ok) {
+          const committed = commitPendingOnAffirm(plan, [
+            {
+              key: slotEval.activeKey,
+              label: loc.label,
+              text: slotEval.pendingText,
+              blockIndex: loc.blockIndex,
+              stepIndex: loc.stepIndex,
+            },
+          ]);
+          if (committed > 0) {
+            syncPlanProgressFields(data, plan, []);
+            setReject("");
+            console.warn(
+              "[Step3Guard] Affirm with no pending but model declared confirm — committed directly.",
+            );
+            if (finishBodyIfComplete()) return;
+            const vetoed = enforceStep3TextBoardConsistency(
+              data,
+              plan,
+              "post_affirm_expand",
+            );
+            console.warn(
+              vetoed
+                ? "[Step3Guard] Post-direct-commit — vetoed illegal next-ask text."
+                : "[Step3Guard] Post-direct-commit — kept model next-slot ask.",
+            );
+            return;
+          }
+        }
+      }
+    }
     syncPlanProgressFields(data, plan, []);
     setReject("affirm_no_pending");
     vetoStep3TextToFirstEmptyAsk(data, plan, "affirm_no_pending");
@@ -5869,6 +5981,46 @@ function enforceStep3LogicCompletionInner(
       `[Step3Guard] Applied confirmed pending draft(s) to slots after student affirmation (confirm-then-write via commitPendingOnAffirm).`,
     );
     if (finishBodyIfComplete()) return;
+
+    // Protocol-hole fix: the model may, in the SAME affirm turn, also organize the
+    // NEXT slot's sentence and ask the student to confirm it ("我将它提炼为一句
+    // 话：... 请回复对"). If it declared mode=confirm + pendingText for an empty
+    // slot, STAGE it here. Otherwise the sentence lives only in text, never gets
+    // staged, and the student's next「对」hits the "affirm with no pending" veto
+    // (observed deadlock: 运作过程 confirmed OK → 具体实例 confirm lost → stuck).
+    if (
+      slotEval?.mode === "confirm" &&
+      slotEval.qualified &&
+      String(slotEval.pendingText || "").trim().length >= 4
+    ) {
+      const loc = findStepLocationByKey(plan, slotEval.activeKey);
+      if (loc && !isStep3Confirmed(loc.step)) {
+        const hard = hardRejectSlotText(
+          slotEval.pendingText,
+          plan,
+          slotEval.activeKey,
+          loc.blockIndex,
+        );
+        if (hard.ok) {
+          pending = [
+            {
+              key: slotEval.activeKey,
+              label: loc.label,
+              text: slotEval.pendingText,
+              blockIndex: loc.blockIndex,
+              stepIndex: loc.stepIndex,
+            },
+          ];
+          syncPlanProgressFields(data, plan, pending);
+          setReject("");
+          console.warn(
+            "[Step3Guard] Post-affirm staged next-slot confirm from model step3SlotEval (confirm-then-write).",
+          );
+          return;
+        }
+      }
+    }
+
     // Affirm done — keep model next ask unless it dumps/fakes complete.
     const vetoed = enforceStep3TextBoardConsistency(
       data,
@@ -6550,12 +6702,187 @@ function enforceStep1SlotCompletion(
   }
 }
 
+/** Network-level errors shared by every Gemini model — retrying other models is futile. */
+function isNetworkLevelError(error: any): boolean {
+  if (!error) return false;
+  const msg = String(
+    error?.message || error?.cause?.message || error?.toString?.() || "",
+  );
+  const causeCode = String(error?.cause?.code || "");
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ENOTFOUND") ||
+    msg.includes("EAI_AGAIN") ||
+    msg.includes("socket hang up") ||
+    msg.includes("UND_ERR_CONNECT_TIMEOUT") ||
+    msg.includes("UND_ERR_SOCKET") ||
+    msg.includes("connect ETIMEDOUT") ||
+    causeCode.startsWith("UND_ERR") ||
+    causeCode === "ECONNREFUSED" ||
+    causeCode === "ECONNRESET" ||
+    causeCode === "ENOTFOUND" ||
+    causeCode === "ETIMEDOUT"
+  );
+}
+
+/** 当前 LLM 提供商：gemini（默认）| openai-compatible */
+function getLLMProvider(): "gemini" | "openai-compatible" {
+  const p = String(process.env.LLM_PROVIDER || "").trim().toLowerCase();
+  return p === "openai" || p === "openai-compatible"
+    ? "openai-compatible"
+    : "gemini";
+}
+
+/** Gemini 模型列表（可用 GEMINI_MODELS=model1,model2 覆盖）。 */
+function getGeminiModels(): string[] {
+  const raw = String(process.env.GEMINI_MODELS || "").trim();
+  if (raw) {
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+  ];
+}
+
+/**
+ * OpenAI 兼容提供商调用（DeepSeek / Kimi / OpenRouter / 本地 vLLM、Ollama 等）。
+ * 通过环境变量配置：
+ *   LLM_PROVIDER=openai-compatible
+ *   OPENAI_API_KEY=<key>
+ *   OPENAI_BASE_URL=<例如 https://api.deepseek.com/v1>
+ *   OPENAI_MODEL=<例如 deepseek-chat>
+ * 返回与 Gemini 相同的信封结构 { candidates: [{ content: { parts: [{ text }] } }] }，
+ * 调用方无需改动。
+ */
+async function generateOpenAICompat(params: {
+  contents: any;
+  config?: any;
+}): Promise<any> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey === "MY_OPENAI_API_KEY") {
+    throw new Error(
+      "OPENAI_API_KEY is not set (LLM_PROVIDER=openai-compatible). Add your key in .env or Settings > Secrets.",
+    );
+  }
+  const baseUrl = (
+    process.env.OPENAI_BASE_URL || "https://api.openai.com/v1"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+  const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+
+  const messages = (Array.isArray(params.contents) ? params.contents : [])
+    .map((c: any) => {
+      const parts = Array.isArray(c?.parts) ? c.parts : [];
+      const text = parts
+        .map((p: any) => String(p?.text || ""))
+        .join("")
+        .trim();
+      if (!text) return null;
+      const role = c?.role === "assistant" ? "assistant" : "user";
+      return { role, content: text };
+    })
+    .filter(Boolean);
+
+  const body: Record<string, any> = {
+    model,
+    messages,
+    temperature:
+      typeof params.config?.temperature === "number"
+        ? params.config.temperature
+        : 0.7,
+    max_tokens: params.config?.maxOutputTokens ?? 32768,
+  };
+  if (params.config?.responseMimeType === "application/json") {
+    body.response_format = { type: "json_object" };
+  }
+
+  const url = `${baseUrl}/chat/completions`;
+  log.llmRequest(model, JSON.stringify(messages).slice(0, 300));
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const err = new Error(
+      `OpenAI-compatible API error ${res.status}: ${errText.slice(0, 300)}`,
+    ) as any;
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const content = String(
+    data?.choices?.[0]?.message?.content || "",
+  );
+  return {
+    candidates: [{ content: { parts: [{ text: content }] } }],
+  };
+}
+
+/** OpenAI 兼容路径：单模型 + 3 次重试。 */
+async function generateOpenAICompatWithRetry(params: {
+  contents: any;
+  config?: any;
+}): Promise<any> {
+  const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(
+        `[LLM] Attempting generation via openai-compatible (${model}) attempt ${attempt}/3`,
+      );
+      const response = await generateOpenAICompat(params);
+      const rawText =
+        response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      log.llmResponse(model, rawText);
+      return response;
+    } catch (error: any) {
+      lastError = error;
+      console.warn(
+        `[LLM] openai-compatible attempt ${attempt} failed:`,
+        error.message || error,
+      );
+      log.llmError(model, error);
+      if (
+        error?.status === 401 ||
+        error?.status === 403 ||
+        isNetworkLevelError(error)
+      ) {
+        throw error;
+      }
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, attempt * 1000));
+      }
+    }
+  }
+  throw lastError || new Error("OpenAI-compatible LLM failed after retries.");
+}
+
 async function generateContentWithFallback(params: {
   contents: any;
   config?: any;
 }): Promise<any> {
+  // 多提供商分派：openai-compatible 走 OpenAI 兼容端点，其余走 Gemini。
+  if (getLLMProvider() === "openai-compatible") {
+    return generateOpenAICompatWithRetry(params);
+  }
+
   const ai = getAI();
-  const models = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-3.1-pro-preview", "gemini-2.5-pro"];
+  const models = getGeminiModels();
   let lastError: any = null;
 
   for (const model of models) {
@@ -6565,11 +6892,14 @@ async function generateContentWithFallback(params: {
         console.log(
           `[Gemini] Attempting generation with model: ${model} (attempt ${attempt}/${retries})`,
         );
+        log.llmRequest(model, JSON.stringify(params.contents).slice(0, 300));
         const response = await ai.models.generateContent({
           model,
           contents: params.contents,
           config: params.config,
         });
+        const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        log.llmResponse(model, rawText);
         return response;
       } catch (error: any) {
         lastError = error;
@@ -6577,6 +6907,18 @@ async function generateContentWithFallback(params: {
           `[Gemini] Model ${model} (attempt ${attempt}) failed. Error:`,
           error.message || error,
         );
+        log.llmError(model, error);
+
+        // Network-level failures (fetch failed / connect timeout / refused / DNS)
+        // are shared by every model — trying the remaining models only wastes time
+        // (each attempt can block ~10s+). Fast-fail so the caller can fall back
+        // (e.g. Planner fallback, coach error) without a ~110s stall.
+        if (isNetworkLevelError(error)) {
+          console.warn(
+            `[Gemini] Network-level failure — skipping remaining models (${models.length} models × 2 attempts avoided).`,
+          );
+          throw error;
+        }
 
         if (
           error.message?.includes("API_KEY") ||
@@ -7497,12 +7839,149 @@ async function startServer() {
 
   // 1. API - Health check
   app.get("/api/health", (req, res) => {
+    const provider = getLLMProvider();
+    const key =
+      provider === "openai-compatible" ? "OPENAI_API_KEY" : "GEMINI_API_KEY";
+    const val = process.env[key];
     res.json({
       status: "ok",
-      hasKey:
-        !!process.env.GEMINI_API_KEY &&
-        process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY",
+      provider,
+      hasKey: !!val && val !== `MY_${key}`,
     });
+  });
+
+  // 1b. API - Step 2.5 Planner
+  app.post("/api/planner/generate", async (req, res) => {
+    try {
+      const { session } = req.body;
+      const question =
+        String(session?.topic?.question || "").trim() ||
+        String(req.body?.question || "").trim();
+      const questionType =
+        String(
+          session?.step1?.coachEvaluation?.correctType ||
+            session?.topic?.questionType ||
+            "",
+        ).trim() || "Agree / Disagree";
+
+      // --- 首选：真实 Planner LLM（材料驱动的结构推理） ---
+      // 解析/QA 失败时重试一次（LLM 输出有随机性，二次尝试常能成功）。
+      let bodyPlans: any[] | null = null;
+      let errorMessage = "";
+      let degraded = false;
+      let qaIssues: string[] = [];
+      let request: any = null;
+      let input: any = null;
+
+      // collectPlannerInput / buildPlannerRequest 若抛错（session 结构异常等），
+      // 直接走兜底，不返回 500（500 会让前端显示“重试”而不是降级出计划）。
+      try {
+        input = collectPlannerInput(session, question, questionType);
+        request = buildPlannerRequest(input);
+      } catch (ce: any) {
+        errorMessage = String(ce?.message || "Planner 输入构造失败");
+        console.warn(`[Planner] 输入构造失败：${errorMessage}`);
+      }
+
+      const MAX_PLANNER_ATTEMPTS = 2;
+
+      for (
+        let attempt = 1;
+        attempt <= MAX_PLANNER_ATTEMPTS && !bodyPlans && request;
+        attempt++
+      ) {
+        try {
+          const response = await generateContentWithFallback(request);
+          const rawText =
+            response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          const parsed = parsePlannerResponse(rawText);
+          if (parsed && Array.isArray(parsed.bodyPlans)) {
+            const qa = runMechanicalQa(parsed.bodyPlans);
+            if (qa.pass) {
+              bodyPlans = parsed.bodyPlans;
+            } else {
+              qaIssues = qa.issues
+                .filter((i) => i.severity === "fail")
+                .map((i) => i.reason);
+              errorMessage = `Planner QA 未通过：${qaIssues.join("；")}`;
+            }
+          } else {
+            // 诊断：记录解析失败原因与响应首尾，便于定位截断/格式问题
+            let parseHint = "";
+            try {
+              JSON.parse(rawText);
+              parseHint = "JSON 语法合法，但缺 bodyPlans 或非数组";
+            } catch (pe: any) {
+              parseHint = `JSON.parse: ${String(pe?.message || pe)}`;
+            }
+            const tail = rawText.slice(-600);
+            console.warn(
+              `[Planner] 解析失败。长度=${rawText.length}\n首200: ${rawText
+                .slice(0, 200)
+                .replace(/\n/g, "\\n")}\n尾600: ${tail.replace(/\n/g, "\\n")}\n${parseHint}`,
+            );
+            errorMessage = `Planner 响应无法解析为有效 bodyPlans（${parseHint}）`;
+          }
+        } catch (e: any) {
+          errorMessage = String(e?.message || "Planner LLM 调用失败");
+        }
+        if (!bodyPlans && attempt < MAX_PLANNER_ATTEMPTS) {
+          console.warn(
+            `[Planner] Attempt ${attempt} failed (${errorMessage}) — retrying once...`,
+          );
+        }
+      }
+
+      // --- 兜底：数据感知的保守结构（携带 Step 2 subClaim） ---
+      if (!bodyPlans) {
+        degraded = true;
+        bodyPlans = buildFallbackBodyPlans(questionType, input || undefined);
+        console.warn(
+          `[Planner] Degraded to programmatic fallback. Reason: ${errorMessage || "unknown"}`,
+        );
+      }
+
+      // --- 规范化：subClaim 预填「分论点」槽（修复 Step3 重复询问） ---
+      bodyPlans = normalizePlannerBodyPlans(bodyPlans);
+
+      res.json({
+        status: "passed",
+        degraded,
+        errorMessage: degraded ? errorMessage || undefined : undefined,
+        step2_5: {
+          status: "passed",
+          startedAt: Date.now(),
+          updatedAt: Date.now(),
+          attempt: 1,
+          planSignature: `sig-${Date.now()}`,
+          bodyPlans,
+          degraded,
+          errorMessage: degraded ? errorMessage || undefined : undefined,
+          // 目前仅执行机械 QA（value 空 / 2-3 body / key 唯一 / mode 合法）；
+          // 完整自适应 QA（rubric + 忠实性 + 段内有效性）为后续 Phase C。
+          qaDepth: "mechanical",
+        },
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "Planner failed" });
+    }
+  });
+
+  // 1c. API - 对话导出
+  app.get("/api/log/session/:sessionId", (req, res) => {
+    const { sessionId } = req.params;
+    const markdown = log.exportSession(sessionId);
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="session-${sessionId}.md"`);
+    res.send(markdown);
+  });
+
+  app.get("/api/log/turn/:turnId", (req, res) => {
+    const { turnId } = req.params;
+    const markdown = log.exportTurn(turnId);
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="turn-${turnId}.md"`);
+    res.send(markdown);
   });
 
   // 2. API - Analyze Topic (Step 1)
@@ -7805,6 +8284,9 @@ async function startServer() {
           });
         return;
       }
+
+      const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      log.startTurn(turnId, Number(step), String(userMessage));
 
       const promptHistory = (messages || [])
         .slice(-15)
@@ -8264,6 +8746,7 @@ ${memoryDigestStr}
      - Agree/Disagree example shape: "根据你前面给出的材料，我更推荐『部分同意』：你对……的论据更具体，而另一面可以作为限制条件。这个方向符合你的本意吗？" Rephrase naturally; do not force this literal wording.
      - Positive / Negative (or outweigh-style) example shape: "我更推荐『利大于弊』：你给出的两个好处都能展开成具体场景，而缺点更适合作为可缓解的让步。你愿意采用这个立场吗？" Rephrase naturally and cite the student's actual points.
      - Wording rule: call ②/③ "带让步的立场". NEVER call 弊大于利 / 利大于弊 a "折中立场".
+     - TYPE-AWARE STANCE RULE (CRITICAL for Discuss Both Views): when questionType is "Discuss Both Views", \`different_situations\` (按工作/场景/人群分情况讨论) IS an equally valid and often BETTER stance than concession. Before recommending concession, explicitly evaluate whether the student's material splits naturally by job type / scenario / stakeholder group. If it does, offer \`different_situations\` as Option A and concession as Option B, with a brief rationale for both. Do NOT silently default to concession just because one side has more material — that collapses Discuss Both into an Agree/Disagree pattern, which breaks the task type.
      - FORBIDDEN: recommending a stance merely because it is generally safer/better/more common. The recommendation must be evidence-based from THIS student's brainstorm.
      - Exhaustion respect: if the student says "没有更多了/先这样/就这些", do NOT re-ask the same side for more points; converge with the solid points already on record (one solid support point is acceptable when they explicitly stop).
      - Wait for student answer.
@@ -8314,8 +8797,9 @@ ${memoryDigestStr}
     2. When two points on the SAME side both have strong material, you MAY split into separate bodies OR combine as dual_point with major/minor — pick the option that best fits stance, word budget (~90–110 words per body), and retention tags.
     3. When one point is thin (略写/待补例子), prefer dual_point (major + minor in one body) rather than giving it its own body.
     4. For 利大于弊 / 弊大于利 / partial-agreement stances: the body presenting the weaker/opposite side MUST be argumentRelation: "concedes" (and stanceRelation: "concedes").
-    5. Keep \`blueprint.bodyCount\`, \`blueprint.layoutPattern\`, and \`clustering\` consistent. Mirror framework fields on matching \`blueprint.bodies[]\` entries when emitted.
-    6. Stance–material fit (CRITICAL, converge-stage only): before finalizing an outweigh stance, check whether the SUPPORT side has enough expandable points. Concession bodies may rely on one major opposite-side point; support bodies should prefer two complementary points OR one very solid point. If the student has already said they have no more points and at least one solid support point exists, finalize with that package — do NOT re-ask the same question.
+    5. TYPE-AWARE RELATION RULE (CRITICAL for Discuss Both Views): when the question type is Discuss Both Views and the stance is NOT outweigh/concession, each body should use argumentRelation: "elaborates" (parallel explanation from the respective viewpoint's perspective). Do NOT assign "supports" to one body and "concedes" to the other — that collapses Discuss Both into an Agree/Disagree pattern. If the student chose "different_situations", use "compares" or "elaborates" depending on whether the bodies directly compare or independently explain two situations.
+    6. Keep \`blueprint.bodyCount\`, \`blueprint.layoutPattern\`, and \`clustering\` consistent. Mirror framework fields on matching \`blueprint.bodies[]\` entries when emitted.
+    7. Stance–material fit (CRITICAL, converge-stage only): before finalizing an outweigh stance, check whether the SUPPORT side has enough expandable points. Concession bodies may rely on one major opposite-side point; support bodies should prefer two complementary points OR one very solid point. If the student has already said they have no more points and at least one solid support point exists, finalize with that package — do NOT re-ask the same question.
 
   ## Layered Output Definition (层级划分与降压设计)
   To reduce JSON complexity and LLM generation errors, the output is strictly split:
@@ -8400,11 +8884,20 @@ ${memoryDigestStr}
     - \`paragraphDensity: "single_point"\` → \`mode: "single_point"\`, exactly ONE pointBlock for the major mapped point.
     - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major: 2–3 steps; minor: 1–2 steps).
     - Set each pointBlock.\`subClaim\` from the mapped point text; set \`role\` from \`pointRoles\`.
+    - ALREADY-PREFILLED CLAIM SLOT (CRITICAL): when a pointBlock has a non-empty \`subClaim\` (a full claim sentence inherited from Step 2), the server has ALREADY pre-filled that pointBlock's first claim slot (「分论点」/「核心观点」) with the subClaim and marked it confirmed. Treat it as DONE: do NOT re-ask "你的分论点是什么", do NOT echo it back for confirmation, do NOT treat it as the firstEmpty. Start your Socratic ask from the first EMPTY slot (the slot cursor in ContextSummary is authoritative).
     - \`argumentRelation\` (or legacy \`stanceRelation\`) selects REQUIRED argument beats for this body. Cover those beats with open student-filled steps; do NOT force a fixed step count or fixed canned labels:
-      - supports / elaborates: ordinary causal chain as needed by the content.
+      - supports / elaborates: no mandatory beats. Choose 2–4 steps from the expansion strategies below that best fit the student's STEP 2 materials. NEVER default to a fixed "claim → reason → mechanism → example" template — different materials need different chains (e.g. a material strong on causal logic uses mechanism→impact; a material strong on concrete situations uses example→explanation).
       - concedes: must cover (1) acknowledge the opposite side exists (2) show why it does not overturn the overall thesis — step count flexible.
       - compares: both sides → key difference → which is better (flexible phrasing).
       - solves: problem/gap → solution → why it works.
+  - EXPANSION STRATEGY CHOICE (applies to ALL relation types): BEFORE you write any \`pointBlock.steps[]\`, decide the \`expansionStrategy\` for each pointBlock by inspecting the Step 2 material quality:
+    - \`explanation\`: the material focuses on clarifying a concept or definition → steps build a logical explanation chain.
+    - \`example\`: the material naturally lends itself to a concrete scene/case → steps build around a vivid example.
+    - \`mechanism\`: the material traces a cause→effect process → steps follow the causal chain.
+    - \`impact\`: the material emphasizes consequences or significance → steps lead toward impact/outcome.
+    - \`contrast\`: the material compares two sides or before/after → steps highlight the contrast.
+    - \`hybrid\`: the material requires 2+ strategies mixed (e.g. mechanism + example) → combine as needed within budget.
+    - Record your choice in \`pointBlock.expansionStrategy\`. DO NOT write every block as "mechanism" or follow the same template for every body paragraph. Two body paragraphs with the same relation but different material SHOULD produce different step layouts.
   - CONTENT REUSE FROM STEP 2 (CRITICAL): \`mappedPoints\` / userPoints are APPROVED EVIDENCE FOR ASKING ONLY. On every empty slot (including kickoff), use Step 2 as clues for a beat-specific Socratic question (mode=expand). FORBIDDEN: polishing / completing Step 2 into a full sentence and putting it in \`step3SlotEval.pendingText\` for the student to merely affirm — that is LLM代劳. mode=confirm is allowed ONLY after the student has themselves stated this beat in Step 3 chat; then pendingText may paraphrase THEIR words (no new facts). Keep all \`steps[].value\` empty until the server commits on affirm. Omit beats Step 2 never covered — ask, do not invent.
   - After the student affirms (「对/是的/没问题」), the SERVER writes confirmed values. Your next turn asks the next empty slot with mode=expand (Socratic) unless the student already answered that next beat in this Step 3 dialogue. Do not make the student restate already-confirmed material.
   - Record \`[inherited-step2-framework]\` in \`paragraphPlan.diagnosis\` when inheriting.
@@ -8456,7 +8949,12 @@ ${memoryDigestStr}
   - 'subClaim': the exact sub-claim being developed.
   - 'role': honor Step 2 \`pointRoles\` when present; otherwise 'major' for the point that deserves more detail, or 'minor' for a concise point.
   - 'expansionStrategy': the most natural strategy for THIS point ('explanation', 'example', 'mechanism', 'impact', 'contrast', or 'hybrid').
-  - 'steps': flexible count based on content + role + required argumentRelation beats (major often 2-3; minor often 1-2; concedes/compares/solves may need their required beats covered without forcing a canned 3-step template).
+  - SLOT-COUNT SPEC (CRITICAL — follow these budgets):
+    - Whole Body total (all pointBlocks + optional totalClaim): 4–7 slots.
+    - single_point (1 pointBlock): 4–5 slots. Do NOT stop at 3 — a single point needs a full reasoning chain (e.g. 分论点 → 展开原因 → 具体机制 → 典型场景, or 分论点 → 具体实例 → 危害后果 → 干预必要性). Include a claim slot even if it is pre-filled.
+    - multi-point (each pointBlock): 2–3 slots per pointBlock (major 3, minor 2), plus optional totalClaim.
+    - These are budgets, not rigid templates: pick the labels and order from the content (see the toolbox below), but respect the slot COUNT so each body is developed deeply enough.
+  - 'steps': flexible count based on content + role + required argumentRelation beats, within the SLOT-COUNT SPEC above (major often 3; minor often 2; single_point 4–5; concedes/compares/solves may need their required beats covered without forcing a canned 3-step template).
   - The flat logic-chain schemes are a per-point toolbox ONLY — pick by content fit, not by habit:
     1. **演绎型逻辑链 (Deductive)**: 核心观点 (Claim) -> 展开原因 (Reason) -> 支撑展开 (Support) -> 推导结果 (Impact)。适合直接立论、原理清晰的论点。
     2. **折中让步型 (Concession/Contrast)**: 核心观点 (Claim) -> 让步承认 (Concession) -> 转折反驳 (Rebuttal/Contrast) -> 总结收尾 (Concluding Clincher)。最适合讨论对立观点或进行有保留的支持。
@@ -8518,9 +9016,11 @@ ${memoryDigestStr}
 
   - OVERRIDE HANDLING (CRITICAL):
     - If the student explicitly requests a different structure/order/strategy after your recommendation (e.g., "两个点都展开", "先举例再讲原因", "换成问题-解决"), you MUST adopt that preference unless it would clearly break core constraints (especially severe word-budget overflow).
+    - STRUCTURE META-QUESTION (CRITICAL — issue 1.3): if the student questions the chain shape itself (e.g. "我一定要按照 分论点→机制→例证 这个逻辑来写么？"), treat it as a legitimate meta-question. Respond naturally: confirm no fixed formula, briefly offer 1–2 alternative chain shapes that fit THIS argument (concrete, tied to the material), and ask which they prefer. You MAY update \`paragraphPlan\` (labels/order) immediately once they choose. This is NOT a rubber-stamp dump and NOT "请先把分论点说具体一点" territory.
     - After adopting, you MUST immediately update 'progressUpdate.paragraphPlan' and the compatible flattened 'progressUpdate.step3SubpointSteps' to reflect the new structure.
     - In chat text, acknowledge the switch in one plain sentence, then continue guidance. Do NOT silently keep the old plan.
     - If you cannot fully satisfy the requested override due to constraints, explain the constraint briefly in plain Chinese and provide the closest feasible variant, then proceed.
+    - OFF-ASK BUT REASONABLE (issue 1.3): if the student's reply does not match the current slot's label but is a logically valid argument beat (e.g. asked for 分论点 but they give the 具体实例; or they say "分论点我已经给了" pointing to an established claim), DO NOT force a re-confirm of the same slot. Either (a) accept their point as the current slot's content via mode=confirm (reclassing the slot label once if needed), or (b) if they reference an already-established claim, recognize it is done and move to the next empty slot.
 
   - Reason vs. Support Crisp Boundary:
     - Reason is the underlying principle/why on a conceptual level (e.g., "在教室里，学生每天都能和同学面对面说话，所以更容易交上朋友").
@@ -8603,6 +9103,10 @@ ${memoryDigestStr}
   - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.
   - CRITICAL — STUCK / 「不知道」: If the student cannot answer, give at most ONE short clue from Step 2 or a narrower follow-up question. FORBIDDEN: writing a complete ready-made sentence and asking them to rubber-stamp it (「用这句话…合适吗」).
   - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise THIS sentence (「对」或修改). Do not stack a long next-slot lecture in the same turn; after they affirm, your NEXT reply asks the next empty beat naturally.
+  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages a confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, activeKey, pendingText}\`. If you write an organized sentence in \`text\` and ask the student to「回复对」but do NOT declare mode=confirm with that pendingText, the sentence is never staged and the student's next「对」will be rejected as "no pending" — a deadlock. Therefore:
+    1. When mode=expand, NEVER present a ready-made sentence and ask the student to confirm it in text; ask a Socratic question instead.
+    2. After a student affirms (a mode=confirm turn), your next turn should normally ask the NEXT empty slot with mode=expand. Do NOT, in the SAME affirm turn, also organize the next slot's sentence — that second confirm would be lost.
+    3. The ONLY case you may present a confirm sentence in text is when you ALSO declare \`mode:"confirm"\` + \`pendingText\` for that exact \`activeKey\` in this same response.
   - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
   - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
   - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
@@ -8736,7 +9240,9 @@ Student says:
       const response = await generateContentWithFallback({
         contents: prompt,
         config: {
-          maxOutputTokens: 8192,
+          // Step 3 输出含完整 paragraphPlan + step3SubpointSteps 投影，
+          // 多点结构下可能超 8K → 提升到 32K 消除截断（Gemini 上限 64K）。
+          maxOutputTokens: 32768,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -9310,7 +9816,8 @@ Student says:
         const retryResponse = await generateContentWithFallback({
           contents: `${prompt}${correctionSuffix}`,
           config: {
-            maxOutputTokens: 8192,
+            // 与主调用保持一致，避免修复轮次因输出截断再次失败。
+            maxOutputTokens: 32768,
             responseMimeType: "application/json",
           },
         });
@@ -9613,15 +10120,9 @@ Student says:
       // clearing also rebuilds the flat step list, and BEFORE completion guard.
       if (currentStepNum === 3 && data?.progressUpdate?.paragraphPlan) {
         applyParagraphModeCorrection(data, session);
-        const activeSpForFramework = (session?.step3?.subpoints || []).find(
-          (sp: any) => sp.id === session?.step3?.activeSubpointId,
-        );
-        applyStep3FrameworkGuard(
-          data.progressUpdate.paragraphPlan,
-          session,
-          activeSpForFramework,
-        );
       }
+
+      // Step 3 completion safety net
 
       // Step 3 completion safety net: merge prior values, backfill a missed last
       // step from the user message, and clear premature completion CTA / flags
@@ -9653,6 +10154,7 @@ Student says:
         data.progressUpdate,
       );
 
+      log.endTurn(turnId, String(data.text || ''), data.progressUpdate);
       res.json(data);
     } catch (error: any) {
       console.error("Error in /api/coach/chat:", error);

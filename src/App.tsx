@@ -7,7 +7,10 @@ import Step1Analysis from './components/Step1Analysis';
 import Step2Brainstorm from './components/Step2Brainstorm';
 import Step3Drafting from './components/Step3Drafting';
 import Step4SentencePractice from './components/Step4SentencePractice';
+import HistoryDialog from './components/HistoryDialog';
 import { Topic, PracticeSession } from './types';
+import { saveHistoryItem } from './historyStorage';
+import type { ConversationHistoryItem } from './historyStorage';
 
 export default function App() {
   const [activeTopic, setActiveTopic] = useState<Topic | null>(null);
@@ -15,6 +18,7 @@ export default function App() {
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
   const [viewMode, setViewMode] = useState<'select' | 'import'>('select');
   const [topicListVersion, setTopicListVersion] = useState(0);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // Check backend health & API key on mount
   useEffect(() => {
@@ -62,6 +66,7 @@ export default function App() {
     setActiveTopic(topic);
     setSession(initialSession);
     localStorage.setItem('ielts_deconstruct_session', JSON.stringify(initialSession));
+    saveHistoryItem(initialSession);
   };
 
   const handleUpdateSession = (updates: Partial<PracticeSession> | ((prev: PracticeSession) => Partial<PracticeSession>)) => {
@@ -70,6 +75,8 @@ export default function App() {
       const resolvedUpdates = typeof updates === 'function' ? updates(prev) : updates;
       const updated = { ...prev, ...resolvedUpdates };
       localStorage.setItem('ielts_deconstruct_session', JSON.stringify(updated));
+      // 同步写入历史记录
+      saveHistoryItem(updated);
       return updated;
     });
   };
@@ -91,6 +98,17 @@ export default function App() {
     localStorage.removeItem('ielts_deconstruct_session');
   };
 
+  const handleOpenHistorySession = (item: ConversationHistoryItem) => {
+    // 先把当前 session 存一下
+    if (session) {
+      saveHistoryItem(session);
+    }
+    setActiveTopic(item.session.topic);
+    setSession(item.session);
+    localStorage.setItem('ielts_deconstruct_session', JSON.stringify(item.session));
+    setHistoryOpen(false);
+  };
+
   return (
     <div className="min-h-screen lg:h-screen lg:overflow-hidden bg-slate-50/50 flex flex-col">
       {/* Header */}
@@ -100,9 +118,17 @@ export default function App() {
         onStepClick={handleSetStep}
         onReset={handleResetSession}
         apiKeyMissing={apiKeyMissing}
+        onOpenHistory={() => setHistoryOpen(true)}
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 pb-4 min-h-0 flex flex-col lg:overflow-hidden">
+      {/* History Dialog */}
+      <HistoryDialog
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        onOpenSession={handleOpenHistorySession}
+      />
+
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 pb-4 min-h-0 flex flex-col overflow-y-auto">
         <AnimatePresence mode="wait">
           {!activeTopic || !session ? (
             <motion.div
@@ -125,6 +151,7 @@ export default function App() {
                   key={topicListVersion}
                   onSelectTopic={handleSelectTopic}
                   onOpenImporter={() => setViewMode('import')}
+                  onOpenHistory={() => setHistoryOpen(true)}
                 />
               )}
             </motion.div>

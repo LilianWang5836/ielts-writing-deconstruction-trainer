@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { motion } from 'motion/react';
-import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Award, Layers, Sparkles } from 'lucide-react';
+import { CheckCircle2, AlertCircle, ArrowRight, Loader2, BookOpen, Award, Layers, Sparkles, RotateCcw } from 'lucide-react';
 import { Topic, PracticeSession, Dimension } from '../types';
 import CoachChat from './CoachChat';
 
@@ -59,6 +59,9 @@ export default function Step2Brainstorm({
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [activeTab, setActiveTab] = useState<'step1' | 'step2' | 'step3' | 'step4'>('step2');
+  const [plannerStatus, setPlannerStatus] = useState<'idle' | 'running' | 'passed' | 'failed'>('idle');
+  const plannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const plannerAbortRef = useRef<AbortController | null>(null);
   const eval1 = session.step1.coachEvaluation;
   const userNotes = session.step1.userAnalysisNotes?.trim();
   const step1SuggestedDimensions = (eval1?.suggestedDimensions || [])
@@ -281,6 +284,77 @@ export default function Step2Brainstorm({
     pointsForBlueprint.body2,
   ]);
 
+  // Planner: 当 CTA 出现且 planner 未运行时自动触发
+  const triggerPlanner = async (controller: AbortController) => {
+    try {
+      const res = await fetch('/api/planner/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session }),
+        signal: controller.signal,
+      });
+      const data = await res.json();
+      if (plannerTimerRef.current) {
+        clearTimeout(plannerTimerRef.current);
+        plannerTimerRef.current = null;
+      }
+      if (data.status === 'passed') {
+        setPlannerStatus('passed');
+        onUpdateSession({ step2_5: data.step2_5 } as any);
+      } else {
+        setPlannerStatus('failed');
+      }
+    } catch {
+      if (plannerTimerRef.current) {
+        clearTimeout(plannerTimerRef.current);
+        plannerTimerRef.current = null;
+      }
+      setPlannerStatus('failed');
+    } finally {
+      plannerAbortRef.current = null;
+    }
+  };
+
+  // Effect A: 状态机 — CTA 出现且 idle 时置 running。
+  // 注意：绝不能在同一个 effect 里又创建 controller 又 setState('running')，
+  // 否则状态变化触发 cleanup 会立刻 abort 掉刚发起的请求（竞态）。
+  useEffect(() => {
+    if (!showNextStepButton) return;
+    if (plannerStatus !== 'idle') return;
+    setPlannerStatus('running');
+  }, [showNextStepButton, plannerStatus]);
+
+  // Effect B: 真正发起请求 — 仅在 running 时执行；cleanup 只在状态离开
+  // running（成功/失败/卸载）时 abort，属于正常收尾，不会误杀请求。
+  useEffect(() => {
+    if (plannerStatus !== 'running') return;
+    const controller = new AbortController();
+    plannerAbortRef.current = controller;
+    // 单一超时源：到点即 abort 请求并把状态置为 failed（可重试）。
+    // 180s 覆盖服务端最多 2 次 LLM 尝试（正常网络单次 30-80s）。
+    plannerTimerRef.current = setTimeout(() => {
+      controller.abort();
+      setPlannerStatus('failed');
+    }, 180000);
+    triggerPlanner(controller);
+    return () => {
+      if (plannerTimerRef.current) {
+        clearTimeout(plannerTimerRef.current);
+        plannerTimerRef.current = null;
+      }
+      plannerAbortRef.current?.abort();
+      plannerAbortRef.current = null;
+    };
+  }, [plannerStatus]);
+
+  const handleNextStepWithPlanner = () => {
+    if (plannerStatus === 'passed') {
+      onNextStep();
+    } else if (plannerStatus === 'failed') {
+      setPlannerStatus('idle');
+    }
+  };
+
   let previousNotes = "";
   if (eval1) {
     previousNotes = `题型判定：${eval1.correctType}\n核心争议：${eval1.coreIssue}${eval1.constraints && eval1.constraints.length > 0 ? `\n关键限定：${eval1.constraints.join('、')}` : ''}`;
@@ -355,6 +429,7 @@ ${topic.question}
           welcomeMessage={welcomeMessage}
           autoKickoff={true}
           kickoffPrompt={kickoffPrompt}
+          inputDisabled={plannerStatus === 'running'}
         >
           {errorMsg && (
             <div className="bg-rose-50 border border-rose-100 rounded-lg p-3 text-rose-800 text-xs flex items-center gap-2 mt-2">
@@ -379,11 +454,17 @@ ${topic.question}
                   </div>
                 </div>
                 <button
-                  onClick={onNextStep}
+                  onClick={handleNextStepWithPlanner}
+                  disabled={plannerStatus === 'running'}
                   className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-4 py-2 font-sans text-xs font-bold text-white shadow-sm transition shrink-0"
                 >
-                  <span>立即跳转</span>
-                  <ArrowRight className="h-3.5 w-3.5" />
+                  {plannerStatus === 'running' ? (
+                    <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>正在整理段落结构…</span></>
+                  ) : plannerStatus === 'failed' ? (
+                    <><RotateCcw className="h-3.5 w-3.5" /><span>重试</span></>
+                  ) : (
+                    <><span>立即跳转</span><ArrowRight className="h-3.5 w-3.5" /></>
+                  )}
                 </button>
               </div>
             </div>
