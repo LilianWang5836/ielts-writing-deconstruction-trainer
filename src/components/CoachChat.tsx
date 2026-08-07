@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2 } from 'lucide-react';
+import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
 
@@ -37,6 +37,7 @@ export default function CoachChat({
   const [errorMsg, setErrorMsg] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const kickoffRef = useRef<string | null>(null);
   const migratedLegacyStep3HistoryRef = useRef(false);
 
@@ -812,16 +813,31 @@ export default function CoachChat({
             {pendingDrafts.map((d: any) => (
               <div
                 key={String(d.key || '')}
-                className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5 text-xs text-slate-700"
+                className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5 text-xs text-slate-700 flex items-start gap-2"
               >
-                <span className="font-bold text-amber-700">
-                  {d.label || '当前一环'}：
+                <span className="flex-1 min-w-0">
+                  <span className="font-bold text-amber-700">
+                    {d.label || '当前一环'}：
+                  </span>
+                  {d.text}
                 </span>
-                {d.text}
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => {
+                    setInputText(`${d.label || '当前一环'}：`);
+                    inputRef.current?.focus();
+                  }}
+                  className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-1.5 py-1 text-[10px] font-bold text-amber-700 transition shrink-0 disabled:opacity-50"
+                  title="修改这一项"
+                >
+                  <Pencil className="h-3 w-3" />
+                  修改
+                </button>
               </div>
             ))}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               disabled={loading}
@@ -832,7 +848,7 @@ export default function CoachChat({
               确认无误，写入看板
             </button>
             <span className="text-[10px] text-slate-400">
-              需要调整？直接在下方输入框里写修改内容即可
+              想改某一项？点该项旁的【修改】补全内容后回车发送
             </span>
           </div>
         </div>
@@ -844,6 +860,7 @@ export default function CoachChat({
         className="bg-slate-50 border-t border-slate-200 px-3 py-2 flex gap-2 items-center shrink-0"
       >
         <input
+          ref={inputRef}
           type="text"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}

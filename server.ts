@@ -3991,10 +3991,10 @@ function buildContinuousConfirmAsk(pending: KickoffPendingDraft[]): string {
     return "请先用一句话写出当前这一环，说清楚后我们再确认写入右侧。";
   }
   if (pending.length === 1) {
-    return `我整理了「${pending[0].label}」：${pending[0].text}\n\n请确认是否准确？回复「对」写入右侧；若要改，直接写出修改后的句子。`;
+    return `我整理了「${pending[0].label}」：${pending[0].text}\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
   }
   const lines = pending.map((d, i) => `${i + 1}. **${d.label}**：${d.text}`);
-  return `我整理了这些论证草稿（确认前不会写入右侧）：\n\n${lines.join("\n")}\n\n请确认：回复「对」写入；若只改其中一环，请写「标签：修改句」。`;
+  return `我根据你刚说的整理了这几环：\n\n${lines.join("\n")}\n\n---\n\n请点击下方【确认】全部写入看板；想改某一项，就在输入框写「${pending[0].label}：修改内容」。`;
 }
 
 function rewriteStep3AskText(
@@ -6437,6 +6437,28 @@ function enforceStep3LogicCompletionInner(
     return;
   }
 
+  // --- Labeled edit of a specific pending item (批量单项修改): 「{label}：修改内容」---
+  // 批量确认时学生发现某一项不准，用「{label}：修正后的句子」只改那一项，
+  // 其余 pending 保留；随后「对」/确认按钮仍提交整批（含已改项）。
+  // 必须放在 staging/expand 分支之前，避免模型的 expand 分支把 pending 清掉。
+  if (
+    pending.length > 0 &&
+    !isStep3AffirmativeConfirmation(userMessage) &&
+    !isStep3RejectMessage(userMessage)
+  ) {
+    const edited = applyLabeledPendingEdits(pending, userMessage);
+    if (edited.touched) {
+      pending = edited.next;
+      syncPlanProgressFields(data, plan, pending);
+      setReject("");
+      ensureMinimalStep3Text(data);
+      console.warn(
+        "[Step3Guard] Labeled pending edit applied（批量单项修改）→ 保留整批待确认。",
+      );
+      return;
+    }
+  }
+
   // --- Apply step3SlotEval → pending (unique staging source) ---
   // Confirm only after a substantive student utterance (not Step2-only polish, not bare「对」).
   // Supports single pendingText OR multi-slot pendingDrafts (≥2, consecutive same-block).
@@ -6631,7 +6653,7 @@ function enforceStep3LogicCompletionInner(
         setReject("");
         syncPlanProgressFields(data, plan, pending);
         if (detectStep3IllegalCoachText(String(data.text || ""), plan)) {
-          data.text = `先确认这一句：\n「${slotEval.pendingText}」\n\n---\n\n如果符合你的意思，请回复「对」；要改就直接说怎么改。`;
+          data.text = `先确认这一句：\n「${slotEval.pendingText}」\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
           console.warn(
             `[Step3Guard] Staged pending for「${stageLoc.label}」— replaced dump/fake text with single-slot confirm ask.`,
           );
@@ -6676,7 +6698,7 @@ function enforceStep3LogicCompletionInner(
     // Do not claim body complete while only a pending draft exists.
     if (detectStep3IllegalCoachText(String(data.text || ""), plan) === "fake_complete") {
       const p0 = pending[0];
-      data.text = `先确认这一句：\n「${String(p0.text || "").trim()}」\n\n---\n\n如果符合你的意思，请回复「对」；要改就直接说怎么改。`;
+      data.text = `先确认这一句：\n「${String(p0.text || "").trim()}」\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
       setReject("fake_complete");
       console.warn(
         "[Step3Guard] Pending kept — replaced fake-complete text with confirm ask.",
@@ -9535,8 +9557,8 @@ ${memoryDigestStr}
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
     - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
       - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
-      - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句并请学生回「对」或修改。SERVER 在 affirm 后才写入 confirmed。
-      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 里列出 1…N 句并请一次回复「对」。FORBIDDEN: 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
+      - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句，然后引导学生点击界面下方的【确认】按钮写入看板（不要让学生用文字回复「对」；确认动作由按钮承载）。SERVER 在按钮/affirm 后才写入 confirmed。
+      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 里列出 1…N 句，并引导学生点击下方【确认】一次全部写入看板（不要让学生文字回复「对」）。FORBIDDEN: 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
      - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
      - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
@@ -9576,11 +9598,11 @@ ${memoryDigestStr}
   - CRITICAL — KICKOFF / FIRST PLANNING TURN (same step3SlotEval contract): On the opening turn, emit the paragraphPlan skeleton with ALL \`steps[].value\` empty. ALWAYS mode=expand for the firstEmpty beat. YOU own the student-facing Socratic ask in \`text\` (natural Chinese coach voice — do NOT use stiff templates like「请用一句话自己写出…不会替你先写好」). Use Step 2 only as a light hint inside the question. FORBIDDEN on kickoff: mode=confirm / pendingText / listing polished reason+example+impact bullets OR narrative lines like「原因：…」「场景：…」「影响：…」for the student to affirm / say「没问题」. You may briefly name the planned chain shape in abstract (e.g. 原因→场景→影响) WITHOUT writing out full sentences for each beat. Do NOT write into \`steps[].value\` yourself. The SERVER never templates your ask — it only aligns state / writes on affirm.
   - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.
   - CRITICAL — STUCK / 「不知道」: If the student cannot answer, give at most ONE short clue from Step 2 or a narrower follow-up question. FORBIDDEN: writing a complete ready-made sentence and asking them to rubber-stamp it (「用这句话…合适吗」).
-  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise the pending sentence(s) (「对」或修改). For pendingDrafts, list all items once. Do not lecture about slots outside the batch; after they affirm, your NEXT reply asks the next empty beat with mode=expand.
-  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, ...}\` with either \`pendingText\` (one slot) or \`pendingDrafts\` (≥2). If you write organized sentences in \`text\` and ask「回复对」but do NOT declare confirm + pendingText/pendingDrafts, the next「对」deadlocks. Therefore:
+  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise the pending sentence(s). For pendingDrafts, list all items once. Guide the student to click the【确认】button below the chat (do NOT ask them to reply「对」in text); if something needs fixing, tell them to write the correction in the input box. After they confirm, your NEXT reply asks the next empty beat with mode=expand.
+  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, ...}\` with either \`pendingText\` (one slot) or \`pendingDrafts\` (≥2). If you write organized sentences in \`text\` without declaring confirm + pendingText/pendingDrafts, the server cannot stage them. Therefore:
     1. When mode=expand, NEVER present a ready-made sentence and ask the student to confirm it in text; ask a Socratic question instead.
-    2. After a student affirms, your next turn asks the NEXT empty slot with mode=expand (batch already wrote everything that utterance covered).
-    3. The ONLY case you may present confirm sentence(s) in text is when you ALSO declare \`mode:"confirm"\` with \`pendingText\` and/or \`pendingDrafts\` in this same response.
+    2. When mode=confirm, ALWAYS declare \`pendingText\` (and \`pendingDrafts\` for ≥2) in this same response; the UI confirm button appears only from the server-staged pending.
+    3. After a student confirms, your next turn asks the NEXT empty slot with mode=expand (batch already wrote everything that utterance covered).
   - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
   - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
   - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
