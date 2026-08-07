@@ -9558,6 +9558,7 @@ ${memoryDigestStr}
     - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
       - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
       - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句，然后引导学生点击界面下方的【确认】按钮写入看板（不要让学生用文字回复「对」；确认动作由按钮承载）。SERVER 在按钮/affirm 后才写入 confirmed。
+      - CRITICAL — DEFAULT SINGLE-SLOT, BATCH ONLY AS EXCEPTION（试验性）: 默认一次只整理并确认【一个】槽（mode=confirm + 单 pendingText）。仅当学生【本轮原话】确实一次性完整覆盖同一 pointBlock 内从 firstEmpty 起的 ≥2 个连续空槽、且每个都有彼此不同的内容时，才走下面的批量 pendingDrafts。禁止为了省轮次把后续还没讨论的槽提前整理进批量；不确定就单槽确认、下一轮再问下一个槽。
       - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 里列出 1…N 句，并引导学生点击下方【确认】一次全部写入看板（不要让学生文字回复「对」）。FORBIDDEN: 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
      - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
