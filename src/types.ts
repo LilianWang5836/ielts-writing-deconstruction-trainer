@@ -96,11 +96,29 @@ export interface ArgumentationFeedback {
   critique: string;
 }
 
+/** Span highlight on Step4 Chinese concept (S/V/O sets only). */
+export interface ConceptHighlightSpan {
+  /** Inclusive start index in `concept`. */
+  start: number;
+  /** Exclusive end index in `concept`. */
+  end: number;
+  /** Grammatical role within a clause. */
+  role: 'S' | 'V' | 'O';
+  /**
+   * Display priority:
+   * - core: logical main-clause S/V/O (brightest + underline)
+   * - subordinate: other clause S/V/O
+   */
+  tier: 'core' | 'subordinate';
+}
+
 export interface SentencePracticeTask {
   id: string;
   concept: string; // e.g. "Students have the flexibility to manage their study schedules"
   section: 'intro' | 'body1' | 'body2' | 'conclusion';
   prompts: string[]; // Lexical cues: "have the flexibility to...", "manage study schedules"
+  /** Optional concept highlights for S/V/O + conjunctions (generated with tasks). */
+  highlights?: ConceptHighlightSpan[];
   userDraft?: string;
   confirmedSentence?: string;
   confirmed?: boolean;

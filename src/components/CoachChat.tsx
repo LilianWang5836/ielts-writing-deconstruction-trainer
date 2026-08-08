@@ -3,6 +3,17 @@ import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pen
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
 
+/** Step1 Q1 — mutually exclusive chips that fill the input box. */
+const STEP1_QUESTION_TYPES = [
+  'Agree / Disagree',
+  'Discuss Both Views',
+  'Advantages / Disadvantages',
+  'Two-part Question',
+  'Problem / Solution',
+  'Positive / Negative',
+  'Other',
+] as const;
+
 interface CoachChatProps {
   topic: Topic;
   step: number;
@@ -53,8 +64,7 @@ export default function CoachChat({
       ? activeStep3Subpoint?.chatHistory || []
       : session[stepKey]?.chatHistory || [];
 
-  // Step 3 确认按钮：服务端已暂存 pending（kickoffPendingDrafts）时，
-  // 在输入区上方给出「确认」按钮，替代“请回复对”的自然语言交互。
+  // Step 3：服务端暂存 pending（kickoffPendingDrafts）时，确认 UI 挂在最新 Coach 气泡上。
   const pendingDrafts =
     stepKey === 'step3'
       ? Array.isArray(activeStep3Subpoint?.kickoffPendingDrafts)
@@ -64,6 +74,154 @@ export default function CoachChat({
         : []
       : [];
   const hasPendingConfirm = pendingDrafts.length > 0 && !loading;
+
+  const lastAiHistoryIndex = (() => {
+    for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+      if (chatHistory[i]?.sender === 'ai') return i;
+    }
+    return -1;
+  })();
+
+  // Pending confirm: keep the latest Coach turn as ONE bubble (don't split on ---),
+  // so the polished sentence + confirm CTA stay together.
+  const renderedMessages = chatHistory.flatMap((msg, historyIndex) => {
+    if (msg.sender === 'ai') {
+      const isPendingHost =
+        hasPendingConfirm && historyIndex === lastAiHistoryIndex;
+      if (isPendingHost) {
+        const joined = String(msg.text || '')
+          .split('---')
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .join('\n\n');
+        return [
+          {
+            ...msg,
+            text: joined,
+            id: `${msg.id}-pending`,
+            isSplit: false,
+            isPendingHost: true as const,
+          },
+        ];
+      }
+      return msg.text.split('---').map((part, i) => ({
+        ...msg,
+        text: part.trim(),
+        id: `${msg.id}-${i}`,
+        isSplit: i > 0,
+        isPendingHost: false as const,
+      }));
+    }
+    return [{ ...msg, isPendingHost: false as const }];
+  });
+
+  const beginEditPendingDraft = (d: any) => {
+    setInputText(`${d.label || '当前一环'}：`);
+    inputRef.current?.focus();
+  };
+
+  /** Render-only: let **bold** work when markers wrap CJK quotation marks. */
+  const prepareCoachMarkdown = (text: string) =>
+    String(text || '')
+      .replace(/\\n/g, '\n')
+      .replace(
+        /\*\*([“‘「『])([\s\S]+?)([”’」』])\*\*/g,
+        (_m, open, inner, close) => `${open}**${inner}**${close}`,
+      );
+
+  /** Render coach text with pending polished sentences as click-to-edit targets. */
+  const renderPendingHostText = (rawText: string) => {
+    const raw = prepareCoachMarkdown(rawText);
+    type Hit = { start: number; end: number; draft: any };
+    const hits: Hit[] = [];
+    for (const d of pendingDrafts) {
+      const t = String(d?.text || '').trim();
+      if (t.length < 4) continue;
+      const variants = [t, `「${t}」`, `"${t}"`, `'${t}'`];
+      for (const v of variants) {
+        let from = 0;
+        while (from <= raw.length - v.length) {
+          const idx = raw.indexOf(v, from);
+          if (idx < 0) break;
+          const end = idx + v.length;
+          if (!hits.some((h) => idx < h.end && end > h.start)) {
+            hits.push({ start: idx, end, draft: d });
+          }
+          from = end;
+        }
+      }
+    }
+    hits.sort((a, b) => a.start - b.start);
+
+    if (hits.length === 0) {
+      return (
+        <>
+          <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+            <ReactMarkdown>{raw}</ReactMarkdown>
+          </div>
+          <div className="mt-2 space-y-1.5">
+            {pendingDrafts.map((d: any) => (
+              <button
+                key={String(d.key || d.label || d.text)}
+                type="button"
+                disabled={loading}
+                onClick={() => beginEditPendingDraft(d)}
+                className="block w-full text-left rounded-md bg-amber-50/80 border border-amber-200/70 px-2 py-1.5 text-[12px] leading-relaxed text-slate-800 hover:bg-amber-50 transition disabled:opacity-50"
+                title="点击修改"
+              >
+                {d.text}
+                <Pencil className="inline-block h-3 w-3 ml-1 text-slate-400 align-[-1px]" />
+              </button>
+            ))}
+          </div>
+        </>
+      );
+    }
+
+    const nodes: React.ReactNode[] = [];
+    let cursor = 0;
+    hits.forEach((h, i) => {
+      if (h.start > cursor) {
+        nodes.push(
+          <div
+            key={`pre-${i}`}
+            className="markdown-body text-xs md:text-[12.5px] text-slate-800"
+          >
+            <ReactMarkdown>{raw.slice(cursor, h.start)}</ReactMarkdown>
+          </div>,
+        );
+      }
+      nodes.push(
+        <button
+          key={`pend-${i}-${h.start}`}
+          type="button"
+          disabled={loading}
+          onClick={() => beginEditPendingDraft(h.draft)}
+          className="inline text-left rounded px-0.5 bg-amber-50 border-b border-dashed border-amber-400 text-slate-900 hover:bg-amber-100/80 transition disabled:opacity-50"
+          title="点击修改"
+        >
+          {raw.slice(h.start, h.end)}
+          <Pencil className="inline-block h-3 w-3 ml-0.5 text-slate-400 align-[-1px]" />
+        </button>,
+      );
+      cursor = h.end;
+    });
+    if (cursor < raw.length) {
+      nodes.push(
+        <div
+          key="post"
+          className="markdown-body text-xs md:text-[12.5px] text-slate-800"
+        >
+          <ReactMarkdown>{raw.slice(cursor)}</ReactMarkdown>
+        </div>,
+      );
+    }
+    return (
+      <div className="text-xs md:text-[12.5px] text-slate-800 leading-relaxed">
+        {nodes}
+      </div>
+    );
+  };
 
   useEffect(() => {
     if (stepKey !== 'step3') return;
@@ -682,17 +840,7 @@ export default function CoachChat({
 
       {/* Chat Message History */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2.5 min-h-0">
-        {chatHistory.flatMap((msg) => {
-          if (msg.sender === 'ai') {
-            return msg.text.split('---').map((part, i) => ({
-              ...msg,
-              text: part.trim(),
-              id: `${msg.id}-${i}`,
-              isSplit: i > 0
-            }));
-          }
-          return [msg];
-        }).map((msg, index, arr) => (
+        {renderedMessages.map((msg) => (
           <div
             key={msg.id}
             className={`flex gap-2.5 items-start ${msg.sender === 'user' ? 'justify-end' : ''}`}
@@ -714,9 +862,44 @@ export default function CoachChat({
             >
               {msg.sender === 'user' ? (
                 <p className="whitespace-pre-wrap">{msg.text}</p>
+              ) : (msg as any).isPendingHost ? (
+                <div>
+                  {renderPendingHostText(msg.text)}
+                  <div className="mt-2.5">
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={() => sendUserMessage('对')}
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      确认
+                    </button>
+                  </div>
+                </div>
               ) : (
                 <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
-                  <ReactMarkdown>{msg.text.replace(/\\n/g, '\n')}</ReactMarkdown>
+                  <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  {/* Step1 Q1: question-type chips → fill input (mutually exclusive) */}
+                  {msg.sender === 'ai' &&
+                    stepKey === 'step1' &&
+                    chatHistory[0] &&
+                    msg.id.startsWith(chatHistory[0].id) &&
+                    !chatHistory.some((m) => m.sender === 'user') && (
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {STEP1_QUESTION_TYPES.map((type) => (
+                          <button
+                            key={type}
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() => sendUserMessage(type)}
+                            className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 transition hover:border-indigo-200 hover:bg-indigo-50/70 disabled:opacity-50"
+                          >
+                            {type}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   {/* Add selection buttons if in step 3 */}
                   {msg.sender === 'ai' &&
                     stepKey === 'step3' &&
@@ -799,60 +982,6 @@ export default function CoachChat({
 
         <div ref={messagesEndRef} />
       </div>
-
-      {/* Step 3 Confirm Strip — 服务端暂存了待确认句时显示按钮，替代“回复对” */}
-      {hasPendingConfirm && (
-        <div className="bg-amber-50/80 border-t border-amber-200 px-3 py-2 shrink-0">
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider">
-              ✍️ 教练已整理，待你确认
-            </span>
-            <span className="text-[9px] text-amber-500">确认后写入右侧看板</span>
-          </div>
-          <div className="space-y-1.5 mb-2">
-            {pendingDrafts.map((d: any) => (
-              <div
-                key={String(d.key || '')}
-                className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5 text-xs text-slate-700 flex items-start gap-2"
-              >
-                <span className="flex-1 min-w-0">
-                  <span className="font-bold text-amber-700">
-                    {d.label || '当前一环'}：
-                  </span>
-                  {d.text}
-                </span>
-                <button
-                  type="button"
-                  disabled={loading}
-                  onClick={() => {
-                    setInputText(`${d.label || '当前一环'}：`);
-                    inputRef.current?.focus();
-                  }}
-                  className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-1.5 py-1 text-[10px] font-bold text-amber-700 transition shrink-0 disabled:opacity-50"
-                  title="修改这一项"
-                >
-                  <Pencil className="h-3 w-3" />
-                  修改
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={loading}
-              onClick={() => sendUserMessage('对')}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              确认无误，写入看板
-            </button>
-            <span className="text-[10px] text-slate-400">
-              想改某一项？点该项旁的【修改】补全内容后回车发送
-            </span>
-          </div>
-        </div>
-      )}
 
       {/* Dynamic Chat Input Bar at the Bottom */}
       <form

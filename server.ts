@@ -3991,10 +3991,49 @@ function buildContinuousConfirmAsk(pending: KickoffPendingDraft[]): string {
     return "请先用一句话写出当前这一环，说清楚后我们再确认写入右侧。";
   }
   if (pending.length === 1) {
-    return `我整理了「${pending[0].label}」：${pending[0].text}\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
+    return (
+      `我已经将你的意思整理成了一句简单明了的话：\n` +
+      `${pending[0].text}\n\n` +
+      `如果你觉得这句话符合你的意思，请点击下方的【确认】按钮写入看板。`
+    );
   }
-  const lines = pending.map((d, i) => `${i + 1}. **${d.label}**：${d.text}`);
-  return `我根据你刚说的整理了这几环：\n\n${lines.join("\n")}\n\n---\n\n请点击下方【确认】全部写入看板；想改某一项，就在输入框写「${pending[0].label}：修改内容」。`;
+  const lines = pending.map((d, i) => `${i + 1}. ${d.text}`);
+  return (
+    `我根据你刚说的整理了这几句：\n\n${lines.join("\n")}\n\n` +
+    `如果你觉得符合你的意思，请点击下方的【确认】按钮全部写入看板。`
+  );
+}
+
+/**
+ * Confirm-turn text hard lock: after pending is staged, replace coach text with a
+ * clean confirm CTA. Never keep a same-turn "next slot" ask (e.g. 具体场景).
+ * Call ONLY after batch salvage / pending staging so batch commit data is intact.
+ */
+function applyConfirmTurnText(data: any, pending: KickoffPendingDraft[]): void {
+  const ask = buildContinuousConfirmAsk(pending);
+  const original = String(data?.text || "");
+  const split = splitTwoParts(original, 3);
+  let praise = String(split.part1 || "").trim();
+  // Drop praise if it already digs into the next beat / asks a question.
+  const looksLikeNextAsk =
+    /同时[，,]?\s*我们来|接下来我们|配一个|具体场景|下一[个环槽步]|请你想想|你能用|能不能先|我们再来/.test(
+      praise,
+    ) ||
+    (praise.includes("？") && praise.length > 36);
+  if (
+    !praise ||
+    looksLikeNextAsk ||
+    pending.some((p) => p.text && praise.includes(String(p.text)))
+  ) {
+    data.text = ask;
+    return;
+  }
+  // Keep at most one short praise sentence.
+  if (praise.length > 100) {
+    const first = praise.split(/(?<=[！!。])/).find((s) => s.trim());
+    praise = String(first || praise).trim();
+  }
+  data.text = `${praise}\n\n${ask}`;
 }
 
 function rewriteStep3AskText(
@@ -6540,25 +6579,14 @@ function enforceStep3LogicCompletionInner(
         }
         setReject("");
         syncPlanProgressFields(data, plan, pending);
-        if (detectStep3IllegalCoachText(String(data.text || ""), plan)) {
-          rewriteStep3AskText(
-            data,
-            buildContinuousConfirmAsk(pending),
-            "我根据你刚说的整理了这几环。",
-            { forceNeutralPart1: true },
-          );
-          console.warn(
-            batchFromTextSalvage
-              ? `[Step3Guard] Salvaged batch pending (${pending.length}) from confirm text — replaced dump/fake text.`
-              : `[Step3Guard] Staged batch pending (${pending.length}) — replaced dump/fake text with multi-slot confirm ask.`,
-          );
-        } else {
-          console.warn(
-            batchFromTextSalvage
-              ? `[Step3Guard] Salvaged batch pending (${pending.length}) from confirm text (model omitted pendingDrafts).`
-              : `[Step3Guard] Staged batch pending (${pending.length} slots) from step3SlotEval.pendingDrafts.`,
-          );
-        }
+        // Always lock confirm-turn copy AFTER staging (salvage already ran on
+        // the original model text above). Prevents same-turn next-slot asks.
+        applyConfirmTurnText(data, pending);
+        console.warn(
+          batchFromTextSalvage
+            ? `[Step3Guard] Salvaged batch pending (${pending.length}) from confirm text — confirm-turn text locked.`
+            : `[Step3Guard] Staged batch pending (${pending.length} slots) — confirm-turn text locked.`,
+        );
         return;
       }
     }
@@ -6652,16 +6680,10 @@ function enforceStep3LogicCompletionInner(
         ];
         setReject("");
         syncPlanProgressFields(data, plan, pending);
-        if (detectStep3IllegalCoachText(String(data.text || ""), plan)) {
-          data.text = `先确认这一句：\n「${slotEval.pendingText}」\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
-          console.warn(
-            `[Step3Guard] Staged pending for「${stageLoc.label}」— replaced dump/fake text with single-slot confirm ask.`,
-          );
-        } else {
-          console.warn(
-            `[Step3Guard] Staged pending from step3SlotEval for「${stageLoc.label}」(slots left empty).`,
-          );
-        }
+        applyConfirmTurnText(data, pending);
+        console.warn(
+          `[Step3Guard] Staged pending for「${stageLoc.label}」— confirm-turn text locked (no same-turn next ask).`,
+        );
         return;
       }
     }
@@ -6695,16 +6717,18 @@ function enforceStep3LogicCompletionInner(
   // No new confirm eval: keep existing pending (if any) or finish/continue.
   if (pending.length > 0) {
     syncPlanProgressFields(data, plan, pending);
-    // Do not claim body complete while only a pending draft exists.
+    // Still waiting on affirm — never advance the ask to the next slot.
+    applyConfirmTurnText(data, pending);
     if (detectStep3IllegalCoachText(String(data.text || ""), plan) === "fake_complete") {
-      const p0 = pending[0];
-      data.text = `先确认这一句：\n「${String(p0.text || "").trim()}」\n\n---\n\n请点击下方【确认】写入看板；要改就直接在输入框里写修改内容。`;
       setReject("fake_complete");
       console.warn(
-        "[Step3Guard] Pending kept — replaced fake-complete text with confirm ask.",
+        "[Step3Guard] Pending kept — confirm-turn text locked (was fake-complete).",
       );
     } else {
-      ensureMinimalStep3Text(data);
+      setReject("");
+      console.warn(
+        "[Step3Guard] Pending kept — confirm-turn text locked (awaiting affirm).",
+      );
     }
     return;
   }
@@ -9557,8 +9581,8 @@ ${memoryDigestStr}
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
     - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
       - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
-      - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句；在 text 里给出整理句，然后引导学生点击界面下方的【确认】按钮写入看板（不要让学生用文字回复「对」；确认动作由按钮承载）。SERVER 在按钮/affirm 后才写入 confirmed。
-      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 里列出 1…N 句，并引导学生点击下方【确认】一次全部写入看板（不要让学生文字回复「对」）。FORBIDDEN: 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
+      - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句。text 结构必须简洁：先 1 句肯定反馈 → 引出整理句（单独成行，只写句子本身，不要再套「具体机制：」等标签）→ 一句「请点击下方的【确认】按钮写入看板」。FORBIDDEN: 在确认前追问下一槽/下一场景；确认动作由气泡底部按钮承载，不要让学生文字回复「对」。SERVER 在按钮/affirm 后才写入 confirmed。
+      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 列出 1…N 句整理句后，只引导点击【确认】一次全部写入；FORBIDDEN 同时开问下一空槽；FORBIDDEN 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
      - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
      - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
@@ -11809,6 +11833,13 @@ Rules:
          GOOD: "It is widely acknowledged that... -> 形式主语 It 引出客观陈述，主语从句放真正主语"
       5. Each prompt MUST strictly follow this single-line format:
          "English academic pattern with ... only -> Chinese explanation of structure (主谓/修饰/连接，不要写具体译词)"
+      6. Also provide "highlights": an array of Chinese substrings to mark in the concept for learner scaffolding:
+         - Mark EVERY subject-verb-(object) set you can identify (not only the main clause).
+         - Do NOT mark conjunctions / logical linkers (尽管/但/由于/通过… etc.) — only S/V/O content words.
+         - Each item: { "text": exact substring of concept, "role": "S"|"V"|"O", "tier": "core"|"subordinate" }
+         - tier=core: the ONE logical main-clause S/V/O set (brightest + underline in UI). Prefer the half after 但/但是/然而 or after 从长远来看/总体上 when present.
+         - tier=subordinate: S/V/O belonging to other clauses (e.g. inside 尽管…).
+         - Do NOT invent words; every "text" MUST appear verbatim in concept. Keep spans short (words/phrases, not whole clauses).
 
       Format output as JSON:
       {
@@ -11816,7 +11847,10 @@ Rules:
           {
             "id": "string (matching Task ID)",
             "concept": "string (EXACT matching Target Chinese Sentence)",
-            "prompts": ["string", "string", "string"]
+            "prompts": ["string", "string", "string"],
+            "highlights": [
+              { "text": "string", "role": "S|V|O", "tier": "core|subordinate" }
+            ]
           }
         ]
       }
@@ -11826,7 +11860,7 @@ Rules:
         contents: prompt,
         config: {
           systemInstruction:
-            "You are an expert IELTS Lexical Resource Tutor. All output properties called 'concept' MUST be written strictly and entirely in Chinese. For 'prompts', English patterns must use ONLY '...' placeholders—never square brackets, never filled-in content words from the concept. Each prompt must contain '->' followed by Chinese structural guidance (主谓/修饰/连接).",
+            "You are an expert IELTS Lexical Resource Tutor. All output properties called 'concept' MUST be written strictly and entirely in Chinese. For 'prompts', English patterns must use ONLY '...' placeholders—never square brackets, never filled-in content words from the concept. Each prompt must contain '->' followed by Chinese structural guidance (主谓/修饰/连接). For 'highlights', every text must be an exact Chinese substring of concept; mark all S/V/O sets only (no conjunctions); main-clause set uses tier=core.",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -11842,8 +11876,20 @@ Rules:
                       type: Type.ARRAY,
                       items: { type: Type.STRING },
                     },
+                    highlights: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          text: { type: Type.STRING },
+                          role: { type: Type.STRING },
+                          tier: { type: Type.STRING },
+                        },
+                        required: ["text", "role", "tier"],
+                      },
+                    },
                   },
-                  required: ["id", "concept", "prompts"],
+                  required: ["id", "concept", "prompts", "highlights"],
                 },
               },
             },
@@ -11889,7 +11935,107 @@ Rules:
         return result.slice(0, 3);
       };
 
+      type HighlightRole = "S" | "V" | "O";
+      type HighlightTier = "core" | "subordinate";
+      type ConceptHighlight = {
+        start: number;
+        end: number;
+        role: HighlightRole;
+        tier: HighlightTier;
+      };
+
+      const sanitizeHighlights = (
+        concept: string,
+        raw: unknown,
+      ): ConceptHighlight[] => {
+        if (!Array.isArray(raw) || !concept) return [];
+        const occupied: boolean[] = Array(concept.length).fill(false);
+        const out: ConceptHighlight[] = [];
+        const tierRank = (t: HighlightTier) => (t === "core" ? 0 : 1);
+
+        const candidates = raw
+          .map((item: any) => {
+            const text = String(item?.text || "").trim();
+            const roleRaw = String(item?.role || "")
+              .trim()
+              .toUpperCase();
+            const tierRaw = String(item?.tier || "")
+              .trim()
+              .toLowerCase();
+            let role: HighlightRole | null = null;
+            if (roleRaw === "S" || roleRaw === "SUBJECT") role = "S";
+            else if (roleRaw === "V" || roleRaw === "VERB" || roleRaw === "PREDICATE")
+              role = "V";
+            else if (roleRaw === "O" || roleRaw === "OBJECT") role = "O";
+            // Drop conjunction / connector roles entirely.
+            if (
+              roleRaw === "CONJ" ||
+              roleRaw === "CONNECTOR" ||
+              roleRaw === "LINK"
+            ) {
+              return null;
+            }
+            let tier: HighlightTier | null = null;
+            if (tierRaw === "core" || tierRaw === "main") tier = "core";
+            else if (
+              tierRaw === "subordinate" ||
+              tierRaw === "sub" ||
+              tierRaw === "secondary"
+            ) {
+              tier = "subordinate";
+            }
+            // Ignore connector tier from older model outputs.
+            if (
+              tierRaw === "connector" ||
+              tierRaw === "conj" ||
+              tierRaw === "linker"
+            ) {
+              return null;
+            }
+            if (!text || !role || !tier) return null;
+            if (text.length > Math.min(24, concept.length)) return null;
+            return { text, role, tier };
+          })
+          .filter(Boolean) as Array<{
+          text: string;
+          role: HighlightRole;
+          tier: HighlightTier;
+        }>;
+
+        // Resolve core first so main-clause spans win overlapping claims.
+        candidates.sort((a, b) => tierRank(a.tier) - tierRank(b.tier));
+
+        for (const c of candidates) {
+          let from = 0;
+          let placed = false;
+          while (from <= concept.length - c.text.length) {
+            const idx = concept.indexOf(c.text, from);
+            if (idx < 0) break;
+            const end = idx + c.text.length;
+            let overlap = false;
+            for (let i = idx; i < end; i += 1) {
+              if (occupied[i]) {
+                overlap = true;
+                break;
+              }
+            }
+            if (!overlap) {
+              for (let i = idx; i < end; i += 1) occupied[i] = true;
+              out.push({ start: idx, end, role: c.role, tier: c.tier });
+              placed = true;
+              break;
+            }
+            from = idx + 1;
+          }
+          if (!placed) continue;
+        }
+
+        out.sort((a, b) => a.start - b.start || a.end - b.end);
+        return out;
+      };
+
       const promptsById = new Map<string, string[]>();
+      const highlightsById = new Map<string, unknown>();
       llmTasks.forEach((task: any, index: number) => {
         const id = normalizeText(task?.id);
         const prompts = Array.isArray(task?.prompts)
@@ -11901,6 +12047,10 @@ Rules:
         if (prompts.length > 0 && !promptsById.has(`__index_${index}`)) {
           promptsById.set(`__index_${index}`, prompts);
         }
+        if (id) highlightsById.set(id, task?.highlights);
+        if (!highlightsById.has(`__index_${index}`)) {
+          highlightsById.set(`__index_${index}`, task?.highlights);
+        }
       });
 
       const mergedTasks = inputElements.map((el, index) => {
@@ -11909,12 +12059,17 @@ Rules:
           promptsById.get(`__index_${index}`) ||
           [];
         const prompts = sanitizePrompts(matchedPrompts);
+        const highlights = sanitizeHighlights(
+          el.chineseText,
+          highlightsById.get(el.id) ?? highlightsById.get(`__index_${index}`),
+        );
 
         return {
           id: el.id,
           concept: el.chineseText,
           section: inferSection(el.id),
           prompts,
+          highlights,
           confirmed: false,
           confirmedSentence: "",
         };
@@ -12141,7 +12296,16 @@ Rules:
   // 11. API - Inline guidance (selected text or whole sentence)
   app.post("/api/inline-guidance", async (req, res) => {
     try {
-      const { scopeText, fullDraft, concept, prompts, intent, questionText } = req.body;
+      const {
+        scopeText,
+        fullDraft,
+        concept,
+        prompts,
+        intent,
+        questionText,
+        guidanceHistory,
+        highlights,
+      } = req.body;
       const normalizedScopeText = String(scopeText || "").trim();
       const normalizedFullDraft = String(fullDraft || "").trim();
       const normalizedIntent = String(intent || "").trim();
@@ -12159,10 +12323,43 @@ Rules:
       }
 
       const ai = getAI();
+      const isStartSentence = normalizedIntent === "start_sentence";
       const isLeftQuickAsk =
         !normalizedScopeText &&
-        (normalizedIntent === "find_word" ||
-          normalizedIntent === "start_sentence");
+        (normalizedIntent === "find_word" || isStartSentence);
+
+      const historyLines = Array.isArray(guidanceHistory)
+        ? guidanceHistory
+            .slice(-12)
+            .map((item: any) => {
+              const role = String(item?.role || "").trim() || "user";
+              const text = String(
+                item?.text || item?.hint || item?.label || item?.issue || "",
+              ).trim();
+              if (!text) return "";
+              return `${role}: ${text}`;
+            })
+            .filter(Boolean)
+            .join("\n")
+        : "";
+
+      const highlightSummary = Array.isArray(highlights)
+        ? highlights
+            .slice(0, 24)
+            .map((h: any) => {
+              const text =
+                String(h?.text || "").trim() ||
+                (typeof h?.start === "number" &&
+                typeof h?.end === "number" &&
+                String(concept || "").slice(h.start, h.end));
+              const role = String(h?.role || "").trim();
+              const tier = String(h?.tier || "").trim();
+              if (!text) return "";
+              return `${tier}/${role}:"${text}"`;
+            })
+            .filter(Boolean)
+            .join("; ")
+        : "";
 
       const prompt = `
         You are an IELTS writing coach.
@@ -12185,6 +12382,12 @@ Rules:
 
         Suggested structural patterns:
         ${JSON.stringify(Array.isArray(prompts) ? prompts : [])}
+
+        Concept highlights already shown in UI (tier/role:"text"):
+        ${highlightSummary || "(none)"}
+
+        Prior guidance thread for THIS sentence (oldest → newest; can be empty):
+        ${historyLines || "(empty)"}
 
         Classify the user's help need into one of:
         - "vocabulary"
@@ -12209,15 +12412,33 @@ Rules:
         4. issue/hint MUST be plain Chinese with learner-friendly wording (IELTS 5-5.5 level), avoid heavy grammar jargon.
         5. Keep it short and practical.
 ${
-  isLeftQuickAsk
+  isLeftQuickAsk && !isStartSentence
     ? `
-        EXTRA — LEFT-PANEL QUICK ASK (intent is find_word or start_sentence, no selected scope):
+        EXTRA — LEFT-PANEL QUICK ASK (intent is find_word, no selected scope):
         - ULTRA COMPACT. No greetings, no restating the Chinese concept, no "你可以试试", no filler.
         - issue: leave as "" OR one short clause (≤12 Chinese characters). Prefer "".
         - hint: ONLY the actionable core.
           * find_word / vocabulary: list 1-3 candidates like \`word\` 短注; max ~40 Chinese chars total notes.
-          * start_sentence / expression: ≤2 short sentences on how to open; no full sample sentence.
         - Do NOT write diagnosis essays. Density over politeness.
+`
+    : ""
+}
+${
+  isStartSentence
+    ? `
+        EXTRA — 「我不会起步」SOCRATIC START SCAFFOLD (intent=start_sentence):
+        Run a 3-step startup scaffold. Use the prior guidance thread to infer the current step; advance one step per turn. Ask EXACTLY ONE question per turn.
+        Steps:
+        1) 拆部分: Help the student see the Chinese concept as 2–3 parts (main assertion vs concession / means / time). Point at the UI highlights if useful (core = brightest underlined main S/V/O; lighter = other clauses). Do NOT translate the whole sentence.
+        2) 先写哪部分: Tell them to write ONLY the core main-clause idea first (the brightest highlighted set). Defer concession/means/time.
+        3) 怎么选结构: For the part they should write NOW, give ONE English shell with "..." placeholders only, and ask them to fill the subject or verb first. No full sample sentence.
+        Rules:
+        - category MUST be "expression".
+        - issue: "" or ≤12 Chinese chars progress tag like "先定主句".
+        - hint: 2–4 short Chinese sentences max; end with ONE clear question.
+        - Never output a complete English translation of the concept.
+        - If the current draft already covers the main clause, skip ahead to attaching the next part (e.g. by / Although).
+        - If this is the first turn (empty history), start at step 1.
 `
     : ""
 }
