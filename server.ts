@@ -13,6 +13,7 @@ import {
   normalizeStep3Status,
   computeSubpointFrameworkSignature,
   computeEssayFrameworkSignature,
+  resolveFrameworkThemeKey,
   resolveArgumentRelation,
   getRequiredBeatsForRelation,
   ARGUMENT_RELATION_BEATS,
@@ -29,8 +30,17 @@ import {
   parsePlannerResponse,
   runMechanicalQa,
   normalizePlannerBodyPlans,
+  buildPendingDraftsFromFullSubClaims,
+  demoteThemeHeadSubClaims,
   prefillClaimSlotsFromSubClaims,
 } from "./src/server/planner/planner";
+import { isClaimSentence, CLAIM_SLOT_LABEL_RE } from "./src/utils/step3ClaimPrefill";
+import {
+  activePoints,
+  missingBucketCoachHint,
+  normalizeStep2PlannerPayload,
+  plannerPayloadFingerprint,
+} from "./src/server/step2/planner-payload";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
 import { log } from "./src/server/logger";
@@ -145,7 +155,105 @@ function safeOverridePart1(text: string): string {
   return "好的，这部分内容我已经记下了。";
 }
 
-function fallbackNextStep(stepNum: number, session: any): string {
+/**
+ * Content-aware Step2 Part-2 fallback: ask for whatever is actually missing
+ * (thin points / pending dimensions / coverage buckets / stance), never the
+ * legacy "A面发散" template.
+ */
+function buildStep2ContentAwareFallback(
+  session: any,
+  step2Data?: any,
+): string {
+  const eval2 = session?.step2?.coachEvaluation || {};
+  const step2 = step2Data && typeof step2Data === "object" ? step2Data : {};
+  const payload =
+    step2.plannerPayload ||
+    eval2.plannerPayload ||
+    session?.step2?.plannerPayload ||
+    null;
+  const stage = String(
+    step2.currentStage ||
+      eval2.currentStage ||
+      session?.step2?.currentStage ||
+      "explore_A",
+  ).trim();
+  const missing: string[] = Array.isArray(payload?.coverage?.missingBuckets)
+    ? payload.coverage.missingBuckets
+    : [];
+  const blockReason = String(payload?.exitGate?.blockReason || "").trim();
+  const stanceText = String(
+    payload?.stance?.text ||
+      step2.userStance ||
+      eval2.userStance ||
+      session?.step2?.userStance ||
+      "",
+  ).trim();
+  const requiresStance =
+    step2.requiresStance !== false &&
+    payload?.requiresStance !== false &&
+    eval2.requiresStance !== false;
+  const points = activePoints(payload);
+  const thin = points.filter((p) => p.quality !== "ready");
+  const ready = points.filter((p) => p.quality === "ready");
+  const dispositions =
+    step2.dimensionDispositions ||
+    eval2.dimensionDispositions ||
+    payload?.dimensionDispositions ||
+    [];
+  const pendingDims = Array.isArray(dispositions)
+    ? dispositions
+        .filter((d: any) => String(d?.disposition || "").trim() === "pending")
+        .map((d: any) =>
+          String(d?.dimension || "")
+            .replace(/（[^）]*）/g, "")
+            .trim(),
+        )
+        .filter(Boolean)
+    : [];
+
+  // 1) Named thin point — most actionable
+  if (thin.length > 0) {
+    const claim = String(thin[0].claim || "").trim() || "这个论点";
+    return `「${claim}」目前还偏薄：请补 1–2 句具体场景、机制或受影响对象，方便写成可展开的论据。`;
+  }
+
+  // 2) Pending Step1 dimensions
+  if (pendingDims.length > 0) {
+    const label = pendingDims.slice(0, 2).join("、");
+    return `还有维度尚未处理（${label}）：请选一个展开成具体主张，或明确说「合并进已有点 / 放下不用」。`;
+  }
+
+  // 3) Missing coverage buckets
+  if (missing.length > 0) {
+    return missingBucketCoachHint(missing as any);
+  }
+
+  // 4) Need more ready points
+  if (ready.length < 2) {
+    if (blockReason) return `${blockReason}。请直接补充可写的具体主张。`;
+    return "材料还不够写满两处论据：请再给出 1 个具体主张，并带上场景、机制或受影响对象。";
+  }
+
+  // 5) Materials enough — stance / summary
+  if (requiresStance && !stanceText) {
+    return "材料已基本齐了。结合已有论据强弱，你更倾向完全同意、部分同意（带让步），还是不同意？直接说一个即可。";
+  }
+  if (stage === "stance" || (requiresStance && stanceText && stage !== "summary")) {
+    return `目前立场是「${stanceText.slice(0, 40)}」。这个方向符合你的本意吗？确认后我们整理材料池并进入下一步。`;
+  }
+  if (stage === "summary" || (stanceText && ready.length >= 2)) {
+    return "材料池和立场已经齐了。若没有要改的点，请确认进入下一步；若要改，直接指出要调整的论点或立场。";
+  }
+
+  if (blockReason) return `${blockReason}？`;
+  return "请再补充 1 个具体可写主张（含场景、机制或受影响对象），或告诉我目前材料已经够用了。";
+}
+
+function fallbackNextStep(
+  stepNum: number,
+  session: any,
+  step2Data?: any,
+): string {
   if (stepNum === 1) {
     const eval1 = session?.step1?.coachEvaluation || {};
     if (!eval1.correctType) {
@@ -161,23 +269,7 @@ function fallbackNextStep(stepNum: number, session: any): string {
   }
 
   if (stepNum === 2) {
-    const stage =
-      session?.step2?.coachEvaluation?.currentStage ||
-      session?.step2?.currentStage ||
-      "explore_A";
-    if (stage === "explore_A") {
-      return "我们先完成 A 面发散：请给出 1-2 个支持 A 面的具体论据，并说明每个论据对应的受益对象。";
-    }
-    if (stage === "explore_B") {
-      return "继续补齐 B 面：请给出 1-2 个 B 面不可替代的点，并尽量和刚才 A 面形成可对照关系。";
-    }
-    if (stage === "stance") {
-      return "现在请明确你的全文立场（支持/反对/部分同意），并用一句话说明“为什么这个立场最能回应题目限定”。";
-    }
-    if (stage === "summary") {
-      return "请确认最终蓝图：你的 Body 1 和 Body 2 分别打算写什么核心分论点？每个分论点给出一句可展开的中心句。";
-    }
-    return "请基于目前讨论，给出“全文立场 + 两个主体段分论点”的简版草图，我来帮你即时校准逻辑闭环。";
+    return buildStep2ContentAwareFallback(session, step2Data);
   }
 
   if (stepNum === 3) {
@@ -226,17 +318,26 @@ function fallbackNextStep(stepNum: number, session: any): string {
   return "我们继续下一步：请基于当前内容补充一个最具体、最可展开的论证点。";
 }
 
-function fallbackStep2QuestionForStage(stage: string): string {
-  if (stage === "explore_A") {
-    return "我们先完成 A 面发散：请给出 1-2 个支持 A 面的具体论据，并说明每个论据对应的受益或受影响对象。";
+function fallbackStep2QuestionForStage(
+  stage: string,
+  missingBuckets: string[] = [],
+  session?: any,
+  step2Data?: any,
+): string {
+  // Prefer gap-specific ask whenever we have payload/session context
+  if (session || step2Data) {
+    return buildStep2ContentAwareFallback(session, step2Data);
   }
   if (stage === "explore_B") {
-    return "接下来只补真正缺失的 B 面内容：请给出一个尚未覆盖、且能与 A 面形成对照的具体论据。";
+    return missingBucketCoachHint(missingBuckets as any);
   }
   if (stage === "stance") {
-    return "结合前面两面的材料强弱，我会给出一个最容易自洽的推荐立场和理由；你确认这个方向符合你的本意吗？";
+    return "结合已有材料强弱，我会给出一个最容易自洽的推荐立场和理由；你确认这个方向符合你的本意吗？";
   }
-  return "请基于目前讨论，确认下一步还缺少的内容。";
+  if (stage === "summary") {
+    return "材料池若已确认，可以直接进入下一步；若要改论点或立场，请直接指出。";
+  }
+  return "请再补充 1 个具体可写主张（含场景、机制或受影响对象），或告诉我目前材料已经够用了。";
 }
 
 /** Extract A面/B面 section text from explore-stage userPoints. */
@@ -563,7 +664,11 @@ function buildQuestionBrief(question: string, knownType?: string): QuestionBrief
     taskMap = { explore_A: "优点/利", explore_B: "缺点/弊" };
   } else if (questionType === "Agree / Disagree") {
     writingDestination = "明确同意/不同意程度，并用论据支撑";
-    taskMap = { explore_A: "支持己方立场的论据", explore_B: "对立面/让步面论据" };
+    // explore_B = fill missing coverage buckets (not a forced opposing side)
+    taskMap = {
+      explore_A: "主论据平行展开",
+      explore_B: "补齐缺失材料类别（若有）",
+    };
   } else if (questionType === "Other") {
     writingDestination = "按题目实际设问完成写作任务（非标准题型）";
     taskMap = { explore_A: "第一核心任务", explore_B: "第二核心任务（若有）" };
@@ -696,6 +801,7 @@ function computeStep2SourceHash(session: any, question: string): string {
   const body2 = String(
     bodies[1]?.content || bodies[1]?.title || blueprint.body2 || "",
   ).trim();
+  const payloadFp = plannerPayloadFingerprint(eval2.plannerPayload);
   const payload = [
     String(question || "").trim(),
     String(eval2.currentStage || session?.step2?.currentStage || "").trim(),
@@ -704,9 +810,163 @@ function computeStep2SourceHash(session: any, question: string): string {
     String(blueprint.position || eval2.suggestedStance || "").trim(),
     body1,
     body2,
+    payloadFp,
     session?.step2?.isCompleted ? "1" : "0",
   ].join("\n");
   return stableHash(payload);
+}
+
+/**
+ * Explore is finished only when there is enough parallel material (or student
+ * signals exhaustion) AND no Step1 dimension is still pending.
+ * Empty coverage buckets alone must NOT unlock stance.
+ */
+function isStep2ExploreDone(args: {
+  payload: any;
+  step2Data?: any;
+  session?: any;
+  userMessage?: string;
+}): boolean {
+  const readyCount = activePoints(args.payload).filter(
+    (p) => p.quality === "ready",
+  ).length;
+  const exhausted =
+    typeof args.userMessage === "string" &&
+    studentSignalsExhausted(args.userMessage);
+  if (readyCount < 2 && !exhausted) return false;
+
+  const dispositions =
+    args.step2Data?.dimensionDispositions ||
+    args.session?.step2?.coachEvaluation?.dimensionDispositions ||
+    args.payload?.dimensionDispositions ||
+    [];
+  if (Array.isArray(dispositions) && dispositions.length > 0) {
+    const pending = dispositions.some(
+      (d: any) => String(d?.disposition || "").trim() === "pending",
+    );
+    if (pending) return false;
+  }
+  return true;
+}
+
+/**
+ * Normalize Step2 → Planner payload every turn; stamp onto step2Data.
+ * Also advances/skips explore_B when coverage buckets are already filled.
+ * Hard rule: never enter stance/summary until explore is done.
+ */
+function applyStep2PlannerPayloadNormalize(
+  question: string,
+  data: any,
+  session: any,
+  userMessage?: string,
+): void {
+  if (!data?.progressUpdate || typeof data.progressUpdate !== "object") return;
+  if (
+    !data.progressUpdate.step2Data ||
+    typeof data.progressUpdate.step2Data !== "object"
+  ) {
+    data.progressUpdate.step2Data = {};
+  }
+  const step2 = data.progressUpdate.step2Data;
+  const knownType =
+    String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+    String(session?.step1?.boardOverrides?.questionType || "").trim() ||
+    undefined;
+  const brief = buildQuestionBrief(question, knownType);
+
+  const exhausted =
+    typeof userMessage === "string" && studentSignalsExhausted(userMessage);
+  const forceExitUsed = Boolean(
+    exhausted ||
+      step2.plannerPayload?.exitGate?.forceExitUsed ||
+      session?.step2?.coachEvaluation?.plannerPayload?.exitGate?.forceExitUsed,
+  );
+
+  const prevFp = plannerPayloadFingerprint(
+    session?.step2?.coachEvaluation?.plannerPayload,
+  );
+
+  const payload = normalizeStep2PlannerPayload({
+    session: {
+      ...session,
+      step2: {
+        ...session?.step2,
+        coachEvaluation: {
+          ...(session?.step2?.coachEvaluation || {}),
+          ...step2,
+        },
+      },
+    },
+    step2Data: step2,
+    questionType: brief.questionType,
+    requiresStance: brief.requiresStance,
+    forceExitUsed,
+  });
+
+  step2.plannerPayload = payload;
+  // Never keep English polished points in the material contract
+  step2.suggestedPoints = "";
+  // Mirror coverage into legacy check fields for UI
+  if (payload.coverage) {
+    step2.coverageCheckPassed = payload.coverage.passed;
+    step2.coverageCheckDesc = payload.exitGate.blockReason
+      ? payload.exitGate.blockReason
+      : payload.coverage.passed
+        ? "材料类别已覆盖题型硬性要求"
+        : "材料类别尚未齐备";
+  }
+
+  let stage = String(
+    step2.currentStage ||
+      session?.step2?.coachEvaluation?.currentStage ||
+      "explore_A",
+  ).trim();
+
+  const missing = payload.coverage?.missingBuckets || [];
+  const readyCount = activePoints(payload).filter(
+    (p) => p.quality === "ready",
+  ).length;
+  const exploreDone = isStep2ExploreDone({
+    payload,
+    step2Data: step2,
+    session,
+    userMessage,
+  });
+
+  // explore_B = fill buckets only. No missing buckets ≠ stance unlocked.
+  if (stage === "explore_A" && readyCount >= 1 && missing.length > 0) {
+    stage = "explore_B";
+    step2.currentStage = stage;
+  } else if (stage === "explore_A" && missing.length === 0 && exploreDone) {
+    stage = brief.requiresStance ? "stance" : "summary";
+    step2.currentStage = stage;
+    console.warn(
+      `[Step2Payload] Explore done (no missing buckets) → stage=${stage}`,
+    );
+  } else if (stage === "explore_B" && missing.length === 0 && exploreDone) {
+    stage = brief.requiresStance ? "stance" : "summary";
+    step2.currentStage = stage;
+    console.warn(
+      `[Step2Payload] Explore done after coverage filled → stage=${stage}`,
+    );
+  } else if (
+    (stage === "stance" || stage === "summary") &&
+    !exploreDone
+  ) {
+    // Model jumped ahead — clamp back until explore finishes.
+    stage = missing.length > 0 ? "explore_B" : "explore_A";
+    step2.currentStage = stage;
+    console.warn(
+      `[Step2Payload] Blocked early stance/summary → clamped to ${stage} (ready=${readyCount})`,
+    );
+  }
+
+  // Invalidate step2_5 when materials changed
+  const nextFp = plannerPayloadFingerprint(payload);
+  if (prevFp && nextFp && prevFp !== nextFp && session?.step2_5) {
+    session.step2_5 = { ...session.step2_5, status: "stale" };
+    console.warn("[Step2Payload] plannerPayload changed → step2_5 marked stale");
+  }
 }
 
 function buildStep2Digest(session: any, question: string): any {
@@ -2221,6 +2481,71 @@ function findFirstEmptyPlanStep(plan: any): PendingPlanStep | null {
   return null;
 }
 
+/**
+ * Ensure each pointBlock starts with a claim-type slot (分论点/核心观点).
+ * Prevents kickoff firstEmpty from jumping to 展开原因 while 论点 never exists.
+ */
+function ensureLeadingClaimSlot(plan: any): void {
+  if (!plan || !Array.isArray(plan.pointBlocks)) return;
+  for (let bi = 0; bi < plan.pointBlocks.length; bi++) {
+    const block = plan.pointBlocks[bi];
+    if (!Array.isArray(block.steps)) block.steps = [];
+    const claimIdx = block.steps.findIndex((s: any) =>
+      CLAIM_SLOT_LABEL_RE.test(String(s?.label || "")),
+    );
+    if (claimIdx < 0) {
+      const bid = String(block.id || `pb${bi + 1}`);
+      block.steps.unshift({
+        key: `${bid}_claim`,
+        label: "分论点",
+        placeholder: "用一句话写出本段核心主张",
+        value: "",
+        status: "",
+      });
+    } else if (claimIdx > 0) {
+      const [claimStep] = block.steps.splice(claimIdx, 1);
+      block.steps.unshift(claimStep);
+    }
+  }
+}
+
+/**
+ * Confirm when the beat text is complete enough (not a thin slogan).
+ * Default path: expand with Step2 material as question seed.
+ * Student-utterance polish: lower bar; longer multi-clause chains are welcome.
+ * Step2-only polish: still needs substance and low overlap with confirmed siblings.
+ */
+function isEspeciallyCompleteConfirmText(
+  text: string,
+  plan: any,
+  key: string,
+  blockIndex: number,
+  options?: { fromStudentUtterance?: boolean; isClaimSlot?: boolean },
+): boolean {
+  const t = String(text || "").trim();
+  if (t.length < 12) return false;
+  const hard = hardRejectSlotText(t, plan, key, blockIndex);
+  if (!hard.ok) return false;
+  if (options?.isClaimSlot && !isClaimSentence(t)) return false;
+
+  if (options?.fromStudentUtterance) {
+    // Preserve rich student chains; do not reject for being "too long".
+    return options?.isClaimSlot ? isClaimSentence(t) : t.length >= 14;
+  }
+
+  // Step2 / coach-only organize: must be substantive and non-redundant
+  if (t.length < 28) return false;
+  const siblings = collectConfirmedSiblingValues(
+    plan,
+    Number.isFinite(blockIndex) ? blockIndex : -1,
+    key,
+  );
+  for (const s of siblings) {
+    if (overlapRatio(t, s) >= 0.42) return false;
+  }
+  return true;
+}
+
 /** Ask text for the first unconfirmed step: confirm existing draft, or fill empty. */
 function buildStep3PendingAsk(
   pending: PendingPlanStep | null,
@@ -3479,7 +3804,10 @@ function stripStep3KickoffDumpBlocks(text: string): string {
  */
 function salvageStep3KickoffAskText(rawText: string, label: string): string {
   const L = String(label || "当前这一环").trim() || "当前这一环";
-  const soft = `我们开始。\n\n---\n\n请先用你自己的话写「${L}」。`;
+  const isClaimLabel = CLAIM_SLOT_LABEL_RE.test(L);
+  const soft = isClaimLabel
+    ? `我们开始。\n\n---\n\n主题词还不是论点。请用一句完整的话写出本段「${L}」（可以说清楚对象与结果；不要用「为什么」先跳到原因）。`
+    : `我们开始。\n\n---\n\n请先用你自己的话写「${L}」。`;
   const cleaned = stripStep3EnglishTranslationShow(
     stripStep3MetaProcessPhrases(stripStep3KickoffDumpBlocks(rawText)),
   );
@@ -3753,8 +4081,24 @@ function resolvePostAffirmNextSlotPending(
 
   if (candidate.length < 4) return null;
 
-  const hard = hardRejectSlotText(candidate, plan, stageKey, stageBlock);
-  if (!hard.ok) return null;
+  // Must stay on firstEmpty — do not stage a later slot while earlier is empty.
+  if (stageKey !== emptyKey) {
+    stageKey = emptyKey;
+    stageLabel = emptyLabel;
+    stageBlock = empty.blockIndex;
+    stageStep = empty.stepIndex;
+  }
+
+  const isClaimSlot = CLAIM_SLOT_LABEL_RE.test(String(emptyStep?.label || ""));
+  // Post-affirm next beat from Step2 polish: only if especially complete.
+  if (
+    !isEspeciallyCompleteConfirmText(candidate, plan, stageKey, stageBlock, {
+      isClaimSlot,
+      fromStudentUtterance: false,
+    })
+  ) {
+    return null;
+  }
 
   return {
     key: stageKey,
@@ -3986,20 +4330,88 @@ function applyLabeledPendingEdits(
   return { next, touched };
 }
 
+/**
+ * Pull the coach's reorganized confirm sentence from chat text
+ * (e.g. 「我为你重新整理了这一步：**……**」).
+ */
+function extractReorganizedConfirmSentence(text: string): string {
+  const t = String(text || "");
+  const patterns = [
+    /重新整理了?(?:了)?(?:这一[步环句]|这句|如下)?[^「"“*\n]{0,24}[：:]?\s*\*{0,2}[「"“]?([^」"”*\n]{8,220})/,
+    /整理成了?(?:一句|如下)?[^「"“*\n]{0,24}[：:]?\s*\*{0,2}[「"“]?([^」"”*\n]{8,220})/,
+    /\*\*[「"“]([^」"”]{8,220})[」"”]\*\*/,
+    /\*\*([^*「」\n]{8,220})\*\*/,
+    /[「"“]([^」"”]{8,220})[」"”]/,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (!m?.[1]) continue;
+    const s = String(m[1] || "")
+      .replace(/\*\*/g, "")
+      .replace(/^[「"“]+|[」"”]+$/g, "")
+      .replace(/[。．]\s*$/, (x) => x.trim())
+      .trim();
+    if (s.length >= 8 && !/^(对|是的|没问题|合适吗|确认)$/.test(s)) {
+      return s;
+    }
+  }
+  return "";
+}
+
+/**
+ * When the student revises a pending slot, prefer the coach's polished
+ * confirm sentence over the raw labeled-edit fragment (which used to leak
+ * into kickoffPendingDrafts → right board → affirm write).
+ */
+function preferPolishedPendingFromCoachText(
+  coachText: string,
+  pendingText: string,
+  userMessage: string,
+): string {
+  const pending = String(pendingText || "").trim();
+  const polished = extractReorganizedConfirmSentence(coachText);
+  if (polished.length < 8) return pending;
+  if (polished === pending) return pending;
+
+  const msg = String(userMessage || "").trim();
+  const labeledBody = (() => {
+    const m = msg.match(/[^：:\n]{1,32}\s*[:：]\s*(.+)$/);
+    return String(m?.[1] || "").trim();
+  })();
+  const pendingLooksLikeRawEdit =
+    (!!labeledBody &&
+      (pending === labeledBody ||
+        labeledBody.includes(pending) ||
+        pending.includes(labeledBody))) ||
+    (pending.length >= 4 &&
+      msg.includes(pending) &&
+      polished.length > pending.length + 4);
+
+  const coachHasPolishNotPending =
+    /重新整理|整理成了/.test(coachText) &&
+    coachText.includes(polished) &&
+    !coachText.includes(pending);
+
+  if (pendingLooksLikeRawEdit || coachHasPolishNotPending) {
+    return polished;
+  }
+  return pending;
+}
+
 function buildContinuousConfirmAsk(pending: KickoffPendingDraft[]): string {
   if (!pending.length) {
-    return "请先用一句话写出当前这一环，说清楚后我们再确认写入右侧。";
+    return "请先把当前这一环说清楚（逻辑通顺即可），说清楚后我们再确认写入右侧。";
   }
   if (pending.length === 1) {
     return (
-      `我已经将你的意思整理成了一句简单明了的话：\n` +
+      `我按你的逻辑整理如下（关联紧密的多层可写在一起，未刻意删减）：\n` +
       `${pending[0].text}\n\n` +
-      `如果你觉得这句话符合你的意思，请点击下方的【确认】按钮写入看板。`
+      `如果你觉得符合你的意思，请点击下方的【确认】按钮写入看板。`
     );
   }
   const lines = pending.map((d, i) => `${i + 1}. ${d.text}`);
   return (
-    `我根据你刚说的整理了这几句：\n\n${lines.join("\n")}\n\n` +
+    `我根据你刚说的、按不同论证环节整理如下：\n\n${lines.join("\n")}\n\n` +
     `如果你觉得符合你的意思，请点击下方的【确认】按钮全部写入看板。`
   );
 }
@@ -5733,7 +6145,6 @@ function collectStep2EvidenceCorpus(step2Data: any, session: any): string {
   const eval2 = session?.step2?.coachEvaluation || {};
   const parts: string[] = [
     String(step2Data?.userPoints || eval2.userPoints || session?.step2?.userPoints || ""),
-    String(step2Data?.suggestedPoints || eval2.suggestedPoints || ""),
     String(step2Data?.critique || eval2.critique || ""),
   ];
   const clustering = step2Data?.clustering || eval2.clustering;
@@ -6115,8 +6526,8 @@ function enforceStep3LogicCompletion(
  * Step 3 confirm-then-write state machine (LLM ask+eval / server write+flow):
  * 1) Freeze confirmed slots; clear all unconfirmed (ignore model prefill).
  * 2) Pending from validated step3SlotEval.pendingText (1 slot) or pendingDrafts
- *    (≥2 consecutive same-block) after a substantive student utterance
- *    (kickoff never stages confirm — no LLM-complete-then-confirm).
+ *    (≥2 consecutive same-block). Material from Step2/Planner may be organized
+ *    into pending for confirm (including kickoff) — NEVER silent-write slots.
  * 3) Affirm → commitPendingOnAffirm; keep model next ask unless illegal.
  * 4) Board is truth: illegal dump / fake-complete text is fully vetoed to a short
  *    firstEmpty ask (safety net — not the primary coach voice).
@@ -6132,10 +6543,25 @@ function enforceStep3LogicCompletionInner(
   let plan = data.progressUpdate.paragraphPlan;
   const storedFrameworkSig = String(activeSp?.frameworkSignature || "").trim();
   const currentFrameworkSig = computeSubpointFrameworkSignature(activeSp, session);
+  // Legacy stored sigs embedded claim-sentence `content` in segment[1]. That is
+  // runtime board state, not a Planner framework change — still merge the board.
+  const signatureDriftIsClaimContentOnly = (() => {
+    if (!storedFrameworkSig || !currentFrameworkSig) return false;
+    if (storedFrameworkSig === currentFrameworkSig) return false;
+    const a = storedFrameworkSig.split("::");
+    const b = currentFrameworkSig.split("::");
+    if (a.length !== b.length || a.length < 2) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (i === 1) continue;
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  })();
   const frameworkDrifted =
     !!storedFrameworkSig &&
     !!currentFrameworkSig &&
-    storedFrameworkSig !== currentFrameworkSig;
+    storedFrameworkSig !== currentFrameworkSig &&
+    !signatureDriftIsClaimContentOnly;
 
   let prevPlan =
     activeSp?.paragraphPlan && !frameworkDrifted
@@ -6144,6 +6570,10 @@ function enforceStep3LogicCompletionInner(
   if (frameworkDrifted) {
     console.warn(
       `[Step3FrameworkGuard] Framework signature changed (${storedFrameworkSig} -> ${currentFrameworkSig}); refusing to merge stale paragraphPlan.`,
+    );
+  } else if (signatureDriftIsClaimContentOnly) {
+    console.warn(
+      `[Step3FrameworkGuard] Ignoring claim/content-only signature drift (theme=${resolveFrameworkThemeKey(activeSp) || "—"}); merging board.`,
     );
   }
 
@@ -6227,38 +6657,143 @@ function enforceStep3LogicCompletionInner(
     data.progressUpdate.step3SlotEval = slotEval;
   }
 
-  // --- Hidden kickoff: never stage confirm; sanitize dump but keep model ask ---
+  // --- Hidden kickoff: claim slot first; default expand with material seed ---
+  // Confirm only when firstEmpty is 论点 AND sentence is especially complete.
   if (options?.isHiddenKickoff) {
     if (plan) {
       sanitizeParagraphPlanValues(plan);
       clearAllStep3PlanValues(plan);
       enforceConfirmedOnlySlots(plan, null);
-      // Coach-emitted skeletons often keep subClaim but leave claim steps empty.
-      // Re-sync so the board matches chat (which already skips the claim beat).
-      const claimFilled = prefillClaimSlotsFromSubClaims(plan);
-      if (claimFilled > 0) {
-        console.warn(
-          `[Step3Guard] Kickoff synced ${claimFilled} claim slot(s) from subClaim.`,
-        );
+      demoteThemeHeadSubClaims(plan);
+      ensureLeadingClaimSlot(plan);
+      prefillClaimSlotsFromSubClaims(plan); // no-op
+
+      const empty = findFirstEmptyPlanStep(plan);
+      const emptyStep =
+        empty &&
+        plan.pointBlocks[empty.blockIndex]?.steps?.[empty.stepIndex];
+      const emptyKey = String(
+        emptyStep?.key ||
+          (empty ? `${empty.blockIndex}:${empty.stepIndex}` : ""),
+      );
+      const emptyLabel = String(
+        empty?.cleanStepLabel || emptyStep?.label || "分论点",
+      ).trim();
+      const isClaimEmpty =
+        !!emptyStep &&
+        CLAIM_SLOT_LABEL_RE.test(String(emptyStep.label || ""));
+
+      let kickoffPending: KickoffPendingDraft[] = [];
+
+      // Only claim-slot + especially-complete text may confirm on kickoff.
+      // Never stage 展开原因/机制 while 论点 is still empty; never remap onto claim.
+      if (
+        isClaimEmpty &&
+        empty &&
+        emptyKey &&
+        slotEval?.mode === "confirm" &&
+        slotEval.qualified &&
+        String(slotEval.pendingText || "").trim().length >= 8
+      ) {
+        const activeKey = String(slotEval.activeKey || "").trim();
+        // Must target the claim firstEmpty — do not put reason text on claim.
+        if (!activeKey || activeKey === emptyKey) {
+          const text = preferPolishedPendingFromCoachText(
+            String(data.text || ""),
+            String(slotEval.pendingText || "").trim(),
+            "",
+          );
+          if (
+            isEspeciallyCompleteConfirmText(
+              text,
+              plan,
+              emptyKey,
+              empty.blockIndex,
+              { isClaimSlot: true, fromStudentUtterance: false },
+            )
+          ) {
+            kickoffPending = [
+              {
+                key: emptyKey,
+                label: emptyLabel,
+                text,
+                blockIndex: empty.blockIndex,
+                stepIndex: empty.stepIndex,
+              },
+            ];
+          }
+        }
       }
+
+      // Planner full claim sentence (rich) → pending confirm for 论点 only.
+      if (!kickoffPending.length && isClaimEmpty && empty) {
+        const fromSub = buildPendingDraftsFromFullSubClaims(plan).find(
+          (d) =>
+            d.blockIndex === empty.blockIndex &&
+            d.stepIndex === empty.stepIndex,
+        );
+        if (
+          fromSub &&
+          isEspeciallyCompleteConfirmText(
+            fromSub.text,
+            plan,
+            fromSub.key,
+            fromSub.blockIndex,
+            { isClaimSlot: true, fromStudentUtterance: false },
+          )
+        ) {
+          kickoffPending = [fromSub];
+        }
+      }
+
+      if (kickoffPending.length) {
+        syncPlanProgressFields(data, plan, kickoffPending);
+        applyConfirmTurnText(data, kickoffPending);
+        if (data.progressUpdate) {
+          data.progressUpdate.step3SlotEval = {
+            activeKey: kickoffPending[0].key,
+            mode: "confirm",
+            qualified: true,
+            pendingText: kickoffPending[0].text,
+          };
+          data.step3SlotEval = data.progressUpdate.step3SlotEval;
+        }
+        setReject("");
+        console.warn(
+          `[Step3Guard] Kickoff staged pending for「${kickoffPending[0].label}」— especially-complete claim confirm.`,
+        );
+        return;
+      }
+
+      // Default: expand — use Step2 material as question seed, not rubber-stamp.
       syncPlanProgressFields(data, plan, []);
       const rawKickoffText = String(data.text || "");
-      const forceSalvage = slotEval?.mode === "confirm";
       const illegalDump = !!detectStep3IllegalCoachText(rawKickoffText, plan);
-      const prefer = forceSalvage
-        ? "kickoff_requires_student_expand"
-        : "kickoff_expand_first_empty";
+      // If model tried to confirm a non-claim / thin sentence, force expand ask.
+      const forceExpand =
+        illegalDump ||
+        slotEval?.mode === "confirm" ||
+        /已经确立了本段的分论点|分论点已经/.test(rawKickoffText);
       prepareStep3KickoffCoachText(
         data,
         plan,
-        prefer,
-        forceSalvage || illegalDump,
+        "kickoff_expand_first_empty",
+        forceExpand,
       );
-      setReject(forceSalvage || illegalDump ? prefer : "");
+      if (data.progressUpdate) {
+        data.progressUpdate.step3SlotEval = {
+          activeKey: emptyKey || "",
+          mode: "expand",
+          qualified: false,
+          rejectReason: forceExpand
+            ? "kickoff_expand_material_seed"
+            : "",
+        };
+        data.step3SlotEval = data.progressUpdate.step3SlotEval;
+      }
+      setReject(forceExpand ? "kickoff_expand_material_seed" : "");
       console.warn(
-        forceSalvage || illegalDump
-          ? "[Step3Guard] Kickoff dump/confirm sanitized — salvaged ask (kept model question when possible; no mid-dialogue veto template)."
-          : "[Step3Guard] Kickoff OK — kept model expand ask (no mid-dialogue veto template).",
+        `[Step3Guard] Kickoff expand on「${emptyLabel}」— material as question seed (confirm only when especially complete).`,
       );
     } else if (Array.isArray(data.progressUpdate.step3SubpointSteps)) {
       data.progressUpdate.step3SubpointSteps =
@@ -6284,15 +6819,10 @@ function enforceStep3LogicCompletionInner(
 
   // Confirmed-only board (model cannot prefill unconfirmed slots).
   enforceConfirmedOnlySlots(plan, prevPlan);
-  // Keep claim slots in sync with subClaim after model plan churn / wipe.
-  {
-    const claimFilled = prefillClaimSlotsFromSubClaims(plan);
-    if (claimFilled > 0) {
-      console.warn(
-        `[Step3Guard] Synced ${claimFilled} claim slot(s) from subClaim.`,
-      );
-    }
-  }
+  // Theme heads out of subClaim. NEVER silent-write from subClaim.
+  demoteThemeHeadSubClaims(plan);
+  ensureLeadingClaimSlot(plan);
+  prefillClaimSlotsFromSubClaims(plan); // no-op by design
   // Protect confirm activeKey so one-shot reclass can still see the new empty target.
   pruneUnauthorizedEmptySteps(
     plan,
@@ -6466,7 +6996,7 @@ function enforceStep3LogicCompletionInner(
   if (pending.length > 0 && isStep3RejectMessage(userMessage)) {
     pending = [];
     enforceConfirmedOnlySlots(plan, prevPlan);
-    prefillClaimSlotsFromSubClaims(plan);
+    demoteThemeHeadSubClaims(plan);
     syncPlanProgressFields(data, plan, []);
     setReject("");
     ensureMinimalStep3Text(data);
@@ -6476,23 +7006,32 @@ function enforceStep3LogicCompletionInner(
     return;
   }
 
-  // --- Labeled edit of a specific pending item (批量单项修改): 「{label}：修改内容」---
-  // 批量确认时学生发现某一项不准，用「{label}：修正后的句子」只改那一项，
-  // 其余 pending 保留；随后「对」/确认按钮仍提交整批（含已改项）。
-  // 必须放在 staging/expand 分支之前，避免模型的 expand 分支把 pending 清掉。
+  // --- Labeled edit of a specific pending item (仅批量 ≥2): 「{label}：修改内容」---
+  // 批量确认时学生发现某一项不准，用「{label}：修正后的句子」只改那一项。
+  // 单槽修订禁止走此早退：铅笔预填「标签：」后学生补充，若把冒号后原文写入
+  // pending 并 return，会覆盖模型本轮整理句 → 聊天黄框/右侧看板/确认写入全错。
+  // 单槽（或模型已给出新 confirm）一律落入下方 staging，pending = 待确认整理句。
   if (
-    pending.length > 0 &&
+    pending.length >= 2 &&
     !isStep3AffirmativeConfirmation(userMessage) &&
     !isStep3RejectMessage(userMessage)
   ) {
+    const modelHasNewConfirm =
+      slotEval?.mode === "confirm" &&
+      slotEval.qualified &&
+      (String(slotEval.pendingText || "").trim().length >= 4 ||
+        (Array.isArray(slotEval.pendingDrafts) &&
+          slotEval.pendingDrafts.length >= 2));
     const edited = applyLabeledPendingEdits(pending, userMessage);
-    if (edited.touched) {
+    if (edited.touched && !modelHasNewConfirm) {
       pending = edited.next;
       syncPlanProgressFields(data, plan, pending);
       setReject("");
+      // Keep chat CTA in sync with the edited pending texts (board uses same drafts).
+      applyConfirmTurnText(data, pending);
       ensureMinimalStep3Text(data);
       console.warn(
-        "[Step3Guard] Labeled pending edit applied（批量单项修改）→ 保留整批待确认。",
+        "[Step3Guard] Labeled pending edit applied（批量单项修改）→ 保留整批待确认，已同步确认文案。",
       );
       return;
     }
@@ -6653,27 +7192,57 @@ function enforceStep3LogicCompletionInner(
         }
       }
       {
-        const hard = hardRejectSlotText(
+        // Prefer coach polish over raw labeled-edit fragment in pendingText.
+        const stagedText = preferPolishedPendingFromCoachText(
+          String(data.text || ""),
           slotEval.pendingText!,
-          plan,
-          stageKey,
-          stageLoc.blockIndex,
+          userMessage,
         );
-        if (hard.ok === false) {
+        const isClaimSlot = CLAIM_SLOT_LABEL_RE.test(
+          String(stageLoc.label || stageLoc.step?.label || ""),
+        );
+        const fromStudent = isSubstantiveStep3Answer(userMessage);
+        if (
+          !isEspeciallyCompleteConfirmText(
+            stagedText,
+            plan,
+            stageKey,
+            stageLoc.blockIndex,
+            { isClaimSlot, fromStudentUtterance: fromStudent },
+          )
+        ) {
+          // Thin / redundant Step2 cut → expand with material seed, not rubber-stamp.
           pending = [];
           syncPlanProgressFields(data, plan, []);
-          setReject(hard.code);
-          vetoStep3TextToFirstEmptyAsk(data, plan, hard.code);
+          setReject("confirm_needs_more_substance");
+          vetoStep3TextToFirstEmptyAsk(
+            data,
+            plan,
+            "confirm_needs_more_substance",
+          );
           console.warn(
-            `[Step3Guard] Hard-reject step3SlotEval.pendingText (${hard.code}); vetoed to firstEmpty ask.`,
+            `[Step3Guard] Confirm for「${stageLoc.label}」not especially complete — expand to补论证 (material as seed).`,
           );
           return;
+        }
+        if (stagedText !== String(slotEval.pendingText || "").trim()) {
+          slotEval.pendingText = stagedText;
+          if (data.progressUpdate) {
+            data.progressUpdate.step3SlotEval = {
+              ...slotEval,
+              pendingText: stagedText,
+            };
+            data.step3SlotEval = data.progressUpdate.step3SlotEval;
+          }
+          console.warn(
+            "[Step3Guard] Pending text upgraded to coach reorganized sentence (not raw edit fragment).",
+          );
         }
         pending = [
           {
             key: stageKey,
             label: stageLoc.label,
-            text: slotEval.pendingText!,
+            text: stagedText,
             blockIndex: stageLoc.blockIndex,
             stepIndex: stageLoc.stepIndex,
           },
@@ -6716,6 +7285,33 @@ function enforceStep3LogicCompletionInner(
 
   // No new confirm eval: keep existing pending (if any) or finish/continue.
   if (pending.length > 0) {
+    // Single-slot revision without declared confirm: if coach text already
+    // contains a reorganized sentence, upgrade pending so board/CTA match it.
+    if (
+      pending.length === 1 &&
+      isSubstantiveStep3Answer(userMessage) &&
+      !isStep3AffirmativeConfirmation(userMessage)
+    ) {
+      const coachText = String(data.text || "");
+      const upgraded = preferPolishedPendingFromCoachText(
+        coachText,
+        pending[0].text,
+        userMessage,
+      );
+      const polished = extractReorganizedConfirmSentence(coachText);
+      const nextText =
+        polished.length >= 8 &&
+        /重新整理|整理成了/.test(coachText) &&
+        polished !== pending[0].text
+          ? polished
+          : upgraded;
+      if (nextText && nextText !== pending[0].text) {
+        pending = [{ ...pending[0], text: nextText }];
+        console.warn(
+          "[Step3Guard] Pending kept — upgraded to coach reorganized sentence after student revision.",
+        );
+      }
+    }
     syncPlanProgressFields(data, plan, pending);
     // Still waiting on affirm — never advance the ask to the next slot.
     applyConfirmTurnText(data, pending);
@@ -6856,22 +7452,46 @@ function enforceStep2Momentum(data: any, session: any): void {
       "",
   );
   const requiresStance = step2.requiresStance !== false;
-  const aSolid = sideHasSolidExploreContent(userPoints, "A");
-  const bSolid = sideHasSolidExploreContent(userPoints, "B");
+  const payload =
+    step2.plannerPayload || session?.step2?.coachEvaluation?.plannerPayload;
+  const missing: string[] = Array.isArray(payload?.coverage?.missingBuckets)
+    ? payload.coverage.missingBuckets
+    : [];
+  const readyCount = activePoints(payload).filter(
+    (p) => p.quality === "ready",
+  ).length;
+  const exploreDone = isStep2ExploreDone({
+    payload,
+    step2Data: step2,
+    session,
+  });
+  // Coverage-first; legacy A/B solid signals only as soft fallback
+  const aSolid =
+    readyCount >= 1 || sideHasSolidExploreContent(userPoints, "A");
+  const bSolid =
+    missing.length === 0
+      ? true
+      : sideHasSolidExploreContent(userPoints, "B");
 
-  // A response may clearly advance the conversation while the model forgets
-  // to update currentStage. Infer the destination before choosing a fallback;
-  // otherwise a successful A/B transition gets overwritten by a stale
-  // "continue filling this side" question from the previous session state.
+  const afterExploreStage = () =>
+    exploreDone
+      ? requiresStance
+        ? "stance"
+        : "summary"
+      : missing.length > 0
+        ? "explore_B"
+        : "explore_A";
+
+  // Verbal advance: never jump to stance before exploreDone
   if (
     stage === oldStage &&
     (oldStage === "explore_A" || oldStage === "explore_B") &&
     textSuggestsExploreSideAdvance(text, oldStage)
   ) {
     if (oldStage === "explore_A") {
-      stage = "explore_B";
+      stage = missing.length > 0 ? "explore_B" : afterExploreStage();
     } else {
-      stage = requiresStance ? "stance" : "summary";
+      stage = afterExploreStage();
     }
     step2.currentStage = stage;
     console.warn(
@@ -6879,41 +7499,43 @@ function enforceStep2Momentum(data: any, session: any): void {
     );
   }
 
-  // Content-aware advance: if the recorded side is already solid, do NOT keep
-  // asking for "尚未覆盖" points on that same side.
+  // Coverage-aware advance — stance only after exploreDone
   if (stage === "explore_A" && aSolid) {
-    stage = bSolid ? (requiresStance ? "stance" : "summary") : "explore_B";
+    stage = missing.length > 0 ? "explore_B" : afterExploreStage();
     step2.currentStage = stage;
     console.warn(
-      `[Step2Momentum] A-side already solid → advance stage to ${stage}`,
+      `[Step2Momentum] explore_A solid → stage=${stage} (exploreDone=${exploreDone}, missing=${missing.join(",") || "none"})`,
     );
-  } else if (stage === "explore_B" && bSolid && aSolid) {
-    stage = requiresStance ? "stance" : "summary";
+  } else if (stage === "explore_B" && missing.length === 0) {
+    stage = afterExploreStage();
     step2.currentStage = stage;
     console.warn(
-      `[Step2Momentum] A+B sides already solid → advance stage to ${stage}`,
+      `[Step2Momentum] explore_B buckets filled → stage=${stage} (exploreDone=${exploreDone})`,
     );
+  } else if (stage === "explore_B" && bSolid && aSolid && missing.length === 0) {
+    stage = afterExploreStage();
+    step2.currentStage = stage;
   }
 
-  if (stage === "summary") return; // summary-stage confirmation wording varies; do not force here.
+  if (stage === "summary") return;
 
   const split = splitTwoParts(text, 2);
-  if (!split.ok) return; // malformed split already handled elsewhere; don't risk double-mangling.
+  if (!split.ok) return;
   if (looksLikeQuestionEnding(split.part2)) return;
 
-  // Never use the "补真正缺失的 B 面" fallback when B is already recorded.
   let fallbackStage = stage;
-  if (fallbackStage === "explore_B" && bSolid) {
-    fallbackStage = requiresStance ? "stance" : "summary";
+  if (fallbackStage === "explore_B" && missing.length === 0) {
+    fallbackStage = afterExploreStage();
     if (fallbackStage === "summary") return;
     step2.currentStage = fallbackStage;
   }
   if (fallbackStage === "explore_A" && aSolid) {
-    fallbackStage = "explore_B";
+    fallbackStage = missing.length > 0 ? "explore_B" : afterExploreStage();
+    if (fallbackStage === "summary") return;
     step2.currentStage = fallbackStage;
   }
 
-  const fallback = fallbackStep2QuestionForStage(fallbackStage);
+  const fallback = buildStep2ContentAwareFallback(session, step2);
   const stanceRecommendationAlreadyPresent =
     fallbackStage === "stance" &&
     /(我更推荐|我建议|推荐你|建议采用|更适合采用|最容易自洽)/.test(text);
@@ -6921,7 +7543,7 @@ function enforceStep2Momentum(data: any, session: any): void {
     ? `${split.part1}\n\n---\n\n${split.part2.trim()}\n\n这个推荐方向符合你的本意吗？你可以直接确认，也可以告诉我你想调整成哪种立场。`
     : `${split.part1}\n\n---\n\n${fallback}`;
   console.warn(
-    `[Step2Momentum] Response ended without a question or CTA; appended content-aware prompt for resolved stage=${fallbackStage} (previous=${oldStage}, aSolid=${aSolid}, bSolid=${bSolid}).`,
+    `[Step2Momentum] Response ended without a question or CTA; appended content-aware prompt for resolved stage=${fallbackStage} (previous=${oldStage}, ready=${readyCount}, missing=${missing.join(",") || "none"}).`,
   );
 }
 
@@ -6963,6 +7585,28 @@ function isStep2BlueprintContentComplete(
       : {};
   const evalOld = session?.step2?.coachEvaluation || {};
   const blueprint = step2New.blueprint || evalOld.blueprint || {};
+  const payload =
+    step2New.plannerPayload || evalOld.plannerPayload || null;
+
+  // New contract: payload exitGate + stance
+  if (payload?.exitGate?.canComplete) {
+    const stanceFromPayload = String(payload.stance?.text || "").trim();
+    if (stanceFromPayload || !payload.requiresStance) return true;
+  }
+  const readyCount = activePoints(payload).filter(
+    (p) => p.quality === "ready",
+  ).length;
+  if (readyCount >= 2) {
+    const stance = String(
+      step2New.userStance ||
+        session?.step2?.userStance ||
+        evalOld.userStance ||
+        payload?.stance?.text ||
+        blueprint.position ||
+        "",
+    ).trim();
+    if (stance || payload?.requiresStance === false) return true;
+  }
 
   const stance = String(
     step2New.userStance ||
@@ -7631,7 +8275,7 @@ function resolveRetentionUserChoice(params: {
       needExpandDetail: uncovered,
       expandMode: "detail",
       allowTransition: false,
-      summaryZh: "两个都展开",
+      summaryZh: "都展开",
     };
   }
 
@@ -7728,7 +8372,9 @@ function applyRetentionTagsToUserPoints(
         return `${cleaned}（${tag}）`;
       });
     }
-    return `${source}；${core}（${tag}）`;
+    // Do NOT append a new empty shell label — right-board slots are frozen;
+    // unmatched tags stay off userPoints rather than creating duplicate points.
+    return source;
   };
 
   text = tagOne(text, developed, developedTag);
@@ -8259,14 +8905,45 @@ async function applyStep2RetentionGuard(
   data.progressUpdate.step2Data.currentStage = oldStage;
   const part1 = safeOverridePart1(String(data.text || ""));
 
+  // Generic numbered list for the ask (prefer frozen Step1 slots when present)
+  const payloadForList =
+    data.progressUpdate.step2Data.plannerPayload ||
+    session?.step2?.coachEvaluation?.plannerPayload;
+  const listLabels: string[] = [];
+  const pushUnique = (label: string) => {
+    const t = shortRetentionLabel(label);
+    if (t.length < 2) return;
+    if (listLabels.some((x) => x === t || x.includes(t) || t.includes(x))) return;
+    listLabels.push(t);
+  };
+  if (Array.isArray(payloadForList?.fixedClaims)) {
+    for (const c of payloadForList.fixedClaims) pushUnique(String(c || ""));
+  }
+  if (!listLabels.length && Array.isArray(payloadForList?.points)) {
+    for (const p of payloadForList.points) {
+      if (p?.supersededBy) continue;
+      pushUnique(String(p?.claim || ""));
+    }
+  }
+  if (!listLabels.length) {
+    pushUnique(dShort);
+    pushUnique(uShort);
+  }
+  const circ = ["①", "②", "③", "④", "⑤", "⑥"];
+  const listBlock = listLabels
+    .map((l, i) => `${circ[i] || `${i + 1}.`} ${l}`)
+    .join("\n");
+
   let retentionQuestion: string;
   if (recommendation === "EXPAND_BOTH") {
-    retentionQuestion = `我们先记录下这一点（${reasonZh}）。你之前还提到『${uShort}』——能否也补充 1-2 句，让这一维度也有具体内容？若你其实想先选定哪个详写、哪个略写，也可以直接告诉我。`;
+    retentionQuestion =
+      `我们先记录下这一点（${reasonZh}）。你之前还提到『${uShort}』——能否也补充 1-2 句，让这一维度也有具体内容？` +
+      `若你想先选定详写哪些、其余略写或不写，也可以直接告诉我。`;
   } else {
     retentionQuestion =
-      `目前这两点都有了：\n① 『${dShort}』\n② 『${uShort}』\n` +
-      `一篇主体段通常详写一个、略写一个（控制在 90-110 词）。你想选哪一个重点详写？另一个简单带一句就好。\n` +
-      `也可以说「两个都展开」，或回复「你定」（${reasonZh}）。`;
+      `目前材料池有：\n${listBlock}\n` +
+      `请选择哪几个作为详写（其余略写或不写）。\n` +
+      `也可以说「都展开」或「你定」（${reasonZh}）。`;
   }
   data.text = `${part1}\n\n---\n\n${retentionQuestion}`;
 
@@ -8415,9 +9092,18 @@ async function startServer() {
             response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
           const parsed = parsePlannerResponse(rawText);
           if (parsed && Array.isArray(parsed.bodyPlans)) {
-            const qa = runMechanicalQa(parsed.bodyPlans);
+            const qa = runMechanicalQa(
+              parsed.bodyPlans,
+              input?.plannerPayload || null,
+            );
             if (qa.pass) {
               bodyPlans = parsed.bodyPlans;
+              const warns = qa.issues
+                .filter((i) => i.severity === "warn")
+                .map((i) => i.reason);
+              if (warns.length) {
+                console.warn(`[Planner] soft QA warns: ${warns.join("；")}`);
+              }
             } else {
               qaIssues = qa.issues
                 .filter((i) => i.severity === "fail")
@@ -8460,8 +9146,23 @@ async function startServer() {
         );
       }
 
-      // --- 规范化：subClaim 预填「分论点」槽（修复 Step3 重复询问） ---
-      bodyPlans = normalizePlannerBodyPlans(bodyPlans);
+      // --- 规范化：按 payload mappedPointIds 水合 subClaim，再预填「分论点」槽 ---
+      bodyPlans = normalizePlannerBodyPlans(
+        bodyPlans,
+        input?.plannerPayload || null,
+      );
+
+      // Material-insufficient degraded: both bodies lack real claims
+      const claimsEmpty = (bodyPlans || []).every((bp: any) => {
+        const sc = bp?.paragraphPlan?.pointBlocks?.[0]?.subClaim;
+        return !String(sc || "").trim() || String(sc).trim().length < 8;
+      });
+      if (claimsEmpty) {
+        degraded = true;
+        errorMessage =
+          errorMessage ||
+          "Step2 可用论点不足，已降级出空主张骨架（请回到 Step2 补点）";
+      }
 
       res.json({
         status: "passed",
@@ -9123,18 +9824,23 @@ ${memoryDigestStr}
 `;
       } else if (Number(step) === 2) {
         stepGuidelines = `
-- Step 2: Essay Blueprint (文章蓝图/论点筹备与结构设计)
-  Current State: BLUEPRINT_DESIGN
-  Role: Essay Architect & Socratic Logical Coach.
-  Objective: Guide the student to brainstorm the required sides of the question, choose a stance, and generate the final Essay Blueprint (the unique target artifact).
+- Step 2: Parallel Points + Stance (材料池 / 立场 — NOT paragraph layout)
+  Current State: MATERIAL_POOL
+  Role: Socratic Logical Coach for brainstorming.
+  Objective: Guide the student to expand PARALLEL concrete points, then choose a stance. Do NOT assign Body Paragraph 1/2 here — Step 2.5 Planner owns paragraph layout after Step2 completes.
 
   ## Question-type stage mapping (CRITICAL)
-  Map explore_A / explore_B using INTERNAL questionBrief.taskMap for THIS question — do NOT always treat them as "online pros vs offline pros":
-  - Agree / Disagree, Discuss Both Views, Advantages / Disadvantages: explore_A = one side; explore_B = the other side.
-  - Problem / Solution: explore_A = causes/reasons; explore_B = solutions/measures.
-  - Positive / Negative (or Two-part whose second question is positive/negative): explore_A = first task (often causes/reasons if present; otherwise the main phenomenon analysis); explore_B = evaluation side, and you MUST separately collect BOTH the positive angle and the negative angle before leaving explore_B.
-  - Other / generic Two-part: explore_A = first sub-question; explore_B = second sub-question.
-  - Prefer questionBrief.taskMap labels when they are more specific than the generic mapping above.
+  Step2 produces PARALLEL points + stance for the Planner; do NOT finalize paragraph layout here.
+  Map explore_A / explore_B using INTERNAL questionBrief.taskMap — but explore_B means "fill missing coverage buckets", NOT "always dig the opposing side":
+  - explore_A = expand concrete claims under Step1 dimensions (parallel points: claim + scene/mechanism).
+  - explore_B = ONLY ask for missing material buckets required by the question type. If no hard buckets are missing, SKIP explore_B and go to stance (or summary when requiresStance=false).
+  - Agree / Disagree: do NOT force an opposing/concession point when the student is fully agree/disagree. Opposing material is optional (soft) unless they choose partial agreement.
+  - Discuss Both Views: hard buckets view_a + view_b — both required before leaving explore_B.
+  - Advantages / Disadvantages: hard buckets advantage + disadvantage.
+  - Problem / Solution: hard buckets cause + solution.
+  - Positive / Negative: collect both positive and negative evaluation angles before leaving explore_B.
+  - Two-part: hard buckets part_1 + part_2.
+  - Prefer questionBrief.taskMap labels for student-facing wording. Internal userPoints may still use "A面：" / "B面：" delimiters for compatibility; the server normalizes into plannerPayload.points.
 
   ## Current Stage Logic (current_stage / 引入状态和状态变化)
   The student progresses through four distinct stages. You MUST strictly obey the rules of the active stage, determine the next stage based on user inputs, and output the correct 'currentStage' inside progressUpdate.step2Data:
@@ -9146,8 +9852,10 @@ ${memoryDigestStr}
   - When INTERNAL questionBrief.requiresStance=false: NEVER enter "stance". After explore_B is sufficient, go directly to "summary". Do NOT ask the student to choose a personal stance / agree-disagree option — the essay does not require one (typical what/why/how / Problem-Solution / many Two-part prompts). For blueprint.position / userStance, write a neutral overview sentence that names the two tasks (e.g. "本文先解释禁用必要性，再提出其他减塑措施"), NOT an agree/disagree judgment.
 
   Stance-skip rule (CRITICAL — driven by questionBrief.requiresStance):
-  - requiresStance=true (Agree/Disagree, Discuss Both Views, Positive/Negative, outweigh-style Adv/Dis): keep the four-stage flow explore_A → explore_B → stance → summary.
-  - requiresStance=false (Problem/Solution, pure what/why Two-part, discuss-only Adv/Dis without judgment ask): three-stage flow explore_A → explore_B → summary. Skip stage "stance" entirely. FORBIDDEN: inventing agree/disagree options, "老师帮我推荐一个", or asking "你最终更倾向于哪种立场" when the prompt never asked for a personal opinion.
+  - requiresStance=true (Agree/Disagree, Discuss Both Views, Positive/Negative, outweigh-style Adv/Dis): explore_A → (explore_B only if coverage buckets missing) → stance → summary.
+  - requiresStance=false (Problem/Solution, pure what/why Two-part, discuss-only Adv/Dis without judgment ask): explore_A → (explore_B if buckets missing) → summary. Skip stage "stance" entirely. FORBIDDEN: inventing agree/disagree options, "老师帮我推荐一个", or asking "你最终更倾向于哪种立场" when the prompt never asked for a personal opinion.
+  - Paragraph layout / body assignment is NOT Step2's job — Step 2.5 Planner consumes plannerPayload.points after Step2 completes.
+  - Explore-before-stance (HARD): Do NOT enter stage "stance" and do NOT write a locked userStance until explore is done (enough concrete points expanded under Step1 dimensions, or student says they have no more). Empty opposing-side buckets for Agree/Disagree do NOT mean explore is finished — keep expanding in explore_A. FORBIDDEN in explore stages: announcing "你倾向于同意/不同意" as if stance were already chosen; Step1 issue wording is not a stance selection.
 
   Dimension-aware questioning rule (CRITICAL):
   - If Step 1 already provides suggestedDimensions in context, your question must explicitly anchor to those dimensions first, then ask for concrete expansion (场景 / 机制 / 受益或受影响对象).
@@ -9198,19 +9906,19 @@ ${memoryDigestStr}
   - If NO (only one dimension was ever named, or the "other" one is just a synonym of the developed one), skip this rule entirely and proceed with the normal sufficiency-gated transition below.
   - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient OR is tagged （待补例子）.
   - Anti-loop vs retention precedence (CRITICAL): the "at most ONE depth follow-up per point" anti-loop rule caps follow-ups WITHIN a single developed point. It does NOT authorize skipping a sibling named dimension, and it does NOT override this Retention Rule. After accepting a thin developed point (with （待补例子） if needed), you MUST still check for uncovered siblings before transitioning; if one remains, ask the retention question and keep currentStage unchanged.
-  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, do NOT silently assign 详写/略写 for the student, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED and ask the student to CHOOSE which point to detail-write:
-    - Present both points briefly (① developed / ② uncovered).
-    - Ask: which one should be 详写 (detail), and which 略写 (brief)? Mention they can also say「两个都展开」or「你定」.
+  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, do NOT silently assign 详写/略写 for the student, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED and ask the student to CHOOSE which point(s) to detail-write:
+    - Present the current material-pool points as a numbered list (①②③…; use plannerPayload.fixedClaims / points when available — do NOT hardcode “only two points”).
+    - Ask: 请选择哪几个作为详写（其余略写或不写）. Mention they can also say「都展开」or「你定」. FORBIDDEN phrasing: 「选哪一个…另一个…」「两条都展开」「详写一个、略写一个」as if there were always exactly two.
     - Do NOT push a forced KEEP/DROP recommendation as the main ask. A soft default may be mentioned only as the「你定」fallback.
-    - Example: "目前这两点都有了：①『生态危害』②『垃圾处理成本』。你想选哪一个重点详写？另一个简单带一句就好。"
+    - Example: "目前材料池有：\n① 生态危害\n② 垃圾处理成本\n③ 社会文化服务\n请选择哪几个作为详写（其余略写或不写）。也可以说「都展开」或「你定」。"
   - When the developed point is still thin: ask for 1-2 sentences on the uncovered dimension too (both need content before a 详写/略写 choice is meaningful).
   - On the NEXT turn, interpret the student's reply as a ROLE CHOICE (not a veto of your assignment):
-    - Explicit pick of point ① or ② as 详写 → tag that point 已选详写 and the other 已选略写. If the chosen 详写 point still lacks a concrete scene/mechanism, ask ONE expansion question for it before leaving this side. If the chosen 略写 point is only an empty label, ask ONE brief "一两句话说明" question; otherwise do not depth-follow-up the 略写 point.
-    - 「两个都展开」→ expand the still-thin/uncovered sibling next.
+    - Explicit pick of point ① or ② (or named labels) as 详写 → tag that point 已选详写 and the other 已选略写. If the chosen 详写 point still lacks a concrete scene/mechanism, ask ONE expansion question for it before leaving this side. If the chosen 略写 point is only an empty label, ask ONE brief "一两句话说明" question; otherwise do not depth-follow-up the 略写 point.
+    - 「都展开」/「全都展开」→ expand the still-thin/uncovered sibling next.
     - 「放弃/只要一个」→ tag the other as 用户放弃 and proceed.
     - Vague agreement ("好的"/"随便"/"你定") → apply the soft default (usually: already-developed point = 详写, sibling = 略写) and then follow the same expand-if-needed rule above.
     - Anti-loop: at most ONE 详写/略写 choice question per side; after the choice is recorded, do not re-ask the same choice.
-  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints (the only Layer-1 field that persists in real time during explore stages) using an explicit status tag per point, e.g. "A面：生态危害（已选详写）；垃圾处理成本高（已选略写）" or "...（用户放弃）" or "...（待补例子）". Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — those Layer-2 fields are only generated starting in stage "summary" and cannot carry this decision in real time. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints using an explicit status tag on the EXISTING point text, e.g. "A面：生态危害（具体展开…）（已选详写）；垃圾处理成本高（…）（已选略写）". FORBIDDEN: appending a new empty duplicate like "社会文化生活和服务（）" or "环境保护（已选详写）" without content — only tag the already-recorded point. Do NOT invent "待定" placeholders inside point bodies. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
 
   1. Stage "explore_A": Explore Side A / Task 1 (按上面的题型映射) — EXPAND phase
      - Priority from Step 1 tags: prefer dimensions tagged （可展开） first; for （质量待确认）/（空标签）, ask ONE concrete-scene probe before investing a full expansion turn.
@@ -9254,12 +9962,12 @@ ${memoryDigestStr}
        - If user answer is complete, language polish is allowed without adding new facts.
      - Feedback: apply the Compact feedback rule above (concise natural acknowledgment per intent — not a fixed phrase).
 
-  3. Stage "stance" (CONVERGE — select points + stance + essay skeleton together):
-     - ONLY enter this stage when questionBrief.requiresStance=true. If requiresStance=false, skip to "summary" from explore_B, but still run the same converge selection of points/roles/argumentRelation there.
-     - This stage is the EXPLICIT converge decision (not a silent model inference):
-       1) Briefly list the candidate points collected in explore_A/B (with 详写/略写/待补例子 tags).
-       2) Recommend which points to keep as final arguments, which are major vs minor, and which overall stance fits the material.
-       3) Ask the student to confirm or correct that package in one turn when possible.
+  3. Stage "stance" (CONVERGE — select stance after flat points are ready; NO paragraph layout):
+     - ONLY enter this stage when questionBrief.requiresStance=true. If requiresStance=false, skip to "summary" from explore_B.
+     - This stage is the EXPLICIT stance decision (not a silent model inference):
+       1) Briefly list the flat candidate points collected in explore_A/B (with 详写/略写/待补例子 tags) — numbered list, NOT Body 1/2.
+       2) Recommend which overall stance fits the material; optionally which points to keep vs drop.
+       3) Ask the student to confirm or correct in one turn when possible. Do NOT assign bodies here.
      - Coach recommendation first (CRITICAL): infer the most defensible stance from the student's recorded A/B material. Recommend ONE stance directly and give 1-2 concrete reasons tied to which side is richer, more expandable, or easier to qualify. Do not make the student choose blindly from a neutral menu.
      - Recommendation integrity: use only points already supplied by the student. You may compare their relative strength and expandability, but MUST NOT invent a new argument merely to justify your recommendation.
      - Agree/Disagree example shape: "根据你前面给出的材料，我更推荐『部分同意』：你对……的论据更具体，而另一面可以作为限制条件。这个方向符合你的本意吗？" Rephrase naturally; do not force this literal wording.
@@ -9273,105 +9981,55 @@ ${memoryDigestStr}
      - Next Stage Transition: When they confirm the recommendation or provide a different stance/point choice, validate and transition to "summary". Set currentStage: "summary".
      - Real-time Save: Populate progressUpdate.step2Data.userStance (and refresh userPoints tags for final keep/drop) and set currentStage: "summary".
 
-  4. Stage "summary": Generate final Essay Blueprint & Diagnostics (locks the converge package for Step 3)
-     - Allowed Actions: Once in "summary", you must evaluate the layout and structure of the planned Body paragraphs based on the brainstormed points.
-       - **Strict Constraint**: Do NOT generate 4+ body paragraphs. In IELTS Task 2, an essay should strictly contain **only 2 or 3 Body Paragraphs (主体段)**.
-       - You must analyze the brainstormed points (Side A and Side B) and determine how they should be mapped into these 2-3 body paragraphs. Specifically, decide whether certain points should be combined into a single paragraph (e.g. combined under a unified theme), kept separate (e.g. Side A in Body 1, Side B in Body 2), or dropped entirely if they are weak or redundant.
-       - **Retention-aware clustering (CRITICAL)**: userPoints may contain status tags recorded during explore_A/explore_B via the Dimension Coverage & Retention Rule (e.g. "已选详写", "已选略写", "保留-略写", "用户放弃", "待补例子"). You MUST read and honor these tags when building 'clustering'/'outliers' — do NOT ignore them or re-ask about them:
-         - A point tagged "已选详写" / "已展开，作为主论点" MUST be mapped as the major/detail point of its body paragraph.
-         - A point tagged "已选略写" / "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point (not promoted to its own body paragraph, not silently dropped).
-         - A point tagged "用户放弃" MUST be listed in clustering.outliers with disposition "dropped" and a suggestion noting the student already chose to drop it during brainstorming.
-         - A Step1 effective dimension that was merged into another point MUST appear in clustering.outliers with disposition "merged" and mergedInto naming the kept point — never omit it silently.
-         - A point tagged "待补例子" MUST NOT be described as "完整性极高". Mark Completeness as "待补充具体例子", and either ask one short example question before finishing OR clearly note that Step 3 should start by adding a concrete scene.
-         - Before isCompleted:true, every Step1 （已探测）（可展开） dimension must appear in dimensionDispositions as expanded|merged|dropped (no pending).
-       - **AI Paragraph Layout Evaluation**:
-         - In your final Socratic text response in Stage "summary", you MUST explicitly present this layout to the student.
-         - For each proposed Body Paragraph (Body 1, Body 2, etc.), provide a clear evaluation assessing three dimensions:
-           - **写作难度 (Writing Difficulty)**: (e.g., Low/Medium/High, explaining why)
-           - **完整性 (Completeness)**: honest status — "可写" / "待补充具体例子" / "素材不足". NEVER say "完整性极高" when any mapped point is tagged 待补例子 or lacks a concrete scene.
-           - **篇幅 (Paragraph Length)**: (e.g., whether it has too few or too many ideas, and a suggestion on length)
-         - Keep the evaluation compact; avoid long ceremonial praise.
-       - You MUST answer internally for every planned Body paragraph:
-         1. Is there enough material to support a complete IELTS body paragraph (about 90–110 words)?
-         2. If not: DO NOT finish Stage 2. Continue Socratic dialogue by asking the user for more ideas or details specifically for the body paragraph(s) that lack sufficient material, and remain in Stage 2.
-         3. If yes: Stop collecting ideas.
-       - Real-time Save (CRITICAL): Once all planned Body paragraphs have sufficient material and you can finalize, set isCompleted: true in progressUpdate, set currentStage: "summary", and populate 'blueprint.bodies' and 'clustering.clusters' (with exactly 2 or 3 elements, grouping the user's brainstormed points accordingly).
+  4. Stage "summary": Confirm flat material pool (NOT paragraph layout)
+     - Allowed Actions: List the parallel points + confirmed stance; check each point is concrete enough (scene/mechanism) or tagged 待补例子.
+     - FORBIDDEN in Step2 (HARD): deciding Body Paragraph 1/2/3, assigning points into bodies, evaluating "写作难度/篇幅" per body, or telling the student the essay skeleton. That is Step 2.5 Planner's job after isCompleted.
+     - Student-facing summary: numbered FLAT points (①②③…), each one claim; do NOT label them as 主体段 / Body Paragraph.
+     - Retention tags in userPoints (已选详写/已选略写/用户放弃/待补例子) still matter for which points to keep — record dropped/merged in clustering.outliers only if needed; do NOT build clusters.targetBody.
+     - Before isCompleted:true, every Step1 （已探测）（可展开） dimension must appear in dimensionDispositions as expanded|merged|dropped (no pending).
+     - Real-time Save (CRITICAL): set isCompleted: true, currentStage: "summary", userStance, userPoints (flat list). blueprint.position = stance text. Prefer leaving blueprint.bodies EMPTY (or omit). Prefer clustering.pointsList = flat brainstormed points; clusters may be empty. NEVER require 2–3 body paragraphs to finish Step2.
 
-  ## ESSAY FRAMEWORK METADATA (INTERNAL — summary/converge only; NEVER echo field names or layoutRationale to students):
-  - When finalizing blueprint/clustering, you MUST emit structured essay-framework metadata for Step 3 handoff. Students only see your normal compact Chinese summary of body layout — NOT these JSON fields.
-  - At \`clustering\` root (and mirror on \`blueprint\`): \`bodyCount\` (2 or 3), \`layoutPattern\` (concession_then_support | thematic_split | side_by_side | custom).
-  - For EACH \`clustering.clusters[]\` entry (one per body paragraph), also set:
-    - \`paragraphDensity\`: "single_point" (this body develops ONE mapped argument) OR "dual_point" (this body develops TWO mapped arguments, typically one major + one minor).
-    - \`pointRoles\`: array of { point, role: "major"|"minor" } matching the mapped \`points\` and honoring retention tags (已选详写 → major, 已选略写/保留-略写 → minor).
-    - \`argumentRelation\` (PREFERRED): one of supports | concedes | compares | solves | elaborates — chosen from the question + content, not a fixed recipe:
-      - supports: body develops a point aligned with overall thesis (ordinary causal chain; no special beats).
-      - concedes: body presents the weaker/opposite side that must still leave the overall thesis standing (beats: acknowledge opposite side exists → show why it does not overturn the thesis).
-      - compares: body weighs two options/eras/approaches (beats: both sides → key difference → which is better).
-      - solves: Problem/Solution body (beats: problem/gap → concrete solution → why it works).
-      - elaborates: parallel explanation without needing to overturn a thesis (Discuss-both / two-part explanatory bodies; ordinary expansion).
-    - \`stanceRelation\` (COMPAT ONLY): still emit "supports" or "concedes" when argumentRelation is one of those two; otherwise omit or mirror the closest value. Prefer argumentRelation as the source of truth.
-    - \`layoutRationale\`: one internal sentence explaining why you chose this body count / merge-vs-split / argumentRelation — for Step 3 only; FORBIDDEN in chat text.
-  - DECISION RULES (Step 2 owns skeleton — Step 3 must not re-decide body count / point roles / argumentRelation):
-    1. Choose 2 vs 3 bodies from brainstormed point count AND expandability — do NOT always default to exactly 2 side-based bodies.
-    2. When two points on the SAME side both have strong material, you MAY split into separate bodies OR combine as dual_point with major/minor — pick the option that best fits stance, word budget (~90–110 words per body), and retention tags.
-    3. When one point is thin (略写/待补例子), prefer dual_point (major + minor in one body) rather than giving it its own body.
-    4. For 利大于弊 / 弊大于利 / partial-agreement stances: the body presenting the weaker/opposite side MUST be argumentRelation: "concedes" (and stanceRelation: "concedes").
-    5. TYPE-AWARE RELATION RULE (CRITICAL for Discuss Both Views): when the question type is Discuss Both Views and the stance is NOT outweigh/concession, each body should use argumentRelation: "elaborates" (parallel explanation from the respective viewpoint's perspective). Do NOT assign "supports" to one body and "concedes" to the other — that collapses Discuss Both into an Agree/Disagree pattern. If the student chose "different_situations", use "compares" or "elaborates" depending on whether the bodies directly compare or independently explain two situations.
-    6. Keep \`blueprint.bodyCount\`, \`blueprint.layoutPattern\`, and \`clustering\` consistent. Mirror framework fields on matching \`blueprint.bodies[]\` entries when emitted.
-    7. Stance–material fit (CRITICAL, converge-stage only): before finalizing an outweigh stance, check whether the SUPPORT side has enough expandable points. Concession bodies may rely on one major opposite-side point; support bodies should prefer two complementary points OR one very solid point. If the student has already said they have no more points and at least one solid support point exists, finalize with that package — do NOT re-ask the same question.
+  ## ESSAY FRAMEWORK METADATA:
+  - Step2 does NOT own bodyCount / layoutPattern / argumentRelation / paragraphDensity. Leave those for Planner.
+  - Optional compat: if you still emit clustering, put all points into pointsList only; do not invent targetBody mappings.
 
   ## Layered Output Definition (层级划分与降压设计)
   To reduce JSON complexity and LLM generation errors, the output is strictly split:
 
-  ### Layer 1: Primary Artifact (Dialogue & Core Blueprint) - Always populated in real-time:
+  ### Layer 1: Primary Artifact (Dialogue & Flat Materials) - Always populated in real-time:
   - currentStage: Must output the active stage name: "explore_A", "explore_B", "stance", or "summary".
-  - userStance: Chinese summary of user's overall stance.
-  - userPoints: Bulleted list of all brainstormed points (both A and B sides) exactly as brainstormed by the user (do not rewrite them!).
+  - userStance: Chinese summary of user's overall stance (ONLY after explore is done / in stance or summary).
+  - userPoints: Flat bulleted list of brainstormed points (do not rewrite them!). Optional A面:/B面: delimiters for compatibility — these are material tags, NOT body paragraphs.
   - blueprint:
     - question: The original prompt question.
-    - position: User's summarized overall stance.
-    - bodies: Array of 2 or 3 body paragraphs representing the planned paragraphs. (E.g. Body 1 title/content, Body 2 title/content).
+    - position: User's summarized overall stance / overview.
+    - bodies: PREFER empty array []. Do NOT use bodies to invent paragraph structure in Step2.
 
   ### Layer 2: Supporting Metadata & Diagnostics (Only generated in "summary" stage):
-  - suggestedStance: High scoring Band 8.0+ thesis option in English.
-  - suggestedPoints: High scoring Band 8.0+ subpoints in English + Chinese.
-  - critique: Socratic overall critique of the blueprint logic.
+  - suggestedStance: Optional short Chinese thesis paraphrase (NOT required). Prefer empty unless helpful.
+  - suggestedPoints: DEPRECATED — always "". Do NOT invent English polished points; material pool uses student Chinese userPoints only.
+  - critique: Socratic critique of material sufficiency (not body layout).
   - suggestions: 2-3 specific bullet-point suggestions for improvement.
-  - clustering: Structured argument clustering representing how brainstormed points mapped into paragraphs.
-    - STRICT CONSTRAINT: Do NOT rewrite or alter the user's original brainstormed points. Simply map them as-is!
-    - bodyCount: 2 or 3 (internal essay skeleton).
-    - layoutPattern: concession_then_support | thematic_split | side_by_side | custom (internal).
-    - totalPoints: Number of distinct points brainstormed.
-    - pointsList: Array of original user brainstormed points.
-    - clusters: Array of clusters. Each cluster has:
-      - theme: The theme/category name.
-      - points: Array of user's points mapped here.
-      - targetBody: "Body Paragraph 1" or "Body Paragraph 2", etc.
-      - content: Summarized topic sentence of this paragraph's core point.
-      - paragraphDensity: single_point | dual_point (internal Step 3 handoff).
-      - pointRoles: [{ point, role: major|minor }] (internal).
-      - argumentRelation: supports | concedes | compares | solves | elaborates (internal; preferred).
-      - stanceRelation: supports | concedes (compat mirror when applicable).
-      - layoutRationale: internal one-line planning note — never student-facing.
-    - outliers: Outlying points that didn't fit, with advice. Each outlier has:
-      - point: The outlier point name.
-      - suggestion: Advice on how to integrate or ignore it.
+  - clustering (optional / lightweight):
+    - totalPoints + pointsList: flat original user points (REQUIRED if clustering is emitted).
+    - clusters: PREFER empty []. Do NOT map points into Body Paragraph targetBody in Step2.
+    - outliers: dropped/merged points with advice when needed.
   - Deterministic Rule-Based Checks:
     These 3 checks must be computed using rule-based criteria, not vague opinions:
     1. Position Check (positionCheckPassed & positionCheckDesc):
-       - Pass Criteria: Both Body 1 and Body 2 are logically consistent with and support the chosen overall stance (e.g. no logical contradiction between bodies and stance).
+       - Pass Criteria: Confirmed stance/overview is clear and does not contradict the kept flat points.
     2. Coverage Check (coverageCheckPassed & coverageCheckDesc):
        - Pass Criteria (Rule-based):
-         - Must include at least 1 argument representing each side of the debate (pro and con).
-         - Must explicitly address the prompt's main keyword/qualifier (e.g. "entirely", "completely", "should").
-         - Must cover at least 2 distinct dimensions of comparison (e.g., efficiency, interaction, resource).
+         - Enough distinct flat points for the question type (Agree/Disagree need not force an opposing point).
+         - Must explicitly address the prompt's main keyword/qualifier when present (e.g. "entirely", "completely", "should").
+         - Prefer covering ≥2 distinct dimensions from Step1 when available.
     3. Structure Check (structureCheckPassed & structureCheckDesc):
-       - Pass Criteria: The planned body paragraphs are independent and have clear boundaries, with no duplicate or overlapping ideas.
+       - Pass Criteria: Flat points are distinct (no near-duplicate claims) and each kept point is concrete enough or explicitly tagged 待补例子. Do NOT judge body-paragraph layout here.
 
   DECIDING COMPLETION:
-  - If currentStage is "summary", the user has finalized their stance/points, and your internal evaluation confirms EVERY planned Body paragraph has enough material to support a complete 90-110 word paragraph, set isCompleted: true in progressUpdate.
-  - If any planned Body paragraph lacks sufficient material, you MUST NOT set isCompleted: true, and must instead ask the user for more ideas/clarification.
-  - When setting isCompleted: true, Part 2 MUST tell the student to click the left-side 【立即跳转】 button and include the phrase "进入第三步". Also set currentStage: "summary" in the SAME turn (do not leave currentStage at "stance" / "explore_*" while emitting the completion CTA). Do NOT start Step 3 drafting questions (mechanism, paragraphPlan, logic chain) in Step 2.
+  - If currentStage is "summary", stance/overview is set, and there are enough distinct flat points (≥2 ready-level claims, or student exhausted), set isCompleted: true. Paragraph layout is NOT required.
+  - If points are still too thin/few, do NOT set isCompleted: true; ask for more concrete expansion.
+  - When setting isCompleted: true, Part 2 MUST tell the student to click the left-side 【立即跳转】 button and include the phrase "进入第三步". Also set currentStage: "summary" in the SAME turn. Do NOT start Step 3 drafting or describe Body 1/2 layout in Step 2.
   - Do NOT populate paragraphPlan or step3SubpointSteps while step=2.
 `;
       } else if (Number(step) === 3) {
@@ -9382,12 +10040,12 @@ ${memoryDigestStr}
   Objective: Help students expand one chosen Body Paragraph (主体段) into a complete, logically closed argument. 
 
   ## STEP 3 PLAIN-LANGUAGE / WRITABILITY STANDARD (CRITICAL, governs all Chinese you generate here):
-  - Target learner is IELTS band 5-5.5. Everything you write INTO the logic chain (totalClaim, each subClaim, every steps[].value) AND every sample phrasing you suggest MUST be plain, concrete, and easy to render as ONE simple English sentence.
+  - Target learner is IELTS band 5-5.5. Prefer plain, concrete Chinese that a band 5-5.5 student can later turn into English — but do NOT gut the student's logic.
   - Concretely:
-    - One idea per line, short subject-verb-object. Do NOT stack multiple clauses.
-    - Use everyday concrete words. AVOID heavy abstract nominalizations and four-character idioms (e.g. 避免"潜移默化中建立自我约束意识""打下决定性的基石""不可替代的社会化功能""全方位的社交接口").
-    - Writability test before writing any value: "Could a band 5-5.5 student translate this into ONE simple English sentence?" If not, simplify.
-  - This controls PHRASING/GRANULARITY only. Do NOT weaken the logic or drop necessary reasoning steps — keep the argument rigorous, just say it plainly.
+    - Everyday concrete words. AVOID heavy abstract nominalizations and four-character idioms (e.g. 避免"潜移默化中建立自我约束意识""打下决定性的基石""不可替代的社会化功能""全方位的社交接口").
+    - Logic first: keep the student's causal chain. Closely related layers (e.g. 研发→减污→绿化→生活质量) MAY stay in ONE slot as a fluent multi-clause sentence. FORBIDDEN: over-compress into a slogan that drops half their meaning just to be "one short SVO".
+    - Only split across slots when layers serve clearly different argument functions AND later empty slots exist; never mutate confirmed steps or invent new plan steps mid-dialogue.
+  - This controls PHRASING only. Do NOT weaken the logic or drop necessary reasoning steps.
   - Do NOT provide a second "higher-band" Chinese version. Language upgrading happens later in the English writing stage, not here.
   - Bad -> Good:
     - Bad: "这种即时的纪律约束和监督机制，能帮助低自律群体在潜移默化中建立起基本的自我约束意识。"
@@ -9401,9 +10059,10 @@ ${memoryDigestStr}
   - When framework fields are present, Step 3's job is to FILL argument content via dialogue — NOT to re-decide essay-level layout (2 vs 3 bodies, merge vs split points across bodies, major/minor assignment, or argumentRelation).
   - Mapping framework → paragraphPlan:
     - \`paragraphDensity: "single_point"\` → \`mode: "single_point"\`, exactly ONE pointBlock for the major mapped point.
-    - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major: 2–3 steps; minor: 1–2 steps).
-    - Set each pointBlock.\`subClaim\` from the mapped point text; set \`role\` from \`pointRoles\`.
-    - ALREADY-PREFILLED CLAIM SLOT (CRITICAL): when a pointBlock has a non-empty \`subClaim\` (a full claim sentence inherited from Step 2), the server has ALREADY pre-filled that pointBlock's first claim slot (「分论点」/「核心观点」) with the subClaim and marked it confirmed. Treat it as DONE: do NOT re-ask "你的分论点是什么", do NOT echo it back for confirmation, do NOT treat it as the firstEmpty. Start your Socratic ask from the first EMPTY slot (the slot cursor in ContextSummary is authoritative).
+    - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major/详写: prefer ≥4 steps including claim; minor/略写: 1–2 steps). Do not thin the major chain just to make room for minor.
+    - Set each pointBlock.\`subClaim\` ONLY when mapped point text is already a FULL CLAIM SENTENCE (planning hint). If mapped text is only a theme head (e.g. 「环境保护」「人际关系」), put that word in \`label\` / theme and leave \`subClaim\` empty. Set \`role\` from \`pointRoles\`.
+    - Board is TWO layers: (1) 论点 = one full claim sentence (2) 论证过程 = mechanism/example/impact steps (may be multiple steps). Theme words are labels only.
+    - CONFIRM-THEN-WRITE (CRITICAL — all slots): Server NEVER silent-writes \`steps[].value\`. Write path is always pending →【确认】→ write. DEFAULT for each firstEmpty: mode=expand — use Step2/Planner snippets as a QUESTION SEED to guide the student to补论证. When confirming, organize the student's meaning into pendingText that stays logically complete — closely related multi-layer content may stay in ONE pendingText; do NOT oversimplify. Split to pendingDrafts / later slots ONLY when layers are clearly different argument functions and empty slots exist. FORBIDDEN: cutting the same Step2 blob into near-duplicate confirms; FORBIDDEN: saying「分论点已确立」while the claim slot is still empty; FORBIDDEN: starting at 展开原因 before 论点 is confirmed; FORBIDDEN: rewriting confirmed steps or inserting new steps mid-dialogue. ContextSummary firstEmpty is authoritative.
     - \`argumentRelation\` (or legacy \`stanceRelation\`) selects REQUIRED argument beats for this body. Cover those beats with open student-filled steps; do NOT force a fixed step count or fixed canned labels:
       - supports / elaborates: no mandatory beats. Choose 2–4 steps from the expansion strategies below that best fit the student's STEP 2 materials. NEVER default to a fixed "claim → reason → mechanism → example" template — different materials need different chains (e.g. a material strong on causal logic uses mechanism→impact; a material strong on concrete situations uses example→explanation).
       - concedes: must cover (1) acknowledge the opposite side exists (2) show why it does not overturn the overall thesis — step count flexible.
@@ -9417,7 +10076,7 @@ ${memoryDigestStr}
     - \`contrast\`: the material compares two sides or before/after → steps highlight the contrast.
     - \`hybrid\`: the material requires 2+ strategies mixed (e.g. mechanism + example) → combine as needed within budget.
     - Record your choice in \`pointBlock.expansionStrategy\`. DO NOT write every block as "mechanism" or follow the same template for every body paragraph. Two body paragraphs with the same relation but different material SHOULD produce different step layouts.
-  - CONTENT REUSE FROM STEP 2 (CRITICAL): \`mappedPoints\` / userPoints are APPROVED EVIDENCE FOR ASKING ONLY. On every empty slot (including kickoff), use Step 2 as clues for a beat-specific Socratic question (mode=expand). FORBIDDEN: polishing / completing Step 2 into a full sentence and putting it in \`step3SlotEval.pendingText\` for the student to merely affirm — that is LLM代劳. mode=confirm is allowed ONLY after the student has themselves stated this beat in Step 3 chat; then pendingText may paraphrase THEIR words (no new facts). Keep all \`steps[].value\` empty until the server commits on affirm. Omit beats Step 2 never covered — ask, do not invent.
+  - CONTENT REUSE FROM STEP 2 / PLANNER (CRITICAL): Never invent from zero. DEFAULT = expand with material as seed (e.g.「你提到超长时间工作——这对家人陪伴具体会怎样？」). Confirm when the beat is complete enough and non-redundant vs confirmed siblings. After student answers, organize THEIR words into pendingText for【确认】 — keep their causal layers when tightly related (fluent multi-clause OK); FORBIDDEN: crushing a rich answer into a short slogan. Split across slots only for clearly different functions + empty later slots. FORBIDDEN: rubber-stamping thin Step2 cuts; FORBIDDEN: writing \`steps[].value\` yourself; FORBIDDEN: mutating the plan skeleton mid-dialogue.
   - After the student affirms (「对/是的/没问题」), the SERVER writes confirmed values. Your next turn asks the next empty slot with mode=expand (Socratic) unless the student already answered that next beat in this Step 3 dialogue. Do not make the student restate already-confirmed material.
   - Record \`[inherited-step2-framework]\` in \`paragraphPlan.diagnosis\` when inheriting.
   - FORBIDDEN when framework exists: re-asking whether to split/combine mapped points; changing the number of pointBlocks vs Step 2 \`mappedPoints\`; ignoring \`pointRoles\`; re-diagnosing single vs multi-point against the claim text; inventing a new argumentRelation.
@@ -9581,8 +10240,8 @@ ${memoryDigestStr}
        - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
     - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
       - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
-      - 若是 FILLED_OK（且本槽内容来自学生在 Step 3 本轮/本对话中自己说的话，而非仅 Step 2 材料）：mode=confirm + qualified=true + pendingText=对学生原话的整理句。text 结构必须简洁：先 1 句肯定反馈 → 引出整理句（单独成行，只写句子本身，不要再套「具体机制：」等标签）→ 一句「请点击下方的【确认】按钮写入看板」。FORBIDDEN: 在确认前追问下一槽/下一场景；确认动作由气泡底部按钮承载，不要让学生文字回复「对」。SERVER 在按钮/affirm 后才写入 confirmed。
-      - CRITICAL — MULTI-SLOT BATCH CONFIRM（一句盖多格）: 若学生【本轮原话】已足够、且能拆成同一 pointBlock 内从 firstEmpty 起连续 ≥2 个【彼此不同】的空槽内容，则一次提交：mode=confirm + qualified=true + pendingDrafts=[{activeKey, pendingText}, ...]（按空槽顺序，activeKey 必须与 ContextSummary 连续空槽一致），activeKey/pendingText 填第一格即可。text 列出 1…N 句整理句后，只引导点击【确认】一次全部写入；FORBIDDEN 同时开问下一空槽；FORBIDDEN 把学生没说到的格也编进 pendingDrafts；不够就仍单槽 expand/confirm。
+      - 若是 FILLED_OK（本轮学生已说清，或 Step2/Planner 对该槽材料已够）：mode=confirm + qualified=true + pendingText=整理句（来自学生本轮原话，或基于已有材料的完善句，禁止编造新事实）。整理句以逻辑严谨通顺为准：关联密切的多层可放在同一 pendingText；FORBIDDEN 为「简短」而删掉学生已说清的因果环。text：短反馈 → 整理句单独成行 → 引导点击【确认】。FORBIDDEN: 确认前追问下一槽；不要让学生文字回「对」。SERVER 仅在【确认】后写入。
+      - CRITICAL — MULTI-SLOT BATCH CONFIRM: 仅当学生本轮内容明显分属【不同论证功能】、且同一 pointBlock 内从 firstEmpty 起有连续 ≥2 个空槽可对上时，才用 pendingDrafts 一批确认。关联很紧的一层链优先放进当前槽一个 pendingText，不必强行拆槽、也不要中途加槽。够拆才拆；不够或同链则单槽 confirm/expand。
       - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
      - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
      - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
@@ -9616,21 +10275,21 @@ ${memoryDigestStr}
 
   DECIDING COMPLETION:
   - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段保留下来的所有 slot 均为 \`status: "confirmed"\`，且左侧教练已确认本段所需的原因/机制/影响等要素足够完整、充实时，才可设为 true；只要还有空步骤、draft 步骤或关键推导缺口就必须保持 false。右侧 paragraphPlan 只同步这项对话判断。
-  - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` and MUST NOT set \`status: "confirmed"\`. Slot writing is SERVER-ONLY after student affirm. Emit quality judgment ONLY via top-level \`step3SlotEval\` { activeKey, mode: "expand"|"confirm", qualified, pendingText?, pendingDrafts?, rejectReason? }. When mode=confirm: single-slot needs pendingText; multi-slot (≥2 consecutive same-block empties covered by THIS utterance) use pendingDrafts. pendingText/pendingDrafts MUST paraphrase the student's own Step 3 words (not a Step 2 rewrite). When mode=expand, ask a beat-specific Socratic question in \`text\` Part 2 — do NOT present a full ready-made sentence for them to rubber-stamp.
+  - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` / \`status: "confirmed"\`. Write only via server after【确认】. Use \`step3SlotEval\` { activeKey, mode, qualified, pendingText?, pendingDrafts? }. DEFAULT mode=expand with Step2 seed to补论证. mode=confirm + pendingText when (a) student just stated the beat and you organize THEIR words (preserve tightly related layers in one text), or (b) the beat is complete enough and non-redundant vs confirmed siblings. Never rewrite confirmed slots.
   - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
-  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`mode\` / \`diagnosis\` / \`subClaim\` / \`expansionStrategy\` / \`placeholder\` are YOUR internal planning context (allowed to anticipate). But \`steps[].value\` must stay empty until the server commits after affirm. You may propose polished wording ONLY in \`step3SlotEval.pendingText\` after the student has spoken this beat — never as an unconfirmed board value, and never as a Step-2-only completion.
-  - CRITICAL — KICKOFF / FIRST PLANNING TURN (same step3SlotEval contract): On the opening turn, emit the paragraphPlan skeleton with ALL \`steps[].value\` empty. ALWAYS mode=expand for the firstEmpty beat. YOU own the student-facing Socratic ask in \`text\` (natural Chinese coach voice — do NOT use stiff templates like「请用一句话自己写出…不会替你先写好」). Use Step 2 only as a light hint inside the question. FORBIDDEN on kickoff: mode=confirm / pendingText / listing polished reason+example+impact bullets OR narrative lines like「原因：…」「场景：…」「影响：…」for the student to affirm / say「没问题」. You may briefly name the planned chain shape in abstract (e.g. 原因→场景→影响) WITHOUT writing out full sentences for each beat. Do NOT write into \`steps[].value\` yourself. The SERVER never templates your ask — it only aligns state / writes on affirm.
-  - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM: Expand-needed content must be completed by the student. Never write the full argument for them and then ask「对」/「合适吗」/「没问题」. Confirm is only for organizing what THEY already said in this Step 3 turn.
-  - CRITICAL — STUCK / 「不知道」: If the student cannot answer, give at most ONE short clue from Step 2 or a narrower follow-up question. FORBIDDEN: writing a complete ready-made sentence and asking them to rubber-stamp it (「用这句话…合适吗」).
-  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, Part 2 should mainly ask the student to affirm/revise the pending sentence(s). For pendingDrafts, list all items once. Guide the student to click the【确认】button below the chat (do NOT ask them to reply「对」in text); if something needs fixing, tell them to write the correction in the input box. After they confirm, your NEXT reply asks the next empty beat with mode=expand.
+  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`subClaim\` is planning only — does NOT write the board. First pointBlock step must be a claim slot (分论点/核心观点).
+  - CRITICAL — KICKOFF / FIRST PLANNING TURN: ALL \`steps[].value\` empty. firstEmpty MUST be the claim slot when it is empty — never skip to 展开原因. Theme heads (人际关系) are labels only. DEFAULT: mode=expand — seed a question from Step2 toward a full 论点句 (NOT「为什么」as a reason ask; NOT「分论点已确立」). Only if a full claim sentence is already especially complete may you mode=confirm on the claim slot. FORBIDDEN: rubber-stamp whole chain; FORBIDDEN: confirm 原因/机制 on kickoff while claim empty.
+  - CRITICAL — ANTI-REDUNDANT CONFIRMS: Do not slice one Step2 idea into multiple near-duplicate confirm sentences. Each confirm must add a new argument layer (e.g. claim = conclusion; reason = why; mechanism = how).
+  - CRITICAL — STUCK / 「不知道」: One short Step2 clue or narrower follow-up; then let them speak before confirm.
+  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, guide【确认】button (do NOT ask them to reply「对」in text); micro-edits go in the input. After they confirm, NEXT reply asks the next empty beat (expand or confirm based on remaining material).
   - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, ...}\` with either \`pendingText\` (one slot) or \`pendingDrafts\` (≥2). If you write organized sentences in \`text\` without declaring confirm + pendingText/pendingDrafts, the server cannot stage them. Therefore:
-    1. When mode=expand, NEVER present a ready-made sentence and ask the student to confirm it in text; ask a Socratic question instead.
+    1. When mode=expand, ask a Socratic补全 question (no ready-made rubber-stamp in expand mode).
     2. When mode=confirm, ALWAYS declare \`pendingText\` (and \`pendingDrafts\` for ≥2) in this same response; the UI confirm button appears only from the server-staged pending.
-    3. After a student confirms, your next turn asks the NEXT empty slot with mode=expand (batch already wrote everything that utterance covered).
+    3. After a student confirms, your next turn handles the NEXT empty slot.
   - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
   - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
   - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
-  - CRITICAL — NO INVENTED SLOT PROSE: Never invent facts not present in the student's Step 3 words (Step 2 may cue the question, not supply the slot sentence). For any beat the student has not yet said in Step 3, leave board empty and ASK (mode=expand).
+  - CRITICAL — NO INVENTED SLOT PROSE: Never invent facts not present in Step2 / this Step3 dialogue. Thin material → expand补全; enough material → confirm organized sentence.
   - CRITICAL — CHAT vs BOARD AFTER CONFIRM: Once values are on the board, chat may only restate non-empty confirmed \`steps[].value\`. During confirmation, chat may show the pending organized sentence while slots are still empty (server-managed pending from your step3SlotEval).
   - CRITICAL — NO PLACEHOLDER-ECHO (this causes silent premature completion): Never copy your own \`placeholder\`（"例如：..." hint）into pendingText or imply it is board content — verbatim or with only the "例如：" prefix stripped — for any step the student has not actually answered.
   - CRITICAL — CONFIRMED VALUE IMMUTABILITY: Once a step has \`status: "confirmed"\` (server-written), it is FROZEN. Later turns MUST NOT propose replacing it unless the student explicitly corrects that step in chat.
@@ -9740,7 +10399,7 @@ JSON Output Schema rules:
 - "text" is ALWAYS required.
 - You MUST populate "step1Data" / "step2Data" inside "progressUpdate" IN REAL-TIME as the Socratic dialogue progresses.
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
-  - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "suggestedStance", "suggestedPoints", "blueprint", "onlinePros", "offlinePros", and the three checks (positionCheckPassed, coverageCheckPassed, structureCheckPassed) with descriptions.
+  - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
   - For Step 3: "paragraphPlan" is the SINGLE SOURCE OF TRUTH for STRUCTURE when present. It MUST include mode, diagnosis, optional totalClaim, and pointBlocks with role, expansionStrategy, and nested steps. You MUST NOT fill unconfirmed steps[].value / status:confirmed — emit quality judgment via top-level step3SlotEval instead; the server writes slots only after student affirm. Also always emit "step3SubpointSteps" as a flattened compatibility projection. The legacy fields are OPTIONAL best-effort mirrors. Keep "step3SubpointCompleted" and "currentSubpointHint" updated. Always also emit step3SlotEval for the current firstEmpty (activeKey/mode/qualified/pendingText).
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
@@ -10025,7 +10684,11 @@ Student says:
                         items: { type: Type.STRING },
                       },
                       suggestedStance: { type: Type.STRING },
-                      suggestedPoints: { type: Type.STRING },
+                      suggestedPoints: {
+                        type: Type.STRING,
+                        description:
+                          "DEPRECATED. Always return empty string. No English polished points.",
+                      },
                       blueprint: {
                         type: Type.OBJECT,
                         properties: {
@@ -10239,7 +10902,6 @@ Student says:
                       "critique",
                       "suggestions",
                       "suggestedStance",
-                      "suggestedPoints",
                     ],
                   },
                   step3Data: {
@@ -10368,13 +11030,18 @@ Student says:
           const safePart1 =
             bestSplit.part1 ||
             String(retryData?.text || data?.text || "我们继续推进。").trim();
-          const safePart2 = fallbackNextStep(currentStepNum, session);
+          const safePart2 = fallbackNextStep(
+            currentStepNum,
+            session,
+            retryData?.progressUpdate?.step2Data ||
+              data?.progressUpdate?.step2Data,
+          );
           retryData.text = `${safePart1}\n\n---\n\n${safePart2}`;
           if (!retryData.progressUpdate) {
             retryData.progressUpdate = { isCompleted: false };
           }
           console.warn(
-            `[CoachGuard] Retry still invalid. Applied fallback next-step template. reason=${retryCheck.reason}`,
+            `[CoachGuard] Retry still invalid. Applied content-aware fallback next-step. reason=${retryCheck.reason}`,
           );
         }
         data = retryData;
@@ -10431,6 +11098,12 @@ Student says:
         applyNoStanceGate(question, data, session);
         enforceStep2DimensionDispositionGuard(data, session);
         enforceStep2StanceMaterialGuard(data, session, userMessage);
+        applyStep2PlannerPayloadNormalize(
+          question,
+          data,
+          session,
+          userMessage,
+        );
         enforceStep2Momentum(data, session);
       }
 
@@ -10811,14 +11484,14 @@ Student says:
         2. Evaluate the Sub-arguments: Are there 2 distinct, logical sub-points? Do they support the stance without overlapping or repeating?
         3. Provide an encouraging, analytical, and highly professional critique (in Chinese, 3-4 sentences). Do NOT output any XML tags or internal thinking steps.
         4. Give 2-3 specific bullet-point suggestions for improvement.
-        5. Formulate a polished, high-scoring IELTS-ready version of their Stance (in English) and Points (in English and Chinese) for them to study and compare.
+        5. Optionally give a short Chinese paraphrase of their stance (no English polish, no rewritten English points).
 
         Format your output strictly as a JSON object matching this schema:
         {
           "critique": "string (coaching review in Chinese)",
           "suggestions": ["string (suggestion 1)", "string (suggestion 2)"],
-          "suggestedStance": "string (polished English stance)",
-          "suggestedPoints": "string (polished English/Chinese sub-arguments)"
+          "suggestedStance": "string (optional Chinese stance paraphrase)",
+          "suggestedPoints": ""
         }
       `;
 
@@ -10835,13 +11508,15 @@ Student says:
                 items: { type: Type.STRING },
               },
               suggestedStance: { type: Type.STRING },
-              suggestedPoints: { type: Type.STRING },
+              suggestedPoints: {
+                type: Type.STRING,
+                description: "Deprecated. Always empty string.",
+              },
             },
             required: [
               "critique",
               "suggestions",
               "suggestedStance",
-              "suggestedPoints",
             ],
           },
         },
@@ -10853,6 +11528,7 @@ Student says:
         suggestedStance: "",
         suggestedPoints: "",
       });
+      data.suggestedPoints = "";
       res.json(data);
     } catch (error: any) {
       console.error("Error in /api/coach/evaluate-step2:", error);
@@ -11611,14 +12287,16 @@ Student says:
         return result;
       };
 
-      const inferSection = (taskId: string): "intro" | "body1" | "body2" | "conclusion" => {
+      const inferSection = (taskId: string): string => {
         if (taskId.startsWith("intro-")) return "intro";
-        if (taskId.startsWith("body1-")) return "body1";
-        if (taskId.startsWith("body2-")) return "body2";
-        return "conclusion";
+        if (taskId.startsWith("conclusion")) return "conclusion";
+        const bodyMatch = taskId.match(/^body(\d+)-/i);
+        if (bodyMatch) return `body${bodyMatch[1]}`;
+        return "body1";
       };
 
       const claimRegex = /(?:^|_)(subclaim|claim)$/i;
+      const claimLabelRegex = /分论点|核心观点|核心主张|主张|论点|观点|claim/i;
       const extractBodySentences = (plan: any): string[] => {
         if (!plan || typeof plan !== "object") return [];
 
@@ -11634,8 +12312,12 @@ Student says:
           let claimStepIndex = -1;
           for (let i = 0; i < steps.length; i += 1) {
             const key = normalizeText(steps[i]?.key);
+            const label = normalizeText(steps[i]?.label);
             const value = normalizeText(steps[i]?.value);
-            if (value && claimRegex.test(key)) {
+            if (
+              value &&
+              (claimRegex.test(key) || claimLabelRegex.test(label))
+            ) {
               claimStepIndex = i;
               break;
             }
@@ -11660,40 +12342,100 @@ Student says:
         return dedupeOrdered(sentences);
       };
 
-      const extractBodyClaimContext = (plan: any): string => {
-        if (!plan || typeof plan !== "object") return "";
-        const totalClaim = normalizeText(plan.totalClaim);
-        if (totalClaim) return totalClaim;
+      /** Short direction labels for intro/conclusion foreshadow (not full claim copy). */
+      const extractBodyClaimContext = (plan: any, sp?: any): string => {
+        const theme = normalizeText(sp?.theme || sp?.label);
+        if (!plan || typeof plan !== "object") return theme;
 
+        const totalClaim = normalizeText(plan.totalClaim);
         const pointBlocks = Array.isArray(plan.pointBlocks) ? plan.pointBlocks : [];
-        const subClaims = dedupeOrdered(
-          pointBlocks.map((block: any) => normalizeText(block?.subClaim)).filter(Boolean),
-        );
-        return subClaims.join("；");
+        const fromSteps: string[] = [];
+        for (const block of pointBlocks) {
+          const label = normalizeText(block?.label);
+          const sub = normalizeText(block?.subClaim);
+          const steps = Array.isArray(block?.steps) ? block.steps : [];
+          let claimVal = "";
+          for (const step of steps) {
+            const key = normalizeText(step?.key);
+            const stepLabel = normalizeText(step?.label);
+            const value = normalizeText(step?.value);
+            if (
+              value &&
+              (claimRegex.test(key) || claimLabelRegex.test(stepLabel))
+            ) {
+              claimVal = value;
+              break;
+            }
+          }
+          const head = label || theme;
+          // Prefer theme/label; if only a long claim exists, keep a short head
+          if (head) {
+            fromSteps.push(head);
+          } else if (claimVal) {
+            fromSteps.push(
+              claimVal.length > 28 ? `${claimVal.slice(0, 28)}…` : claimVal,
+            );
+          } else if (sub) {
+            fromSteps.push(sub.length > 28 ? `${sub.slice(0, 28)}…` : sub);
+          }
+        }
+        const joined = dedupeOrdered(fromSteps).join("；");
+        if (joined) return joined;
+        if (totalClaim) {
+          return totalClaim.length > 36
+            ? `${totalClaim.slice(0, 36)}…`
+            : totalClaim;
+        }
+        return theme;
+      };
+
+      const bodyIndexFromSubpoint = (sp: any, fallback: number): number => {
+        const target = normalizeText(sp?.targetBody);
+        const mTarget = target.match(/(\d+)/);
+        if (mTarget) return Math.max(1, parseInt(mTarget[1], 10));
+        const id = normalizeText(sp?.id);
+        const mId = id.match(/(\d+)/);
+        if (mId) return Math.max(1, parseInt(mId[1], 10));
+        return fallback;
       };
 
       const allSubpoints = Array.isArray(subpoints) ? subpoints : [];
-      const body1Subpoint =
-        allSubpoints.find((sp) =>
-          normalizeText(sp?.targetBody).toLowerCase().includes("1"),
-        ) || allSubpoints[0];
+      const seenBodyIds = new Set<string>();
+      const orderedBodies = allSubpoints
+        .filter((sp: any) => {
+          const id = normalizeText(sp?.id) || JSON.stringify(sp?.targetBody || "");
+          if (!id || seenBodyIds.has(id)) return false;
+          seenBodyIds.add(id);
+          return true;
+        })
+        .sort((a: any, b: any) => {
+          return (
+            bodyIndexFromSubpoint(a, 99) - bodyIndexFromSubpoint(b, 99)
+          );
+        });
 
-      let body2Subpoint =
-        allSubpoints.find((sp) =>
-          normalizeText(sp?.targetBody).toLowerCase().includes("2"),
-        ) || allSubpoints[1];
-      if (body1Subpoint && body2Subpoint && body1Subpoint.id === body2Subpoint.id) {
-        body2Subpoint = undefined;
-      }
+      // Prefer actual Step3 bodies in order; fall back to index 1..n
+      const bodyEntries = orderedBodies.map((sp: any, idx: number) => {
+        const bodyNum = idx + 1;
+        const plan = sp?.paragraphPlan;
+        return {
+          bodyNum,
+          sp,
+          sentences: extractBodySentences(plan),
+          claimContext: extractBodyClaimContext(plan, sp),
+        };
+      });
 
-      const body1Plan = body1Subpoint?.paragraphPlan;
-      const body2Plan = body2Subpoint?.paragraphPlan;
-      const body1Sentences = extractBodySentences(body1Plan);
-      const body2Sentences = extractBodySentences(body2Plan);
-
-      const body1ClaimContext = extractBodyClaimContext(body1Plan);
-      const body2ClaimContext = extractBodyClaimContext(body2Plan);
       const stance = normalizeText(selectedThesis) || "需要结合题干进行立场表达";
+      const bodyCount = Math.max(bodyEntries.length, 1);
+      const bodyContextBlock = bodyEntries.length
+        ? bodyEntries
+            .map(
+              (b) =>
+                `Body ${b.bodyNum} direction (theme/label only):\n"${b.claimContext || "（缺失）"}"`,
+            )
+            .join("\n\n")
+        : `Body 1 direction (theme/label only):\n"（缺失）"`;
 
       const inputElements: {
         id: string;
@@ -11707,23 +12449,22 @@ You are an IELTS Writing coach creating Chinese sentence-level semantic targets 
 Topic question:
 "${question}"
 
-Stance:
+Full stance (for YOUR reference only — do NOT copy it nearly verbatim into introStance/conclusion):
 "${stance}"
 
-Body 1 core claim context:
-"${body1ClaimContext || "（缺失）"}"
-
-Body 2 core claim context:
-"${body2ClaimContext || "（缺失）"}"
+There are ${bodyCount} body paragraph(s). Direction cues (themes / short labels — NOT full argument chains):
+${bodyContextBlock}
 
 Generate exactly three Chinese outputs:
-1) introParaphrase: A concise paraphrase of the original topic sentence. It should be a topic restatement only.
-2) introStance: One sentence that states the overall stance while naturally foreshadowing the two body directions.
-3) conclusion: One sentence that summarizes the final stance with concise reference to the two body directions. Must not copy introStance wording.
+1) introParaphrase: A concise paraphrase of the original topic sentence. Topic restatement only.
+2) introStance: One sentence stating the overall position and lightly foreshadowing the ${bodyCount} body direction(s) by theme words only.
+3) conclusion: One sentence summarizing the final position with brief nod to those body directions. Must not copy introStance wording.
 
-Rules:
-- All three fields MUST be Chinese only.
-- Keep each field as one sentence.
+CRITICAL — REDUCE OVERLAP / EASE PARAPHRASE (introStance + conclusion):
+- Moderately SUMMARIZE / GENERALIZE. Do NOT paste the full stance sentence or full body claim sentences.
+- Prefer short judgment + direction nouns (e.g. 就业、社会安定、政府投入), not long causal chains already practiced in Body tasks.
+- Keep lexical overlap with the Full stance string LOW (avoid reusing long identical chunks).
+- Each of the three fields remains ONE Chinese sentence.
 - Do NOT include bullets, numbering, or explanation text.
       `;
 
@@ -11749,10 +12490,10 @@ Rules:
         "该题围绕一个公共议题展开讨论，需要比较不同路径并作出判断。";
       const introStance =
         normalizeText(introConclusionData?.introStance) ||
-        `${stance}，并将结合两个主体段展开论证。`;
+        `本文持明确立场，并将从${bodyCount}个方面展开论证。`;
       const conclusion =
         normalizeText(introConclusionData?.conclusion) ||
-        `综上所述，${stance}这一立场更具说服力。`;
+        `综上所述，上述${bodyCount}个方面共同支撑了这一立场。`;
 
       inputElements.push({
         id: "intro-1",
@@ -11767,20 +12508,14 @@ Rules:
         label: "第一段：总立场句",
       });
 
-      body1Sentences.forEach((sentence, index) => {
-        inputElements.push({
-          id: `body1-${index + 1}`,
-          type: "body1_sentence",
-          chineseText: sentence,
-          label: `Body 1 句子 ${index + 1}`,
-        });
-      });
-      body2Sentences.forEach((sentence, index) => {
-        inputElements.push({
-          id: `body2-${index + 1}`,
-          type: "body2_sentence",
-          chineseText: sentence,
-          label: `Body 2 句子 ${index + 1}`,
+      bodyEntries.forEach((body) => {
+        body.sentences.forEach((sentence, index) => {
+          inputElements.push({
+            id: `body${body.bodyNum}-${index + 1}`,
+            type: `body${body.bodyNum}_sentence`,
+            chineseText: sentence,
+            label: `Body ${body.bodyNum} 句子 ${index + 1}`,
+          });
         });
       });
 
@@ -12083,8 +12818,11 @@ Rules:
 
       console.log("[generate-sentence-tasks]", {
         subpointsCount: allSubpoints.length,
-        body1SentenceCount: body1Sentences.length,
-        body2SentenceCount: body2Sentences.length,
+        bodyCount: bodyEntries.length,
+        bodySentenceCounts: bodyEntries.map((b) => ({
+          body: b.bodyNum,
+          sentences: b.sentences.length,
+        })),
         inputElementIds: inputElements.map((el) => el.id),
         mergedTaskIds: mergedTasks.map((task) => `${task.id}:${task.section}`),
         llmTaskCount: llmTasks.length,

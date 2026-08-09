@@ -878,6 +878,28 @@ export function computeEssayFrameworkSignature(session: any): string {
   return [stance, bodyCount, layout, clusterSig].join("::");
 }
 
+/**
+ * Theme / structural key for framework fingerprinting.
+ * Must NOT include confirmed claim sentences — those change during Step3 dialogue
+ * (pending → affirm) and must not look like a Planner framework change.
+ */
+export function resolveFrameworkThemeKey(subpoint: any): string {
+  const theme = String(subpoint?.theme || "").trim();
+  if (theme) return theme;
+  const content = String(subpoint?.content || "").trim();
+  const placeholder = content.match(/^（主题：(.+?)，待确认论点句）$/);
+  if (placeholder) return String(placeholder[1] || "").trim();
+  // Bare short heads only; full claim sentences are runtime board state, not framework.
+  if (
+    content &&
+    content.length <= 16 &&
+    !/是|能|会|应该|因为|所以|导致|使得|牺牲|降低|提升/.test(content)
+  ) {
+    return content;
+  }
+  return "";
+}
+
 /** Stable fingerprint for Step 2 → Step 3 body framework handoff. */
 export function computeSubpointFrameworkSignature(
   subpoint: any,
@@ -899,7 +921,7 @@ export function computeSubpointFrameworkSignature(
   const essaySig = session ? computeEssayFrameworkSignature(session) : "";
   return [
     String(subpoint.id || "").trim(),
-    String(subpoint.content || "").trim(),
+    resolveFrameworkThemeKey(subpoint),
     String(subpoint.targetBody || "").trim(),
     String(subpoint.paragraphDensity || "").trim(),
     resolveArgumentRelation(subpoint),

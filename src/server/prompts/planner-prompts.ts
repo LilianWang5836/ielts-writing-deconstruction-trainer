@@ -8,7 +8,11 @@ export interface StrategyDef {
   appliesWhen: string;
   argumentRelation: string;
   layoutPattern: string;
-  bodyCount: number;
+  /**
+   * @deprecated Segment count is decided dynamically from materials (retentionRole /
+   * ready points). Kept optional for docs/compat; do NOT treat as a hard lock.
+   */
+  bodyCount?: number;
 }
 
 /** 所有题型的策略枚举 */
@@ -199,19 +203,54 @@ export function buildPlannerPrompt(input: {
   questionType: string;
   requiresStance: boolean;
   materials: {
-    aSide: string;
-    bSide: string;
+    aSide?: string;
+    bSide?: string;
     stance: string;
+    points?: Array<{
+      id: string;
+      claim: string;
+      elaboration?: string;
+      quality?: string;
+      leanTags?: string[];
+      retentionRole?: 'detail' | 'brief' | 'dropped' | string;
+    }>;
+    stanceMeta?: { polarity?: string; strength?: string };
+    coverage?: {
+      requiredBuckets?: string[];
+      missingBuckets?: string[];
+      filledBuckets?: string[];
+    };
+    /** Soft material digest for bodyCount judgment (not a hard lock). */
+    materialDigest?: string;
   };
 }): string {
   const strategies = STRATEGY_TABLE[input.questionType] || FALLBACK_STRATEGIES;
 
+  // Strategy names decide relation/layout ONLY — never lock bodyCount.
   const strategyBlock = strategies
     .map(
       (s) =>
-        `- **${s.name}**：${s.description}（适用：${s.appliesWhen}）→ relation=${s.argumentRelation}, layout=${s.layoutPattern}, bodyCount=${s.bodyCount}`,
+        `- **${s.name}**：${s.description}（适用：${s.appliesWhen}）→ relation=${s.argumentRelation}, layout=${s.layoutPattern}`,
     )
     .join('\n');
+
+  const points = Array.isArray(input.materials.points) ? input.materials.points : [];
+  const roleLabel = (r?: string) =>
+    r === 'detail' ? '详写' : r === 'brief' ? '略写' : r === 'dropped' ? '放下' : '未标详略';
+  const pointsBlock = points.length
+    ? points
+        .map(
+          (p, i) =>
+            `${i + 1}. id=${p.id} | quality=${p.quality || '?'} | retentionRole=${roleLabel(p.retentionRole)} | tags=${(p.leanTags || []).join(',') || 'general'}\n   claim: ${p.claim}\n   elaboration: ${p.elaboration || '（无）'}`,
+        )
+        .join('\n')
+    : `（无结构化 points；兼容文本）\n- A侧：${input.materials.aSide || '（无）'}\n- B侧：${input.materials.bSide || '（无）'}`;
+
+  const stanceMeta = input.materials.stanceMeta || {};
+  const coverage = input.materials.coverage || {};
+  const digest =
+    String(input.materials.materialDigest || '').trim() ||
+    '（无摘要：请直接根据上方 points 的 quality / retentionRole 判断）';
 
   return `你是一个 IELTS Task 2 段落结构规划器。
 
@@ -219,27 +258,37 @@ export function buildPlannerPrompt(input: {
 1. 题目：${input.question}
 2. 题型：${input.questionType}
 3. 是否需要明确立场：${input.requiresStance ? '是' : '否'}
-4. 学生原材料：
-   - A面论据：${input.materials.aSide || '（无）'}
-   - B面论据：${input.materials.bSide || '（无）'}
-   - 立场：${input.materials.stance || '（未明确）'}
+4. 立场：${input.materials.stance || '（未明确）'}（polarity=${stanceMeta.polarity || 'unknown'}, strength=${stanceMeta.strength || 'unknown'}）
+5. 材料覆盖：required=${(coverage.requiredBuckets || []).join(',') || '无硬性双桶'}; filled=${(coverage.filledBuckets || []).join(',') || '无'}; missing=${(coverage.missingBuckets || []).join(',') || '无'}
+6. 材料摘要（供 bodyCount 动态判断，非死公式）：
+${digest}
+7. 学生平行论点（Step2 plannerPayload.points — 尚未排段）：
+${pointsBlock}
 
 【第1步：盘点原材料】
-分析 A面 和 B面 的论据：
-- 列出每个具体论点
-- 判断每个论点的强度：强（有具体场景/机制支撑） / 弱（空泛提纲）
-- 结论：材料天然偏向哪一侧？两侧都有实质内容还是明显失衡？
+按上面的 points 逐条盘点：
+- 哪些是 ready（有场景/机制）/ thin；哪些是 详写(detail) / 略写(brief) / 放下(dropped)
+- 标签桶是否满足题型硬性要求
+- Agree/Disagree 且 strength=full：允许双主段 thematic_split，不必强行让步段
+- Discuss Both / 利弊：两侧桶都必须落入不同 Body
 
 【第2步：选择论证策略】
-可选策略（仅限以下，不可编造）：
+可选策略（仅限以下，不可编造；策略名只决定段间关系，不决定段数）：
 ${strategyBlock}
 
 决策规则：
 ① 题型要求（${input.questionType}）
-② 是否需要明确立场（${input.requiresStance ? '是' : '否'}）
-③ 双方材料强弱
+② 是否需要明确立场（${input.requiresStance ? '是' : '否'}）+ polarity/strength
+③ points 强弱、retentionRole（详写/略写）、标签桶
 ④ 观点之间的逻辑关系（支持/让步/并列/因果/问题→解决）
-⑤ Body Count：2（默认）或 3（仅当 3+ 个可独立展开论点 或 Problem→Cause→Solution 或 Discuss Both Views+Personal Opinion）
+⑤ Body Count（必须动态判断 2 或 3，禁止因策略名而默认永远 2）：
+   - 先看「详写 + ready」能否各自支撑一段；再看略写是否必须单独成段
+   - 详写优先各自成 Body；略写默认合并进主题最近的详写 Body（作 supporting / dual_point），不要仅为略写硬开第三段
+   - 仅当存在 ≥3 条互不从属、均可独立展开的主线（多为 3 条详写，或 Problem→Cause→Solution / Discuss Both+个人立场需要三段）时选 bodyCount=3
+   - 2 详写 + 1 略写 → 通常 bodyCount=2（略写并进相关段）
+   - 未标详略时：按 ready 点是否主题独立推断，并在 rationale 注明「未标详略，按可写点推断」
+   - FORBIDDEN：只因为策略是 concession / partial_agreement 就固定 bodyCount=2
+   - 在 rationale 用中文说明为何选 2 或 3（引用 point id 与详略）
 
 输出 YAML：
 \`\`\`yaml
@@ -247,20 +296,29 @@ stance: agree|disagree|balanced|not_required
 argumentStrategy: ${strategies.map(s => s.name).join('|')}
 argumentRelation: supports|concedes|side_by_side|causal|solves|parallel
 layoutPattern: support|concession_then_support|side_by_side|problem_solution|causal|parallel
-bodyCount: 2|3
+bodyCount: 2|3   # 按上方材料动态填写，勿套死值
 \`\`\`
 
 【第3步：分配材料到 Body】
 - 每个 Body 的 role（concession / main_argument / problem / solution / view_A / view_B / evaluation）
 - 每个 Body 的 structure（single_point / dual_point）
-- 每个 Body 包含哪些具体 points
-- 弱论点合并为 Supporting Points
+- 每个 Body 必须给出 mappedPointIds（引用上面的 point id）；禁止编造无来源新论点
+- subClaim 规则（论点句 → 论证过程；论证过程可多步）：
+  - 仅当 mapped claim 已是完整主张句时，才写入 subClaim（完整句）
+  - 若 mapped claim 只是主题词/维度头（如「环境保护」「人际关系」），把词放进 pointBlock.label 或 body theme，subClaim 留空——Step3 会先让学生确认论点句
+  - FORBIDDEN：把主题词当成 subClaim 假装论点已完成
+- 详写点优先独占 Body；略写点合并为 Supporting Points / 同一 Body 的次要 pointBlock（dual_point）
+- dropped 点不要映射进 Body
+- 详略与 pointBlock.role：
+  - 详写主线 → pointBlock.role = "major"
+  - 并入的略写点 → pointBlock.role = "minor"（supporting）
 
 输出 YAML：
 \`\`\`yaml
 bodies:
   - role: concession|main_argument|problem|solution|...
     structure: single_point|dual_point
+    mappedPointIds: [p1]
     points:
       - 论点文本
     expansion: explanation|example|mechanism|impact|comparison|mixed
@@ -272,14 +330,21 @@ bodies:
 要求：
 - 所有 steps[].value 为空字符串 ""
 - 所有 steps[].status 为空字符串 ""
-- placeholder 要贴合具体材料内容（不是泛泛的"请写一个例子"）
+- placeholder 要贴合具体材料内容（不是泛泛的"请写一个例子"）；可提示材料里的多层因果（如研发→减污→生活质量），供 Step3 展开
 - key 需要在整个 plan 内唯一
-- mode 为 "single_point"（单点）或 "total_then_points"（总分型）或 "direct_points"（分点直写）
+- mode 为 "single_point"（单点）或 "total_then_points"（总分型）或 "direct_points"（分点直写；dual_point 常用）
+- 每个 pointBlock.subClaim：仅完整主张句；主题词只进 label，subClaim 用 ""
+- diagnosis / rationale / label / placeholder / subClaim 一律使用中文（禁止英文论述）
+- CRITICAL — 详写 / 略写步数（按 role，不是按整段句数偷懒）：
+  - role=major（详写主线）：steps 建议 ≥4 —— 第1步必须是分论点/核心观点；其后至少 3 个展开槽（按 expansion 选标签，例如：展开原因 / 机制或过程 / 结果或场景 / 影响）。FORBIDDEN：major 只有「论点 + 一句机制」两步就收工。
+  - role=minor（略写/supporting）：steps 1～2 即可（补充点 ± 一句带过）。
+  - dual_point：major 用厚链，minor 用短链；不要为了给 minor 腾位置而把 major 压成 2 步。
+  - 标签贴合材料与 expansionStrategy，不必套死英文模板名；但 major 的展开槽数量要够用。
 
 【输出格式】严格 JSON：
 {
   "layoutPattern": "...",
-  "rationale": "给系统的简短解释：为什么选这个策略和结构",
+  "rationale": "中文说明：为何选该策略，以及为何 bodyCount=2 或 3（引用 point id / 详略）",
   "plannerIntermediate": {
     "stance": "...",
     "argumentStrategy": "...",
@@ -292,25 +357,40 @@ bodies:
       "id": "body-1",
       "targetBody": "Body Paragraph 1",
       "role": "...",
-      "paragraphDensity": "single_point",
+      "paragraphDensity": "dual_point",
       "argumentRelation": "...",
+      "mappedPointIds": ["p1", "p3"],
       "paragraphPlan": {
-        "mode": "single_point",
-        "diagnosis": "...",
+        "mode": "direct_points",
+        "diagnosis": "中文诊断：详写主线 + 略写并入...",
         "pointBlocks": [
           {
             "id": "pb1",
-            "label": "...",
-            "subClaim": "...",
+            "label": "详写主题词或短标签",
+            "subClaim": "",
             "role": "major",
-            "expansionStrategy": "...",
+            "expansionStrategy": "mechanism",
             "steps": [
-              { "key": "pb1_s1", "label": "...", "placeholder": "...", "value": "", "status": "" }
+              { "key": "pb1_s1", "label": "分论点", "placeholder": "本段完整主张句", "value": "", "status": "" },
+              { "key": "pb1_s2", "label": "展开原因", "placeholder": "贴材料：为何成立", "value": "", "status": "" },
+              { "key": "pb1_s3", "label": "机制/过程", "placeholder": "贴材料：可含多层紧密因果", "value": "", "status": "" },
+              { "key": "pb1_s4", "label": "结果/影响", "placeholder": "贴材料：对幸福感/生活的结果", "value": "", "status": "" }
+            ]
+          },
+          {
+            "id": "pb1b",
+            "label": "略写补充标签",
+            "subClaim": "",
+            "role": "minor",
+            "expansionStrategy": "explanation",
+            "steps": [
+              { "key": "pb1b_s1", "label": "补充点", "placeholder": "一两句带过略写点", "value": "", "status": "" }
             ]
           }
         ]
       }
     }
   ]
-}`;
+}
+（bodyPlans 数组长度必须等于你选定的 bodyCount，可为 2 或 3）`;
 }

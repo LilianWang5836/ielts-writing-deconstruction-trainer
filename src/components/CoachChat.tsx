@@ -2,6 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
+import {
+  isClaimSentence,
+  resolveBlockClaimSentence,
+} from '../utils/step3ClaimPrefill';
+import { computeSubpointFrameworkSignature } from '../utils/step3Quality';
 
 /** Step1 Q1 — mutually exclusive chips that fill the input box. */
 const STEP1_QUESTION_TYPES = [
@@ -19,7 +24,11 @@ interface CoachChatProps {
   step: number;
   stepKey: 'step1' | 'step2' | 'step3' | 'step4';
   session: PracticeSession;
-  onUpdateSession: (updates: Partial<PracticeSession>) => void;
+  onUpdateSession: (
+    updates:
+      | Partial<PracticeSession>
+      | ((prev: PracticeSession) => Partial<PracticeSession>),
+  ) => void;
   stepContext: any;
   welcomeMessage: string;
   autoKickoff?: boolean;
@@ -51,6 +60,8 @@ export default function CoachChat({
   const inputRef = useRef<HTMLInputElement>(null);
   const kickoffRef = useRef<string | null>(null);
   const migratedLegacyStep3HistoryRef = useRef(false);
+  const requestSeqRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Get current step's chat history or initialize it
   const activeStep3SubpointId =
@@ -73,7 +84,9 @@ export default function CoachChat({
           )
         : []
       : [];
-  const hasPendingConfirm = pendingDrafts.length > 0 && !loading;
+  // Keep confirm bubble stable while the affirm request is in flight (don't
+  // re-split the coach message on --- just because loading flipped true).
+  const hasPendingConfirm = pendingDrafts.length > 0;
 
   const lastAiHistoryIndex = (() => {
     for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
@@ -116,7 +129,10 @@ export default function CoachChat({
   });
 
   const beginEditPendingDraft = (d: any) => {
-    setInputText(`${d.label || '当前一环'}：`);
+    // Prefill the current confirm sentence so students edit 待确认句, not a blank label.
+    const label = String(d.label || '当前一环').trim();
+    const text = String(d.text || '').trim();
+    setInputText(text ? `${label}：${text}` : `${label}：`);
     inputRef.current?.focus();
   };
 
@@ -137,7 +153,15 @@ export default function CoachChat({
     for (const d of pendingDrafts) {
       const t = String(d?.text || '').trim();
       if (t.length < 4) continue;
-      const variants = [t, `「${t}」`, `"${t}"`, `'${t}'`];
+      const variants = [
+        t,
+        `「${t}」`,
+        `"${t}"`,
+        `'${t}'`,
+        `**${t}**`,
+        `**「${t}」**`,
+        `**“${t}”**`,
+      ];
       for (const v of variants) {
         let from = 0;
         while (from <= raw.length - v.length) {
@@ -154,6 +178,8 @@ export default function CoachChat({
     hits.sort((a, b) => a.start - b.start);
 
     if (hits.length === 0) {
+      // Fallback: still show pending as the only editable confirm target (never
+      // invent a second sentence from chat). Server keeps pending = 待确认句.
       return (
         <>
           <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
@@ -167,7 +193,7 @@ export default function CoachChat({
                 disabled={loading}
                 onClick={() => beginEditPendingDraft(d)}
                 className="block w-full text-left rounded-md bg-amber-50/80 border border-amber-200/70 px-2 py-1.5 text-[12px] leading-relaxed text-slate-800 hover:bg-amber-50 transition disabled:opacity-50"
-                title="点击修改"
+                title="点击修改当前待确认句"
               >
                 {d.text}
                 <Pencil className="inline-block h-3 w-3 ml-1 text-slate-400 align-[-1px]" />
@@ -360,16 +386,19 @@ export default function CoachChat({
     // Optimistically update UI (skip the synthetic kickoff user bubble)
     if (!hiddenUserMessage) {
       if (stepKey === 'step3' && activeSubpointIdAtSend) {
-        const nextSubpoints = (session.step3.subpoints || []).map((sp: any) =>
-          sp.id === activeSubpointIdAtSend
-            ? { ...sp, chatHistory: updatedHistory }
-            : sp,
-        );
-        onUpdateSession({
-          step3: {
-            ...session.step3,
-            subpoints: nextSubpoints,
-          },
+        onUpdateSession((prev) => {
+          const step3 = prev.step3 || session.step3;
+          const nextSubpoints = (step3.subpoints || []).map((sp: any) =>
+            sp.id === activeSubpointIdAtSend
+              ? { ...sp, chatHistory: updatedHistory }
+              : sp,
+          );
+          return {
+            step3: {
+              ...step3,
+              subpoints: nextSubpoints,
+            },
+          };
         });
       } else {
         onUpdateSession({
@@ -381,6 +410,11 @@ export default function CoachChat({
       }
     }
 
+    // Supersede any in-flight coach turn (reset / double-send safety).
+    abortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const reqId = ++requestSeqRef.current;
     setLoading(true);
 
     try {
@@ -391,6 +425,11 @@ export default function CoachChat({
               step3: {
                 ...session.step3,
                 activeSubpointId: activeSubpointIdAtSend,
+                subpoints: (session.step3.subpoints || []).map((sp: any) =>
+                  sp.id === activeSubpointIdAtSend
+                    ? { ...sp, chatHistory: updatedHistory }
+                    : sp,
+                ),
               },
             }
           : session;
@@ -398,6 +437,7 @@ export default function CoachChat({
       const res = await fetch('/api/coach/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: abortController.signal,
         body: JSON.stringify({
           question: topic.question,
           step,
@@ -411,11 +451,15 @@ export default function CoachChat({
         }),
       });
 
+      if (reqId !== requestSeqRef.current) return;
+
       const data = await res.json();
       if (!res.ok || data.error) {
         setErrorMsg(data.error || 'AI Coach 暂无回应，请检查 API 密钥。');
         return;
       }
+
+      if (reqId !== requestSeqRef.current) return;
 
       const newAiMessage: ChatMessage = {
         id: `msg-ai-${Date.now()}`,
@@ -574,6 +618,36 @@ export default function CoachChat({
               }
               if (data.progressUpdate.paragraphPlan) {
                 updatedSp.paragraphPlan = data.progressUpdate.paragraphPlan;
+                // Sync body「论点」from confirmed claim-step (theme heads ignored)
+                try {
+                  const pendingMap = new Map<string, string>();
+                  const drafts =
+                    data.progressUpdate.step3KickoffPendingDrafts ||
+                    updatedSp.kickoffPendingDrafts ||
+                    [];
+                  for (const d of drafts) {
+                    const k = String(d?.key || "").trim();
+                    const t = String(d?.text || "").trim();
+                    if (k && t) pendingMap.set(k, t);
+                  }
+                  const blocks =
+                    data.progressUpdate.paragraphPlan?.pointBlocks || [];
+                  for (const block of blocks) {
+                    const claim = resolveBlockClaimSentence(block, pendingMap);
+                    if (claim && isClaimSentence(claim)) {
+                      updatedSp.content = claim;
+                      // Keep signature on theme/structure (not claim text)
+                      updatedSp.frameworkSignature =
+                        computeSubpointFrameworkSignature(
+                          updatedSp,
+                          session,
+                        );
+                      break;
+                    }
+                  }
+                } catch {
+                  /* keep prior content */
+                }
               }
               if (
                 Array.isArray(data.progressUpdate.step3SubpointSteps) &&
@@ -675,6 +749,8 @@ export default function CoachChat({
           memory: data.progressUpdate.memory,
         };
       }
+      if (reqId !== requestSeqRef.current) return;
+
       if (stepKey === 'step3' && activeSubpointIdAtSend) {
         const step3State = sessionUpdates.step3 || session.step3;
         const nextSubpoints = (step3State.subpoints || []).map((sp: any) =>
@@ -702,15 +778,22 @@ export default function CoachChat({
         [stepKey]: nextStepKeyUpdate,
       });
     } catch (err: any) {
+      if (err?.name === 'AbortError') return;
       console.error(err);
-      setErrorMsg('发送失败，请稍后重试。' + (err.message || ''));
+      if (reqId === requestSeqRef.current) {
+        setErrorMsg('发送失败，请稍后重试。' + (err.message || ''));
+      }
     } finally {
-      setLoading(false);
+      if (reqId === requestSeqRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     if (!autoKickoff || !kickoffPrompt.trim() || loading) return;
+    // Step3: wait until a body is selected (avoids empty-key double kickoff).
+    if (stepKey === 'step3' && !String(kickoffContextKey || '').trim()) return;
     // Fire the opener only when the step chat is still empty (no welcome bubble is
     // seeded for autoKickoff steps). Once any message exists, never re-fire.
     const hasAnyMessage = chatHistory.some(
@@ -739,6 +822,12 @@ export default function CoachChat({
   };
 
   const handleResetChat = () => {
+    // Cancel in-flight turn so a late response cannot restore old chat.
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    requestSeqRef.current += 1;
+    setLoading(false);
+
     // autoKickoff steps (step2/step3) have no welcome bubble; clear to empty so the
     // opener effect regenerates the first message. Other steps keep the welcome.
     const initialHistory: ChatMessage[] = autoKickoff
@@ -755,7 +844,15 @@ export default function CoachChat({
     if (stepKey === 'step3') {
       const activeId = session.step3?.activeSubpointId;
       const resetSubpoints = (session.step3?.subpoints || []).map((sp: any) =>
-        sp.id === activeId ? { ...sp, chatHistory: initialHistory } : sp,
+        sp.id === activeId
+          ? {
+              ...sp,
+              chatHistory: initialHistory,
+              kickoffPendingDrafts: [],
+              step3SlotEval: undefined,
+              lastRejectCode: '',
+            }
+          : sp,
       );
       onUpdateSession({
         step3: {

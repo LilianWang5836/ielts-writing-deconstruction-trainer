@@ -115,7 +115,8 @@ export interface ConceptHighlightSpan {
 export interface SentencePracticeTask {
   id: string;
   concept: string; // e.g. "Students have the flexibility to manage their study schedules"
-  section: 'intro' | 'body1' | 'body2' | 'conclusion';
+  /** e.g. intro | body1 | body2 | body3 | … | conclusion */
+  section: string;
   prompts: string[]; // Lexical cues: "have the flexibility to...", "manage study schedules"
   /** Optional concept highlights for S/V/O + conjunctions (generated with tasks). */
   highlights?: ConceptHighlightSpan[];
@@ -288,6 +289,11 @@ export interface PracticeSession {
       suggestions: string[];
       suggestedStance: string;
       suggestedPoints: string;
+      /**
+       * Step2 → Planner material contract (single source of truth).
+       * Parallel points + stance + coverage; no paragraph layout.
+       */
+      plannerPayload?: Step2PlannerPayload;
       /** From questionBrief.taskMap.explore_A — student-facing explore label. */
       taskLabelA?: string;
       /** From questionBrief.taskMap.explore_B — student-facing explore label. */
@@ -494,7 +500,101 @@ export interface BodyPlan {
   argumentRelation?: string;
   pointRoles?: BodyPointRole[];
   mappedPoints?: string[];
+  /** Ids into session.step2.coachEvaluation.plannerPayload.points */
+  mappedPointIds?: string[];
   paragraphPlan: ParagraphPlan;
+}
+
+// ============================================================
+// Step2 → Planner payload (材料契约)
+// ============================================================
+
+export type CoverageBucket =
+  | 'view_a'
+  | 'view_b'
+  | 'advantage'
+  | 'disadvantage'
+  | 'cause'
+  | 'solution'
+  | 'positive'
+  | 'negative'
+  | 'part_1'
+  | 'part_2'
+  | 'support_main'
+  | 'oppose_or_qualify'
+  | 'general';
+
+export type Step2StancePolarity =
+  | 'agree'
+  | 'disagree'
+  | 'partial'
+  | 'positive'
+  | 'negative'
+  | 'balanced'
+  | 'outweigh_yes'
+  | 'outweigh_no'
+  | 'not_required'
+  | 'unknown';
+
+export type Step2StanceStrength = 'full' | 'qualified' | 'unknown';
+
+/** Detail/brief role chosen in Step2 retention (详写 / 略写). */
+export type Step2RetentionRole = 'detail' | 'brief' | 'dropped';
+
+export interface Step2Point {
+  id: string;
+  claim: string;
+  elaboration?: string;
+  fromDimension?: string;
+  leanTags: CoverageBucket[];
+  quality: 'thin' | 'ready';
+  /** 详写 / 略写 / 放下 — mirrored from userPoints retention tags */
+  retentionRole?: Step2RetentionRole;
+  sourceTurn?: number;
+  supersededBy?: string;
+}
+
+export interface Step2PlannerPayload {
+  version: 1;
+  status: 'draft' | 'ready' | 'invalid';
+  updatedAt: string;
+  questionType: string;
+  requiresStance: boolean;
+  /**
+   * When true, points[] slot count/labels are frozen from Step1 dimensions.
+   * Later turns may only attach elaborations onto existing slots — never append.
+   */
+  slotsLocked?: boolean;
+  /** Canonical claim labels for locked slots (Step1 dimension cores). */
+  fixedClaims?: string[];
+  stance: {
+    text: string;
+    polarity: Step2StancePolarity;
+    strength: Step2StanceStrength;
+  };
+  points: Step2Point[];
+  redirects: Record<string, string>;
+  dimensionDispositions: Array<{
+    dimension: string;
+    disposition: 'expanded' | 'merged' | 'dropped' | 'pending';
+    side?: 'A' | 'B' | '';
+    mergedInto?: string;
+    note?: string;
+    pointIds?: string[];
+  }>;
+  coverage: {
+    passed: boolean;
+    requiredBuckets: CoverageBucket[];
+    filledBuckets: CoverageBucket[];
+    missingBuckets: CoverageBucket[];
+    softMissingBuckets: CoverageBucket[];
+  };
+  exitGate: {
+    canComplete: boolean;
+    canForceExit: boolean;
+    forceExitUsed: boolean;
+    blockReason?: string;
+  };
 }
 
 // ============================================================
@@ -581,6 +681,7 @@ export interface Step2Board {
   userPoints: string;
   suggestedStance: string;
   suggestedPoints: string;
+  plannerPayload?: Step2PlannerPayload;
   blueprint: {
     position: string;
     bodies: Array<{ title: string; content: string }>;
@@ -622,12 +723,23 @@ export interface PlannerInput {
   questionType: string;
   requiresStance: boolean;
   materials: {
+    /** Preferred: structured Step2 points */
+    points: Step2Point[];
+    stance: string;
+    stanceMeta?: {
+      polarity?: Step2StancePolarity;
+      strength?: Step2StanceStrength;
+    };
+    coverage?: Step2PlannerPayload['coverage'];
+    /** Soft one-line digest for dynamic bodyCount (not a hard lock). */
+    materialDigest?: string;
+    /** @deprecated legacy text sides — compatibility only */
     aSide: string;
     bSide: string;
-    stance: string;
     clusters: any[];
     userRawText: string;
   };
+  plannerPayload?: Step2PlannerPayload | null;
 }
 
 export interface PlannerOutput {
