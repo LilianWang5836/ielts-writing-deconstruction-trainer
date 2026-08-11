@@ -201,7 +201,7 @@ mustContain(
   "step1 per-task sufficiency header",
 );
 mustContain(
-  "do not silently transition to the next task with only 1 angle recorded for the current one",
+  "HARD: do NOT ask Task B while any Task A label is still unprobed",
   "step1 per-task sufficiency: forbids premature task transition with only 1 angle",
 );
 mustContain(
@@ -348,19 +348,23 @@ mustContain(
   "step2 explore_B transition wired to retention rule",
 );
 mustContain(
-  "Retention-aware clustering (CRITICAL)",
+  "Retention tags in userPoints (已选详写/已选略写/用户放弃/待补例子) still matter",
   "step2 summary stage reads retention tags",
 );
 mustContain(
-  "ask the student to CHOOSE which point to detail-write",
-  "step2 main prompt: ask-then-expand choice instead of forced KEEP/DROP",
+  "Only then may you present a numbered 详略 scheme for confirm (UI「采纳/拒绝」)",
+  "step2 main prompt: recommend-then-confirm instead of forced KEEP/DROP",
 );
 mustContain(
-  'Vague agreement ("好的"/"随便"/"你定") → apply the soft default',
-  "step2 main prompt: vague replies fall back to soft default after choice ask",
+  'Bounce-back ("你觉得呢"/"你定") → do NOT tag',
+  "step2 main prompt: bounce-back replies wait for confirm before tagging",
 );
 mustContain(
-  "If the chosen 详写 point still lacks a concrete scene/mechanism, ask ONE expansion question",
+  "function isRetentionSoftAckConfirm(",
+  "step2 retention: soft ack 好/可以 counts while pending confirm-ask",
+);
+mustContain(
+  "请再补充 1-2 句具体场景 / 机制 / 受影响对象，把它写扎实。",
   "step2 main prompt: expand chosen detail point after role choice",
 );
 
@@ -395,8 +399,16 @@ mustContain(
   "step2 retention guard: coverage check uses coach question window",
 );
 mustContain(
-  "await applyStep2RetentionGuard(data, session, userMessage, messages, question);",
+  "await applyStep2RetentionGuard(",
   "step2 retention guard: wired into coach handler",
+);
+mustContain(
+  "applyStep2ProposalChannelEarly(",
+  "step2 proposal channel: early accept/reject wired before retention guard",
+);
+mustContain(
+  "applyStep2ProposalChannelLate(data, session, userMessage);",
+  "step2 proposal channel: late arm wired after ask-contract",
 );
 mustContain(
   "fail-open, no correction applied",
@@ -450,6 +462,27 @@ assert.ok(
 );
 console.log("OK: step2 blueprint no longer uses naive newline split for body1");
 
+// Board role inference must NOT leak sibling locked tags onto an unmentioned
+// slot (incident: unfilled B-side 商业发展 painted 详写 by A-side 已选详写
+// via the whole-text fallback window).
+assert.ok(
+  step2BrainstormSource.includes("if (!relevant.length) return undefined;"),
+  "Missing: board retentionRoleFromUserPoints returns undefined for unmentioned claims",
+);
+console.log("OK: board retentionRoleFromUserPoints returns undefined for unmentioned claims");
+assert.ok(
+  !step2BrainstormSource.includes("(relevant.length ? relevant : chunks).join"),
+  "Should be absent but found: whole-corpus fallback window in board role inference",
+);
+console.log("OK: board role inference whole-corpus fallback removed");
+assert.ok(
+  !step2BrainstormSource.includes(
+    "retentionRoleFromUserPoints(\n                              claim,\n                              userPointsRaw,\n                            )",
+  ),
+  "Should be absent but found: board role rendering bypasses roleCorpus guard with raw userPoints",
+);
+console.log("OK: board role rendering only reads the locked-tag corpus");
+
 // Step 2 Retention: ask student to choose 详写/略写 (heuristic default only on vague reply)
 mustContain(
   "function decideStep2Retention(",
@@ -468,6 +501,42 @@ mustContain(
   "step2 retention: ask-then-expand choice resolver exists",
 );
 mustContain(
+  "ACTIVE POINT FOCUS",
+  "step2 prompt: active point focus rule",
+);
+mustContain(
+  "NEW SLOT ONLY AFTER CONFIRM",
+  "step2 prompt: new slot only after confirm",
+);
+mustContain(
+  "function applyStep2FocusAndSlotAddPostProcess(",
+  "step2 focus/slot-add post-process exists",
+);
+mustContain(
+  "activePointId",
+  "step2 planner payload tracks activePointId",
+);
+mustContain(
+  "focusMode",
+  "step2 planner payload tracks deepen focusMode",
+);
+mustContain(
+  "CRITICAL — ACTIVE POINT FOCUS / MOUNT: Server mounts STUDENT material only",
+  "step2 dual-path mount: deepen rescue vs chunk match",
+);
+mustContain(
+  "function isRetentionDeferToCoach(",
+  "step2 retention: bounce-back detector exists",
+);
+mustContain(
+  "function isRetentionExplicitConfirm(",
+  "step2 retention: explicit-confirm detector exists",
+);
+mustContain(
+  "applied: false",
+  "step2 retention: choice result can await confirm without tagging",
+);
+mustContain(
   "function extractPointContent(",
   "step2 retention: extracts on-record content for a labeled point",
 );
@@ -484,11 +553,15 @@ mustContain(
   "step2 retention: checks freshly-tagged userPoints (not raw choice message) for sufficiency",
 );
 mustContain(
-  "你想选哪一个重点详写？另一个简单带一句就好",
-  "step2 retention: ask student to choose detail vs brief",
+  "是否按这个方案定下来？请回复「同意」「好」或直接说明你的详略选择。",
+  "step2 retention: ask student to confirm recommended detail vs brief",
 );
 mustContain(
-  "［待裁决：详=${developed}｜略=${uncovered}｜默认=${recommendation}］",
+  "[Step2RetentionGuard][PENDING_AWAIT_CONFIRM]",
+  "step2 retention: pending branch waits for explicit confirm before tagging",
+);
+mustContain(
+  "［待裁决：详=${pending.developed}｜略=${pending.uncovered}｜默认=${pending.recommendation || \"EXPAND_BOTH\"}］",
   "step2 retention: pending marker embeds both candidates and default",
 );
 mustContain(
@@ -496,11 +569,11 @@ mustContain(
   "step2 prompt: forbids AI-forced detail/brief assignment",
 );
 mustContain(
-  'A point tagged "已选略写" / "保留-略写" MUST be mapped into its body paragraph as a minor/brief supporting point',
+  "Allowed Actions: recommend stance + point selection + major/minor roles",
   "step2 summary maps retained dimension to minor point",
 );
 mustContain(
-  'A point tagged "待补例子" MUST NOT be described as "完整性极高"',
+  'Tag thin developed points so summary does not claim "完整性极高"',
   "step2 summary stays honest about thin points tagged 待补例子",
 );
 mustContain(
@@ -686,7 +759,7 @@ mustContain(
   "step3 context: active body targetBody in ContextSummary",
 );
 mustContain(
-  "ESSAY FRAMEWORK METADATA (INTERNAL",
+  "ESSAY FRAMEWORK METADATA:",
   "step2 summary: emits internal essay framework for Step 3",
 );
 mustContain(
@@ -730,7 +803,7 @@ mustContain(
   "step3 writability standard header",
 );
 mustContain(
-  'Could a band 5-5.5 student translate this into ONE simple English sentence?',
+  "Prefer plain, concrete Chinese that a band 5-5.5 student can later turn into English",
   "step3 writability test",
 );
 mustContain(
@@ -763,6 +836,38 @@ mustContain("function backfillStep1Constraints(", "step1 backfill: backfill func
 mustContain("function looksLikeConstraintQuestion(", "step1 backfill: constraint-question detector exists");
 mustContain("function isStep1SlotsComplete(", "step1 completion: slot checker exists");
 mustContain("function enforceStep1SlotCompletion(", "step1 completion: enforce function exists");
+mustContain(
+  "preserveStep1ProbeTags(",
+  "step1 probe: preserves confirmed probe tags across model rewrites",
+);
+mustContain(
+  "Confirmed dimension LOCK",
+  "step1 probe: prompt forbids rewriting confirmed dimension stamps",
+);
+mustContain(
+  "stripIllegalSameTurnProbeTags(",
+  "step1 probe: strips same-turn self-reported expandable tags",
+);
+mustContain(
+  "Probe-first: rewrote Part2 to probe",
+  "step1 probe: bare labels force probe-first Part2 rewrite",
+);
+mustContain(
+  "stampUnprobedQualityPending(",
+  "step1 probe: escape hatch stamps 质量待确认 on bare labels",
+);
+mustContain(
+  "pendingProbeCore",
+  "step1 probe: tracks server-forced probe target across turns",
+);
+mustContain(
+  "probeVerdict",
+  "step1 probe: B-lite probeVerdict field in schema/guard",
+);
+mustContain(
+  "step1CapProbeComplete(",
+  "step1 probe: cap+all-probed deadlock relief",
+);
 mustContain("function enforceStep3LogicCompletion(", "step3 completion: enforce function exists");
 mustContain(
   "function enforceConfirmedOnlySlots(",
@@ -829,7 +934,7 @@ mustContain(
   "step3 completion: evaluateSlotDraft must not stage pending",
 );
 mustContain(
-  "Staged pending from step3SlotEval",
+  "[Step3Guard] Staged pending for「${stageLoc.label}」— confirm-turn text locked (no same-turn next ask).",
   "step3 completion: pending staged from step3SlotEval only",
 );
 mustContain(
@@ -909,7 +1014,7 @@ mustContain(
   "step3 kickoff legacy builder retained (not main path)",
 );
 mustContain(
-  "Hidden kickoff: never stage confirm; sanitize dump but keep model ask",
+  "Kickoff-only: align expand state; sanitize dump; keep model ask when possible.",
   "step3 kickoff never stages confirm; sanitizes dump; keeps model ask",
 );
 mustContain(
@@ -945,11 +1050,11 @@ mustContain(
   "step3 client persists kickoffPendingDrafts on subpoint",
 );
 mustContain(
-  "Kickoff dump/confirm sanitized — salvaged ask",
+  "function salvageStep3KickoffAskText(",
   "step3 kickoff salvages ask without mid-dialogue veto template",
 );
 mustContain(
-  "Kickoff OK — kept model expand ask (no mid-dialogue veto template)",
+  "[Step3Guard] Kickoff expand on「${emptyLabel}」— material as question seed (confirm only when especially complete).",
   "step3 kickoff keeps legal model expand ask",
 );
 mustContain(
@@ -1001,7 +1106,7 @@ mustContain(
   "step3 prompt: stuck students get clues not rubber-stamp sentences",
 );
 mustContain(
-  "listing polished reason+example+impact bullets OR narrative lines",
+  "narrative「原因：/场景：/影响：」prose (common kickoff leak)",
   "step3 prompt: kickoff forbids narrative full-sentence chain dump",
 );
 mustContain(
@@ -1065,7 +1170,7 @@ mustContain(
   "step3 prompt: kickoff expand-first (Step2 is ask clue only)",
 );
 mustContain(
-  "CONTENT REUSE FROM STEP 2 (CRITICAL)",
+  "CONTENT REUSE FROM STEP 2 / PLANNER (CRITICAL)",
   "step3 prompt: mapped Step2 points are ask evidence only (no complete-then-confirm)",
 );
 mustContain(
@@ -1077,7 +1182,7 @@ mustContain(
   "step3 server: confirm pending requires substantive student utterance",
 );
 mustContain(
-  "kickoff_requires_student_expand",
+  "Kickoff / Step2-only polish must use mode=expand",
   "step3 server: kickoff forces expand when model tries confirm",
 );
 mustContain(
@@ -1333,7 +1438,7 @@ mustContain(
   "step3 prompt: draft vs confirmed slot status contract",
 );
 mustContain(
-  "Slot writing is SERVER-ONLY after student affirm",
+  "After the student affirms (「对/是的/没问题」), the SERVER writes confirmed values",
   "step3 prompt: draft confirmation must overwrite the same slot",
 );
 
@@ -1805,8 +1910,8 @@ mustContain(
   "step2 prompt: forbids stage/enum names in chat text",
 );
 assert.ok(
-  step3DraftingSource.includes("结构细节写入系统即可，对话里不要提字段名") &&
-    step3DraftingSource.includes("禁止 mode=confirm") &&
+  step3DraftingSource.includes("DEFAULT：mode=expand") &&
+    step3DraftingSource.includes("禁止静默写入") &&
     !step3DraftingSource.includes("并先请我一次性确认"),
   "Missing: step3 kickoff: expand-only, no internal field names, no one-shot confirm",
 );
@@ -1939,7 +2044,7 @@ mustContain(
   "step2 stance-material guard wired into Step2 handler",
 );
 mustContain(
-  "Stance–material fit (CRITICAL, converge-stage only)",
+  "function enforceStep2StanceMaterialGuard(",
   "step2 prompt: stance-material fit rule",
 );
 mustContain(
@@ -1983,7 +2088,7 @@ mustContain(
   "step1 schema/prompt includes exitOffered",
 );
 mustContain(
-  "FORBIDDEN: tagging （可展开） in the same turn you first introduce a dimension",
+  "FORBIDDEN: tagging status on the introduce turn",
   "step1 prompt forbids same-turn expandable+introduce",
 );
 mustContain(
@@ -2035,7 +2140,7 @@ mustContain(
   "step2 schema: argumentRelation on clustering clusters",
 );
 mustContain(
-  "CONVERGE — select points + stance",
+  "CONVERGE — select stance after flat points are ready; NO paragraph layout",
   "step2 converge stage selects points and stance together",
 );
 mustContain(
@@ -2063,7 +2168,7 @@ mustContain(
   "step2 momentum preserves an evidence-based stance recommendation",
 );
 mustContain(
-  "enforceStep2Momentum(data, session);",
+  "enforceStep2Momentum(data, session, {",
   "step2 momentum guard wired into Step2 handler",
 );
 mustContain(
@@ -2071,7 +2176,19 @@ mustContain(
   "step2 momentum: solid-side detector exists",
 );
 mustContain(
-  "A+B sides already solid → advance stage to",
+  "hasSeedOnlySprouts",
+  "step2 seedOnly: momentum ignores text-solid while Step1 sprouts remain",
+);
+mustContain(
+  "isPointExpandedForWalk",
+  "step2 seedOnly: walk/ready counts use expanded-for-walk gate",
+);
+mustContain(
+  "在第一步你提到过",
+  "step2 seedOnly: content-aware expand ask cites Step1 seed",
+);
+mustContain(
+  "[Step2Momentum] explore_A solid → stage=",
   "step2 momentum advances when A+B already solid",
 );
 mustContain(
@@ -2122,7 +2239,9 @@ mustContain(
   "step2 schema includes dimensionDispositions ledger",
 );
 assert.ok(
-  step2BrainstormSource.includes("Step1 角度处置"),
+  step2BrainstormSource.includes("材料池（平铺论点）") &&
+    step2BrainstormSource.includes("可写") &&
+    step2BrainstormSource.includes("待加深"),
   "Missing: step2 UI shows Step1 dimension disposition checklist",
 );
 console.log("OK: step2 UI shows Step1 dimension disposition checklist");
@@ -2154,5 +2273,57 @@ assert.ok(
   "Step3 client must not contain progress decision helpers",
 );
 console.log("OK: Step3 client contains no progress decision helpers");
+
+// Momentum must treat decision CTAs (采纳/拒绝 without question marks) as valid
+// endings — a proposal ask ending in 。 was previously replaced by an expand ask.
+mustContain(
+  "Decision CTAs (采纳/拒绝 buttons) are valid endings",
+  "momentum question-ending check accepts decision CTA endings",
+);
+// A bare 详写『x』 scheme statement must not drive deepen focus (culture-loss loop).
+assert.ok(
+  fs
+    .readFileSync(
+      path.join(repoRoot, "src/server/step2/planner-payload.ts"),
+      "utf8",
+    )
+    .includes("must NOT drive deepen focus"),
+  "focus extractor documents 详写 scheme exclusion",
+);
+console.log("OK: focus extractor excludes bare 详写 scheme statements");
+
+// A locked/accepted stance must never be re-confirmed by the content fallback,
+// and the stance text must not be truncated mid-sentence.
+mustContain(
+  "A stance the student just accepted (locked/resolved) must not be re-confirmed",
+  "fallback stance branch checks stanceConfirmResolved before re-asking",
+);
+mustNotContain(
+  "stanceText.slice(0, 40)",
+  "fallback stance re-confirm no longer truncates at 40 chars",
+);
+// The mis-attributed 已记入：「X」 prefix was removed from the late channel.
+mustNotContain(
+  "已记入：「${core}」",
+  "已记入 tip generator removed",
+);
+
+// Momentum must not rewrite text authored by the proposal channel this turn
+// (it was eating the server recap of committed retention roles).
+mustContain(
+  "if (opts?.channelAuthoredText) return;",
+  "momentum skips text rewrite for channel-authored turns",
+);
+mustContain(
+  "channelAuthoredText: Boolean(proposalEarly.handled)",
+  "chat pipeline passes channel-handled flag into momentum",
+);
+
+// Step3 kickoff plan must be checked against the planner framework so mapped
+// points the coach narration dropped get a synthesized block.
+mustContain(
+  "ensureParagraphPlanCoversFrameworkPoints(",
+  "step3 merge point runs framework coverage guard",
+);
 
 console.log("\nAll slot-reuse/static-guard assertions passed.");

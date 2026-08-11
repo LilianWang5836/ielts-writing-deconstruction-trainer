@@ -8,6 +8,8 @@ import CoachChat from './CoachChat';
 function stripStep2InternalTags(text: string): string {
   return String(text || '')
     .replace(/［待裁决：[^\］]*］/g, '')
+    .replace(/［待新增：[^\］]*］/g, '')
+    .replace(/［[；;]\s*[:：]?[^\］]*］/g, '')
     .replace(/（待补例子）/g, '')
     .replace(/（\s*[主次]\s*[／/]\s*(?:详写|略写)\s*）/g, '')
     .replace(/（\s*已选详写[^）]*）/g, '')
@@ -16,13 +18,17 @@ function stripStep2InternalTags(text: string): string {
     .trim();
 }
 
-/** Infer 详写/略写 label from userPoints / coach summary for a claim. */
+/** Infer 详写/略写 only from locked tags — never from coach「建议详写」recommend copy. */
 function retentionRoleFromUserPoints(
   claim: string,
   userPoints: string,
 ): 'detail' | 'brief' | 'dropped' | undefined {
   const head = String(claim || '').trim();
   if (head.length < 2 || !userPoints) return undefined;
+  // Pending proposal must not paint 详写/略写 on the board
+  if (/［待裁决：/.test(userPoints) && !/已选详写|已选略写|用户放弃/.test(userPoints)) {
+    return undefined;
+  }
   const prefix = head.slice(0, Math.min(4, head.length));
   const chunks = String(userPoints)
     .split(/[；;\n]+/)
@@ -36,23 +42,73 @@ function retentionRoleFromUserPoints(
       (prefix.length >= 3 && bare.includes(prefix))
     );
   });
-  const scan = (relevant.length ? relevant : chunks).join('；');
+  // A corpus that never mentions this claim must NOT leak sibling tags onto
+  // it (mirror of the server-side inferRetentionRoleFromText fix): an unfilled
+  // B-side slot was painted 详写 by an A-side 已选详写 via the whole-text
+  // fallback window.
+  if (!relevant.length) return undefined;
+  const scan = relevant.join('；');
   const idx = scan.indexOf(prefix);
   const window =
     idx >= 0 ? scan.slice(Math.max(0, idx - 2), idx + head.length + 20) : scan;
   if (/用户放弃/.test(window)) return 'dropped';
-  if (/已选详写|主\s*[／/]\s*详写|（\s*详写\s*）/.test(window)) return 'detail';
-  if (/已选略写|次\s*[／/]\s*略写|保留-略写|（\s*略写\s*）/.test(window)) {
-    return 'brief';
-  }
-  // Coach summary: 人际关系（详写）： / 社会文化服务（略写）：
-  if (new RegExp(`${prefix}[^\\n；;]{0,16}（\\s*详写\\s*）`).test(scan)) {
-    return 'detail';
-  }
-  if (new RegExp(`${prefix}[^\\n；;]{0,16}（\\s*略写\\s*）`).test(scan)) {
-    return 'brief';
-  }
+  if (/已选详写/.test(window)) return 'detail';
+  if (/已选略写|保留-略写/.test(window)) return 'brief';
   return undefined;
+}
+
+/** Board quality badge: real body only — never mark claim-echo as 可写. */
+function displayPointQuality(
+  claim: string,
+  elaboration: string,
+): 'ready' | 'thin' {
+  const c = String(claim || '').trim();
+  const e = String(elaboration || '')
+    .replace(/［待裁决：[^\］]*］/g, '')
+    .replace(/（\s*已选详写[^）]*）/g, '')
+    .replace(/（\s*已选略写[^）]*）/g, '')
+    .trim();
+  if (!e || e.length < 8) return 'thin';
+  const core = c
+    .replace(
+      /[（(]\s*(原因|成因|评价|利弊|影响|解决|问题|主|次|详写|略写|待加深|可写)\s*[）)]/g,
+      '',
+    )
+    .trim();
+  if (
+    core &&
+    (e === core ||
+      e === c ||
+      (e.startsWith(core) && e.length <= core.length + 6))
+  ) {
+    return 'thin';
+  }
+  if (/^(?:原因|成因|评价|待加深|可写)$/.test(e)) return 'thin';
+  return 'ready';
+}
+
+function displayElaboration(claim: string, elaboration: string): string {
+  const e = String(elaboration || '').trim();
+  if (!e) return '';
+  if (displayPointQuality(claim, e) === 'thin' && e.length <= String(claim || '').length + 8) {
+    // Hide claim-echo shells like「主流文化冲击（待加深）」under the title
+    const core = String(claim || '')
+      .replace(
+        /[（(]\s*(原因|成因|评价|利弊|影响|解决|问题)\s*[）)]/g,
+        '',
+      )
+      .trim();
+    if (core && (e === core || e.startsWith(core))) return '';
+  }
+  return e;
+}
+
+function displayLeanTags(tags: string[]): string[] {
+  const list = (tags || []).map(String).filter(Boolean);
+  if (list.some((t) => t !== 'general')) {
+    return list.filter((t) => t !== 'general');
+  }
+  return list;
 }
 
 /** Fallback: pull elaboration from userPoints when payload point only has a short head. */
@@ -82,7 +138,10 @@ function elabFromUserPoints(claim: string, userPoints: string): string {
       if (
         (h === head || h.startsWith(head) || head.startsWith(h)) &&
         inner.length >= 4 &&
-        !/^(?:主|次)?[／/]?(?:详写|略写)?$/.test(inner)
+        !/^(?:主|次)?[／/]?(?:详写|略写)?$/.test(inner) &&
+        !/^(?:原因|成因|评价|利弊|影响|解决|问题|待加深|可写|可展开|空标签|质量待确认|已探测|已询退出)$/.test(
+          inner,
+        )
       ) {
         return inner;
       }
@@ -757,14 +816,10 @@ ${topic.question}
                       .filter((s) => s.length >= 6);
 
                     const userPointsRaw = String(evalData.userPoints || '');
-                    // Coach summaries often put （详写）/（略写） in chat before userPoints is tagged
-                    const roleCorpus = [
-                      userPointsRaw,
-                      ...(session.step2.chatHistory || [])
-                        .filter((m) => m.sender === 'ai' && /详写|略写/.test(m.text || ''))
-                        .slice(-4)
-                        .map((m) => String(m.text || '')),
-                    ].join('\n');
+                    // Only locked tags count — never infer from coach recommend chatter.
+                    const hasLockedTags =
+                      /已选详写|已选略写|用户放弃/.test(userPointsRaw);
+                    const roleCorpus = hasLockedTags ? userPointsRaw : '';
                     const rawItems =
                       payloadPts.length > 0
                         ? payloadPts.map((p: any) => {
@@ -773,20 +828,23 @@ ${topic.question}
                             if (!elaboration) {
                               elaboration = elabFromUserPoints(claim, userPointsRaw);
                             }
-                            const quality =
-                              elaboration.length >= 12
-                                ? 'ready'
-                                : p.quality || 'thin';
+                            // Label-echo / task-role shell must stay 待加深 (not length≥4 → 可写).
+                            const quality = displayPointQuality(claim, elaboration);
+                            // Only the locked-tag corpus may drive display
+                            // roles — a raw-corpus call here bypassed the
+                            // hasLockedTags guard above.
                             const retentionRole =
                               p.retentionRole ||
                               retentionRoleFromUserPoints(claim, roleCorpus);
                             return {
                               id: p.id,
                               claim,
-                              elaboration,
+                              elaboration: displayElaboration(claim, elaboration),
                               quality,
                               retentionRole,
-                              tags: Array.isArray(p.leanTags) ? p.leanTags : [],
+                              tags: displayLeanTags(
+                                Array.isArray(p.leanTags) ? p.leanTags : [],
+                              ),
                             };
                           })
                         : (listFallback.length ? listFallback : fromUserPoints).map(
@@ -796,11 +854,8 @@ ${topic.question}
                               return {
                                 id: `f${i + 1}`,
                                 claim: c,
-                                elaboration,
-                                quality:
-                                  elaboration.length >= 12 || c.length >= 14
-                                    ? 'ready'
-                                    : 'thin',
+                                elaboration: displayElaboration(c, elaboration),
+                                quality: displayPointQuality(c, elaboration),
                                 retentionRole: retentionRoleFromUserPoints(
                                   c,
                                   roleCorpus,

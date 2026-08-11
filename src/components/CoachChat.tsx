@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil } from 'lucide-react';
+import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
 import {
@@ -7,6 +7,13 @@ import {
   resolveBlockClaimSentence,
 } from '../utils/step3ClaimPrefill';
 import { computeSubpointFrameworkSignature } from '../utils/step3Quality';
+import {
+  coachMessageIsContentAskNotDecision,
+  coachMessageLooksLikeCapacityTrimDecision,
+  coachMessageLooksLikeRetentionDecision,
+  coachMessageLooksLikeSlotAddDecision,
+  coachMessageLooksLikeStanceDecision,
+} from '../server/step2/planner-payload';
 
 /** Step1 Q1 — mutually exclusive chips that fill the input box. */
 const STEP1_QUESTION_TYPES = [
@@ -87,6 +94,97 @@ export default function CoachChat({
   // Keep confirm bubble stable while the affirm request is in flight (don't
   // re-split the coach message on --- just because loading flipped true).
   const hasPendingConfirm = pendingDrafts.length > 0;
+  const step2Payload = (session.step2?.coachEvaluation as any)?.plannerPayload;
+  const pendingProposal =
+    stepKey === 'step2' && step2Payload?.pendingProposal?.proposalId
+      ? step2Payload.pendingProposal
+      : null;
+  const hasPendingProposal = Boolean(pendingProposal);
+  const pendingProposalKind = String(pendingProposal?.kind || '');
+  const pendingProposalDecisionType =
+    pendingProposalKind === 'side_settle'
+      ? 'retention'
+      : pendingProposalKind === 'slot_add'
+        ? 'slot_add'
+        : pendingProposalKind === 'slot_merge'
+          ? 'slot_merge'
+          : pendingProposalKind === 'stance'
+            ? 'stance'
+            : '';
+  const pendingProposalSummary = (() => {
+    if (!pendingProposal) return '';
+    if (pendingProposal.kind === 'slot_add') {
+      return String(pendingProposal.payload?.claim || '');
+    }
+    if (pendingProposal.kind === 'slot_merge') {
+      const pts = Array.isArray(step2Payload?.points) ? step2Payload.points : [];
+      const label = (id: string) => {
+        const p = pts.find((x: any) => x.id === id);
+        return String(p?.claim || id)
+          .replace(/（[^）]*）/g, '')
+          .trim();
+      };
+      return `${label(String(pendingProposal.payload?.fromSlotId || ''))} → ${label(
+        String(pendingProposal.payload?.intoSlotId || ''),
+      )}`;
+    }
+    if (pendingProposal.kind === 'stance') {
+      return String(pendingProposal.payload?.text || '').slice(0, 80);
+    }
+    if (pendingProposal.kind === 'side_settle') {
+      const asg = pendingProposal.payload?.assignments || [];
+      const pts = Array.isArray(step2Payload?.points) ? step2Payload.points : [];
+      const label = (id: string) => {
+        const p = pts.find((x: any) => x.id === id);
+        return String(p?.claim || id)
+          .replace(/（[^）]*）/g, '')
+          .trim();
+      };
+      const d = asg
+        .filter((a: any) => a.role === 'detail')
+        .map((a: any) => label(a.slotId));
+      const b = asg
+        .filter((a: any) => a.role === 'brief')
+        .map((a: any) => label(a.slotId));
+      return `详写「${d.join('、') || '—'}」/ 略写「${b.join('、') || '—'}」`;
+    }
+    return '';
+  })();
+  const pendingSlotAddClaim =
+    stepKey === 'step2'
+      ? String(step2Payload?.pendingSlotAdd?.claim || '').trim()
+      : '';
+  const hasPendingSlotAdd =
+    !hasPendingProposal && Boolean(pendingSlotAddClaim);
+  const step2UserPoints = String(
+    (session.step2?.coachEvaluation as any)?.userPoints ||
+      session.step2?.userPoints ||
+      '',
+  );
+  const pendingRetentionMatch =
+    stepKey === 'step2' && !hasPendingProposal
+      ? /［待裁决：(?:详=([^｜］]+)｜略=([^｜］]+)|([^｜］]+))/.exec(step2UserPoints)
+      : null;
+  const hasPendingRetention = Boolean(pendingRetentionMatch);
+  const pendingRetentionSummary = pendingRetentionMatch
+    ? pendingRetentionMatch[1] && pendingRetentionMatch[2]
+      ? `详写「${pendingRetentionMatch[1].trim()}」/ 略写「${pendingRetentionMatch[2].trim()}」`
+      : String(pendingRetentionMatch[3] || '').trim()
+    : '';
+  const pendingCapacityTrim =
+    stepKey === 'step2' && !hasPendingProposal
+      ? step2Payload?.pendingCapacityTrim
+      : null;
+  const hasPendingCapacityTrim = Boolean(
+    pendingCapacityTrim?.sideKey &&
+      Array.isArray(pendingCapacityTrim?.pointClaims) &&
+      pendingCapacityTrim.pointClaims.length >= 3,
+  );
+  const pendingStanceConfirmText =
+    stepKey === 'step2' && !hasPendingProposal
+      ? String(step2Payload?.pendingStanceConfirm?.text || '').trim()
+      : '';
+  const hasPendingStanceConfirm = Boolean(pendingStanceConfirmText);
 
   const lastAiHistoryIndex = (() => {
     for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
@@ -95,38 +193,137 @@ export default function CoachChat({
     return -1;
   })();
 
-  // Pending confirm: keep the latest Coach turn as ONE bubble (don't split on ---),
-  // so the polished sentence + confirm CTA stay together.
-  const renderedMessages = chatHistory.flatMap((msg, historyIndex) => {
-    if (msg.sender === 'ai') {
-      const isPendingHost =
-        hasPendingConfirm && historyIndex === lastAiHistoryIndex;
-      if (isPendingHost) {
-        const joined = String(msg.text || '')
-          .split('---')
-          .map((part) => part.trim())
-          .filter(Boolean)
-          .join('\n\n');
-        return [
-          {
-            ...msg,
-            text: joined,
-            id: `${msg.id}-pending`,
-            isSplit: false,
-            isPendingHost: true as const,
-          },
-        ];
+  const lastAiText =
+    lastAiHistoryIndex >= 0
+      ? String(chatHistory[lastAiHistoryIndex]?.text || '')
+      : '';
+  // Hard rule: 采纳/拒绝 ONLY when this coach turn is proposing something to adopt.
+  // Content asks (补薄 / 展开 / 自由答详略) never get those buttons — even if stale pending remains.
+  const lastIsContentAsk = coachMessageIsContentAskNotDecision(lastAiText);
+  const lastLooksSlotAdd =
+    !lastIsContentAsk && coachMessageLooksLikeSlotAddDecision(lastAiText);
+  const lastLooksRetention =
+    !lastIsContentAsk && coachMessageLooksLikeRetentionDecision(lastAiText);
+  const lastLooksCapacityTrim =
+    !lastIsContentAsk && coachMessageLooksLikeCapacityTrimDecision(lastAiText);
+  const lastLooksStance =
+    !lastIsContentAsk && coachMessageLooksLikeStanceDecision(lastAiText);
+
+  type RenderedChatMessage = ChatMessage & {
+    isSplit: boolean;
+    isPendingHost: boolean;
+    isProposalHost: boolean;
+    isSlotAddHost: boolean;
+    isRetentionHost: boolean;
+    isCapacityTrimHost: boolean;
+    isStanceConfirmHost: boolean;
+  };
+
+  // Pending confirm / proposal / legacy: keep the latest Coach turn as ONE bubble.
+  const renderedMessages: RenderedChatMessage[] = chatHistory.flatMap(
+    (msg, historyIndex): RenderedChatMessage[] => {
+      if (msg.sender === 'ai') {
+        const isPendingHost =
+          hasPendingConfirm && historyIndex === lastAiHistoryIndex;
+        // Phase1: trust pendingProposal on latest AI turn (text is display-only).
+        const isProposalHost =
+          hasPendingProposal &&
+          !hasPendingConfirm &&
+          historyIndex === lastAiHistoryIndex;
+        const isSlotAddHost =
+          !isProposalHost &&
+          hasPendingSlotAdd &&
+          lastLooksSlotAdd &&
+          !hasPendingConfirm &&
+          !lastLooksRetention &&
+          !lastLooksCapacityTrim &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isRetentionHost =
+          !isProposalHost &&
+          hasPendingRetention &&
+          lastLooksRetention &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksCapacityTrim &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isCapacityTrimHost =
+          !isProposalHost &&
+          hasPendingCapacityTrim &&
+          lastLooksCapacityTrim &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksRetention &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isStanceConfirmHost =
+          !isProposalHost &&
+          hasPendingStanceConfirm &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksRetention &&
+          !lastLooksCapacityTrim &&
+          historyIndex === lastAiHistoryIndex &&
+          (lastLooksStance ||
+            /请点击「采纳」|点击「采纳」锁定|基于你材料的立场推荐/.test(
+              lastAiText,
+            ));
+        if (
+          isPendingHost ||
+          isProposalHost ||
+          isSlotAddHost ||
+          isRetentionHost ||
+          isCapacityTrimHost ||
+          isStanceConfirmHost
+        ) {
+          const joined = String(msg.text || '')
+            .split('---')
+            .map((part) => part.trim())
+            .filter(Boolean)
+            .join('\n\n');
+          return [
+            {
+              ...msg,
+              text: joined,
+              id: `${msg.id}-pending`,
+              isSplit: false,
+              isPendingHost,
+              isProposalHost,
+              isSlotAddHost,
+              isRetentionHost,
+              isCapacityTrimHost,
+              isStanceConfirmHost,
+            },
+          ];
+        }
+        return msg.text.split('---').map((part, i) => ({
+          ...msg,
+          text: part.trim(),
+          id: `${msg.id}-${i}`,
+          isSplit: i > 0,
+          isPendingHost: false,
+          isProposalHost: false,
+          isSlotAddHost: false,
+          isRetentionHost: false,
+          isCapacityTrimHost: false,
+          isStanceConfirmHost: false,
+        }));
       }
-      return msg.text.split('---').map((part, i) => ({
-        ...msg,
-        text: part.trim(),
-        id: `${msg.id}-${i}`,
-        isSplit: i > 0,
-        isPendingHost: false as const,
-      }));
-    }
-    return [{ ...msg, isPendingHost: false as const }];
-  });
+      return [
+        {
+          ...msg,
+          isSplit: false,
+          isPendingHost: false,
+          isProposalHost: false,
+          isSlotAddHost: false,
+          isRetentionHost: false,
+          isCapacityTrimHost: false,
+          isStanceConfirmHost: false,
+        },
+      ];
+    },
+  );
 
   const beginEditPendingDraft = (d: any) => {
     // Prefill the current confirm sentence so students edit 待确认句, not a blank label.
@@ -356,7 +553,17 @@ export default function CoachChat({
 
   const sendUserMessage = async (
     textToSend: string,
-    options?: { hiddenUserMessage?: boolean; targetSubpointId?: string },
+    options?: {
+      hiddenUserMessage?: boolean;
+      targetSubpointId?: string;
+      decision?: {
+        type: string;
+        action: string;
+        claim?: string;
+        proposalId?: string;
+        legacyType?: string;
+      };
+    },
   ) => {
     if (!textToSend.trim() || loading) return;
 
@@ -370,6 +577,7 @@ export default function CoachChat({
     };
 
     const hiddenUserMessage = !!options?.hiddenUserMessage;
+    const decision = options?.decision;
     const activeSubpointIdAtSend =
       stepKey === 'step3'
         ? options?.targetSubpointId || session.step3?.activeSubpointId
@@ -445,9 +653,9 @@ export default function CoachChat({
           stepContext,
           session: sessionForRequest,
           userMessage: textToSend.trim(),
-          ...(stepKey === 'step3' && hiddenUserMessage
-            ? { isHiddenKickoff: true }
-            : {}),
+          // Hidden openers (Step2/Step3 kickoff) are system prompts — never student material.
+          ...(hiddenUserMessage ? { isHiddenKickoff: true } : {}),
+          ...(decision ? { decision } : {}),
         }),
       });
 
@@ -973,6 +1181,258 @@ export default function CoachChat({
                       确认
                     </button>
                   </div>
+                </div>
+              ) : (msg as any).isProposalHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: {
+                            type: 'proposal',
+                            action: 'accept',
+                            proposalId: pendingProposal?.proposalId,
+                            // legacy alias for older server mappers
+                            ...(pendingProposalDecisionType
+                              ? { legacyType: pendingProposalDecisionType }
+                              : {}),
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: {
+                            type: 'proposal',
+                            action: 'reject',
+                            proposalId: pendingProposal?.proposalId,
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingProposalSummary ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      {pendingProposalKind === 'slot_add'
+                        ? `待决策：是否将「${pendingProposalSummary}」加入材料池`
+                        : pendingProposalKind === 'slot_merge'
+                          ? `待决策合并：${pendingProposalSummary}`
+                          : pendingProposalKind === 'stance'
+                            ? `待确认立场：${pendingProposalSummary}${
+                                String(pendingProposal?.payload?.text || '')
+                                  .length > 80
+                                  ? '…'
+                                  : ''
+                              }`
+                            : `待决策详略：${pendingProposalSummary}`}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isSlotAddHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'slot_add', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'slot_add', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingSlotAddClaim ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待决策：是否将「{pendingSlotAddClaim}」加入材料池
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isRetentionHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'retention', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'retention', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingRetentionSummary ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待决策详略：{pendingRetentionSummary}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isCapacityTrimHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 space-y-2">
+                    {(pendingCapacityTrim?.pointClaims || []).map(
+                      (claim: string) => (
+                        <div
+                          key={claim}
+                          className="flex flex-wrap items-center gap-1.5 rounded-md border border-slate-100 bg-white px-2 py-1.5"
+                        >
+                          <span className="text-[11px] text-slate-700 flex-1 min-w-[8rem]">
+                            {claim}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() =>
+                              sendUserMessage(`略写「${claim}」`, {
+                                decision: {
+                                  type: 'capacity_trim',
+                                  action: 'brief',
+                                  claim,
+                                },
+                              })
+                            }
+                            className="rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-700 transition disabled:opacity-50"
+                          >
+                            略写此条
+                          </button>
+                          <button
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() =>
+                              sendUserMessage(`丢掉「${claim}」`, {
+                                decision: {
+                                  type: 'capacity_trim',
+                                  action: 'drop',
+                                  claim,
+                                },
+                              })
+                            }
+                            className="rounded-md border border-rose-100 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 transition disabled:opacity-50"
+                          >
+                            丢掉
+                          </button>
+                        </div>
+                      ),
+                    )}
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('全部保留', {
+                          decision: {
+                            type: 'capacity_trim',
+                            action: 'keep_all',
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      全部保留（不裁剪）
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-slate-400">
+                    单侧/单问已有 {pendingCapacityTrim?.pointClaims?.length || 0}{' '}
+                    条 —— 确认后再改板
+                  </p>
+                </div>
+              ) : (msg as any).isStanceConfirmHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'stance', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'stance', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingStanceConfirmText ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待确认立场：{pendingStanceConfirmText.slice(0, 80)}
+                      {pendingStanceConfirmText.length > 80 ? '…' : ''}
+                    </p>
+                  ) : null}
                 </div>
               ) : (
                 <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">

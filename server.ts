@@ -22,6 +22,7 @@ import {
   isStep3AffirmativeConfirmation,
   promoteAcknowledgedStep3DraftTarget,
   promoteAcknowledgedFlatStep3Target,
+  ensureParagraphPlanCoversFrameworkPoints,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 import {
@@ -37,10 +38,78 @@ import {
 import { isClaimSentence, CLAIM_SLOT_LABEL_RE } from "./src/utils/step3ClaimPrefill";
 import {
   activePoints,
+  buildSameSlotDeepenAsk,
+  buildSlotAddConfirmAsk,
+  claimMatchCore,
+  coachMessageIsContentAskNotDecision,
+  coachMessageLooksLikeStanceDecision,
+  extractFocusClaimFromCoachText,
+  findPointIdByClaim,
+  formatPendingSlotAddMarker,
+  applyRetentionRolesFromUserPoints,
+  coachMessageLooksLikeRetentionDecision,
+  formatSideRetentionPendingMarker,
+  headsCompatible,
+  isExplicitSlotAddConfirm,
+  isPointExpandedForWalk,
+  isStep2ChecklistWalkDone,
+  listUnwalkedChecklistPoints,
   missingBucketCoachHint,
   normalizeStep2PlannerPayload,
+  parseSideRetentionSchemeFromCoachText,
   plannerPayloadFingerprint,
+  pointSideKey,
+  preserveLockedRetentionInUserPoints,
+  stripForgedRetentionLocks,
+  resolveNextSideWalkStep,
+  resolveProposedClaimAgainstBoard,
+  resolveSlotAddDecision,
+  settleSideRetentionAfterAccept,
+  shouldClearStep2DeepenFocus,
+  stampRetentionTagOnUserPoints,
+  stripPendingSlotAddMarker,
+  textLooksLikePrematureSideAdvance,
+  userMessageRequestsRetentionChange,
 } from "./src/server/step2/planner-payload";
+import {
+  buildStep2StudentTurnIntentPrompt,
+  classifyStep2StudentTurnHeuristic,
+  intentFromStructuredDecision,
+  parseRetentionChoiceMessage,
+  parseStep2StudentTurnIntentLlm,
+  type Step2StudentTurnIntent,
+} from "./src/server/step2/student-turn-intent";
+import {
+  enforceStep2AskContract,
+  extractStanceRecommendFromText,
+  textLooksLikePrematureStanceAsk,
+} from "./src/server/step2/ask-contract";
+import {
+  buildBareDimensionProbeAsk,
+  countUnprobedStep1Dimensions,
+  earliestUnprobedDimension,
+  preserveStep1ProbeTags,
+  resolvePendingProbeAnswer,
+  stampUnprobedQualityPending,
+  step1CapProbeComplete,
+  stripIllegalSameTurnProbeTags,
+  textLooksLikeProbeAskForDim,
+} from "./src/server/step1/dimension-probe";
+import {
+  armNextProposal,
+  buildAskFromProposal,
+  buildOpenRetentionSchemeAsk,
+  buildSideSettleFromLabelMessage,
+  buildSideSettleFromScheme,
+  commitProposal,
+  parseRetentionSchemeMessage,
+  reattachElaborationBetweenSlots,
+  resolvePendingProposalDecision,
+  textLooksLikeExploreDecisionLeak,
+  userMessageAsksForSettleRecommendation,
+  userMessageLooksLikeReattach,
+  userMessageRequestsResettle,
+} from "./src/server/step2/proposal";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
 import { log } from "./src/server/logger";
@@ -151,14 +220,25 @@ function splitTwoParts(
  */
 function safeOverridePart1(text: string): string {
   const split = splitTwoParts(text, 1);
-  if (split.ok) return split.part1;
-  return "好的，这部分内容我已经记下了。";
+  if (split.ok && String(split.part1 || "").trim()) return split.part1.trim();
+  // Prefer a short leading paragraph over the old "记下了" dead phrase.
+  const raw = String(text || "").trim();
+  if (raw.length >= 4) {
+    const head = raw.split(/\n\n+|---/)[0].trim();
+    if (
+      head.length >= 4 &&
+      head.length <= 280 &&
+      !/进入第三步|立即跳转|材料池已经全部/.test(head)
+    ) {
+      return head;
+    }
+  }
+  return "好的。";
 }
 
 /**
- * Content-aware Step2 Part-2 fallback: ask for whatever is actually missing
- * (thin points / pending dimensions / coverage buckets / stance), never the
- * legacy "A面发散" template.
+ * Content-aware Step2 Part-2 fallback: walk checklist slots (content → 详略),
+ * then single-side capacity trim, then stance — never skip unwalked Step1 slots.
  */
 function buildStep2ContentAwareFallback(
   session: any,
@@ -193,8 +273,7 @@ function buildStep2ContentAwareFallback(
     payload?.requiresStance !== false &&
     eval2.requiresStance !== false;
   const points = activePoints(payload);
-  const thin = points.filter((p) => p.quality !== "ready");
-  const ready = points.filter((p) => p.quality === "ready");
+  const ready = points.filter((p) => isPointExpandedForWalk(p));
   const dispositions =
     step2.dimensionDispositions ||
     eval2.dimensionDispositions ||
@@ -210,43 +289,546 @@ function buildStep2ContentAwareFallback(
         )
         .filter(Boolean)
     : [];
+  const unwalked = listUnwalkedChecklistPoints(payload, dispositions);
+  const checklistDone = isStep2ChecklistWalkDone(payload, dispositions);
+  const pendingTrim = payload?.pendingCapacityTrim;
 
-  // 1) Named thin point — most actionable
-  if (thin.length > 0) {
-    const claim = String(thin[0].claim || "").trim() || "这个论点";
-    return `「${claim}」目前还偏薄：请补 1–2 句具体场景、机制或受影响对象，方便写成可展开的论据。`;
+  // Phase1: structured pendingProposal is the only decision ask source.
+  if (payload?.pendingProposal?.proposalId) {
+    return buildAskFromProposal(payload, payload.pendingProposal);
   }
 
-  // 2) Pending Step1 dimensions
-  if (pendingDims.length > 0) {
+  // 1) Side-first checklist: expand all on side → one 详略 → next side
+  const buildExpandAskForPoint = (point: any): string => {
+    const claim = String(point?.claim || "").trim() || "这个论点";
+    const seed = String(point?.elaboration || "").trim();
+    if (step2 && typeof step2 === "object") {
+      step2.pendingFocusClaim = claim;
+      if (step2.plannerPayload && typeof step2.plannerPayload === "object") {
+        step2.plannerPayload.activePointId = point.id;
+        step2.plannerPayload.focusMode = "deepen";
+      }
+    }
+    if (point?.seedOnly === true && seed.length >= 4) {
+      const seedPreview = seed.length > 36 ? `${seed.slice(0, 36)}…` : seed;
+      return (
+        `「${claim}」在第一步你提到过「${seedPreview}」。` +
+        `请再展开 1–2 句：具体场景、机制或受影响对象，方便写成可展开的论据。`
+      );
+    }
+    return `「${claim}」目前还偏薄：请补 1–2 句具体场景、机制或受影响对象，方便写成可展开的论据。`;
+  };
+  const sideNext = resolveNextSideWalkStep(payload, dispositions);
+  if (sideNext.kind === "expand") {
+    return buildExpandAskForPoint(sideNext.point);
+  }
+  if (sideNext.kind === "side_retention") {
+    // Do not park ［待裁决］ markers — Phase1 arms pendingProposal instead.
+    if (step2 && typeof step2 === "object") {
+      const cleaned = stripPendingSlotAddMarker(String(step2.userPoints || ""))
+        .replace(/［待裁决：[^\］]*］/g, "")
+        .trim();
+      step2.userPoints = cleaned;
+    }
+    // Student rejected this side's settle → they own the scheme. Ask an open
+    // question instead of re-proposing the same fallback.
+    if (
+      payload?.settleAwaitingCustomSide &&
+      String(payload.settleAwaitingCustomSide) === String(sideNext.sideKey)
+    ) {
+      return buildOpenRetentionSchemeAsk(payload, sideNext.sideKey);
+    }
+    // Arm-first alignment: only speak a decision ask when the proposal channel
+    // would actually arm one; otherwise expand the blocking slot instead of
+    // emitting 详略 prose that will never grow buttons.
+    const probe = armNextProposal({
+      payload,
+      retentionSuggestion: step2?.retentionSuggestion || null,
+    });
+    if (probe?.proposalId) {
+      return buildAskFromProposal(payload, probe);
+    }
+    const blocking = (sideNext.points || []).find(
+      (p: any) => !isPointExpandedForWalk(p),
+    );
+    if (blocking) {
+      return buildExpandAskForPoint(blocking);
+    }
+    // Channel refused and nothing to expand (rare, e.g. side already settled
+    // mid-rebuild) — fall through to generic content asks; never speak a
+    // decision ask without a matching pendingProposal.
+  }
+
+  // 3) New-slot confirm ONLY after checklist is walked
+  const pendingAdd = payload?.pendingSlotAdd;
+  if (checklistDone && pendingAdd?.claim) {
+    return buildSlotAddConfirmAsk(String(pendingAdd.claim));
+  }
+
+  // Capacity trim merged into side 详略 — do not ask a second裁剪 confirm.
+  void pendingTrim;
+
+  // 4) Pending Step1 dimensions with no board slot yet
+  if (pendingDims.length > 0 && unwalked.length === 0 && !checklistDone) {
     const label = pendingDims.slice(0, 2).join("、");
     return `还有维度尚未处理（${label}）：请选一个展开成具体主张，或明确说「合并进已有点 / 放下不用」。`;
   }
 
-  // 3) Missing coverage buckets
-  if (missing.length > 0) {
+  // 5) Soft: missing coverage buckets (does not unlock stance alone)
+  if (missing.length > 0 && !checklistDone) {
     return missingBucketCoachHint(missing as any);
   }
 
-  // 4) Need more ready points
-  if (ready.length < 2) {
+  // 6) Need more ready points
+  if (ready.length < 2 && !checklistDone) {
     if (blockReason) return `${blockReason}。请直接补充可写的具体主张。`;
     return "材料还不够写满两处论据：请再给出 1 个具体主张，并带上场景、机制或受影响对象。";
   }
 
-  // 5) Materials enough — stance / summary
+  // 7) Stance recommend pending UI confirm (self-contained: carry the text)
+  const pendingStance = String(payload?.pendingStanceConfirm?.text || "").trim();
+  if (pendingStance && requiresStance) {
+    return (
+      `基于你目前的材料，推荐立场：「${pendingStance}」\n\n` +
+      `请点击「采纳」锁定，或「拒绝」后告诉我你想改成哪种立场。`
+    );
+  }
+  if (payload?.stanceAwaitingCustom && requiresStance && !stanceText) {
+    return "好的，不采用刚才的推荐。请直接用一两句话写出你的整体立场（例如利弊参半 / 更偏积极 / 更偏消极）。";
+  }
+
+  // 8) Checklist done — stance / summary
   if (requiresStance && !stanceText) {
-    return "材料已基本齐了。结合已有论据强弱，你更倾向完全同意、部分同意（带让步），还是不同意？直接说一个即可。";
+    return "各条论点已巡检完毕。结合已有论据强弱，你更倾向完全同意、部分同意（带让步），还是不同意？直接说一个即可。";
   }
-  if (stage === "stance" || (requiresStance && stanceText && stage !== "summary")) {
-    return `目前立场是「${stanceText.slice(0, 40)}」。这个方向符合你的本意吗？确认后我们整理材料池并进入下一步。`;
+  // A stance the student just accepted (locked/resolved) must not be re-confirmed.
+  const stanceLocked = Boolean(
+    payload?.stance?.locked ||
+      payload?.stanceConfirmResolved ||
+      step2.stanceConfirmResolved ||
+      eval2.stanceConfirmResolved,
+  );
+  if (
+    !stanceLocked &&
+    (stage === "stance" || (requiresStance && stanceText && stage !== "summary"))
+  ) {
+    return `目前立场是「${stanceText}」。这个方向符合你的本意吗？确认后我们整理材料池并进入下一步。`;
   }
-  if (stage === "summary" || (stanceText && ready.length >= 2)) {
+  if (stage === "summary" || stanceLocked || (stanceText && checklistDone)) {
     return "材料池和立场已经齐了。若没有要改的点，请确认进入下一步；若要改，直接指出要调整的论点或立场。";
   }
 
   if (blockReason) return `${blockReason}？`;
   return "请再补充 1 个具体可写主张（含场景、机制或受影响对象），或告诉我目前材料已经够用了。";
+}
+
+/**
+ * Phase1 early: accept/reject previous pendingProposal before legacy guards.
+ */
+/**
+ * Server-authored recap of the committed 详略 roles. On an accept turn the
+ * model's own prose may echo an earlier unparsed counter-scheme and claim
+ * roles that were never committed — the recap reads the committed payload.
+ */
+function buildSettleRecapAck(payload: any, sideKey: string): string {
+  const pts = (Array.isArray(payload?.points) ? payload.points : []).filter(
+    (p: any) =>
+      p &&
+      !p.supersededBy &&
+      (sideKey === "general" ||
+        (Array.isArray(p.leanTags) && p.leanTags.includes(sideKey))),
+  );
+  const label = (p: any) =>
+    String(p?.claim || "")
+      .replace(/[（(][^）)]*[）)]/g, "")
+      .trim() || String(p?.claim || "");
+  const details = pts
+    .filter((p: any) => p?.retentionRole === "detail")
+    .map(label);
+  const briefs = pts
+    .filter((p: any) => p?.retentionRole === "brief")
+    .map(label);
+  const parts: string[] = [];
+  if (details.length) {
+    parts.push(`详写${details.map((c: string) => `『${c}』`).join("、")}`);
+  }
+  if (briefs.length) {
+    parts.push(`略写${briefs.map((c: string) => `『${c}』`).join("、")}`);
+  }
+  if (!parts.length) return "好的，这一侧的详略方案已锁定。";
+  return `好的，已锁定这一侧详略：${parts.join("；")}。`;
+}
+
+function applyStep2ProposalChannelEarly(
+  data: any,
+  session: any,
+  userMessage: string,
+  decision?: { type?: string; action?: string; proposalId?: string } | null,
+): {
+  handled: boolean;
+  accepted?: boolean;
+  rejected?: boolean;
+  committedPayload?: any;
+  committedUserPoints?: string;
+  kind?: string;
+} {
+  if (!data?.progressUpdate?.step2Data) return { handled: false };
+  const prevPayload =
+    session?.step2?.coachEvaluation?.plannerPayload ||
+    session?.step2?.plannerPayload ||
+    null;
+  const prevUp = String(
+    session?.step2?.coachEvaluation?.userPoints ||
+      session?.step2?.userPoints ||
+      "",
+  );
+  const resolved = resolvePendingProposalDecision({
+    prevPayload,
+    prevUserPoints: prevUp,
+    userMessage,
+    decision: decision || null,
+  });
+  if (!resolved.handled || !resolved.result) {
+    // No pending proposal, but the student owns a rejected side's 详略 and
+    // just supplied their scheme → commit it directly (indices in board order,
+    // matching the open scheme ask).
+    const awaitingSide = String(
+      prevPayload?.settleAwaitingCustomSide || "",
+    ).trim();
+    if (awaitingSide && prevPayload && !prevPayload.pendingProposal?.proposalId) {
+      const scheme = parseRetentionSchemeMessage(userMessage);
+      const prop =
+        (scheme
+          ? buildSideSettleFromScheme({
+              payload: prevPayload,
+              sideKey: awaitingSide,
+              scheme,
+            })
+          : null) ||
+        // Label-named scheme（「详细写强势文化冲击」）— board order.
+        buildSideSettleFromLabelMessage({
+          payload: prevPayload,
+          sideKey: awaitingSide,
+          userMessage,
+        });
+      if (prop) {
+        const result = commitProposal({
+          payload: prevPayload,
+          proposal: prop,
+          userPoints: prevUp,
+        });
+        if (result.ok) {
+          const step2 = data.progressUpdate.step2Data;
+          step2.plannerPayload = result.payload;
+          step2.userPoints = String(result.userPoints || "")
+            .replace(/［待裁决：[^\］]*］/g, "")
+            .replace(/［待新增：[^\］]*］/g, "")
+            .trim();
+          const part1raw = safeOverridePart1(String(data.text || ""));
+          const part1 = /详写|略写/.test(part1raw) ? "好的。" : part1raw;
+          const nextAsk = buildStep2ContentAwareFallback(session, step2);
+          const recap = buildSettleRecapAck(result.payload, awaitingSide);
+          data.text = `${part1}\n\n---\n\n${recap}${nextAsk}`;
+          console.warn(
+            "[Step2Proposal] Custom scheme committed side_settle (awaiting-custom)",
+          );
+          return {
+            handled: true,
+            accepted: true,
+            committedPayload: result.payload,
+            committedUserPoints: step2.userPoints,
+            kind: "side_settle",
+          };
+        }
+      }
+    }
+    return { handled: false };
+  }
+
+  const step2 = data.progressUpdate.step2Data;
+  step2.plannerPayload = resolved.result.payload;
+  step2.userPoints = String(resolved.result.userPoints || "")
+    .replace(/［待裁决：[^\］]*］/g, "")
+    .replace(/［待新增：[^\］]*］/g, "")
+    .trim();
+  if (resolved.accepted && resolved.result.payload.stance?.text) {
+    step2.userStance = resolved.result.payload.stance.text;
+    if (!step2.blueprint || typeof step2.blueprint !== "object") {
+      step2.blueprint = {};
+    }
+    step2.blueprint.position = resolved.result.payload.stance.text;
+  }
+
+  const kind = String(prevPayload?.pendingProposal?.kind || "");
+  let part1 = safeOverridePart1(String(data.text || ""));
+  if (resolved.accepted) {
+    let ack =
+      kind === "slot_add"
+        ? "好的，新的平行论点已加入材料池。"
+        : kind === "slot_merge"
+          ? "好的，已按方案合并，右侧材料池已同步。"
+          : "好的，立场已锁定。";
+    if (kind === "side_settle") {
+      // Recap the roles that were ACTUALLY committed — and mute any 详写/略写
+      // narration in the model's prose, which can echo an earlier unparsed
+      // counter-scheme and contradict the board (incident: 「强势文化冲击设为
+      // 详写」 while the committed detail was 全球消费主义).
+      ack = buildSettleRecapAck(
+        resolved.result.payload,
+        String((prevPayload?.pendingProposal as any)?.payload?.side || ""),
+      );
+      if (/详写|略写/.test(part1)) part1 = "好的。";
+    }
+    const nextAsk = buildStep2ContentAwareFallback(session, step2);
+    // Skip the ack when the model's own reply already states the same lock.
+    const ackDup =
+      kind === "stance" && /立场已锁定|立场已经锁定/.test(part1);
+    data.text = `${part1}\n\n---\n\n${ackDup ? "" : ack}${nextAsk}`;
+    console.warn(
+      `[Step2Proposal] Accepted ${kind || "?"} → ledger committed`,
+    );
+    return {
+      handled: true,
+      accepted: true,
+      committedPayload: resolved.result.payload,
+      committedUserPoints: step2.userPoints,
+      kind,
+    };
+  }
+
+  const nextAsk = buildStep2ContentAwareFallback(session, step2);
+  data.text = `${part1}\n\n---\n\n好的，这个方案先不定。${nextAsk}`;
+  console.warn("[Step2Proposal] Rejected → pending cleared");
+  return {
+    handled: true,
+    rejected: true,
+    committedPayload: resolved.result.payload,
+    committedUserPoints: step2.userPoints,
+    kind,
+  };
+}
+
+/** Re-apply roles / sideSettled / stance after normalize rebuilds the payload. */
+function mergeCommittedProposalIntoPayload(
+  step2: any,
+  committed: any,
+  committedUserPoints?: string,
+): void {
+  if (!step2 || !committed) return;
+  const cur = step2.plannerPayload;
+  if (!cur || typeof cur !== "object") {
+    step2.plannerPayload = committed;
+    if (committedUserPoints != null) step2.userPoints = committedUserPoints;
+    return;
+  }
+  const committedById = new Map(
+    (committed.points || []).map((p: any) => [p.id, p]),
+  );
+  cur.points = (cur.points || []).map((p: any) => {
+    const cp: any = committedById.get(p.id);
+    if (!cp) return p;
+    let next = p;
+    if (cp.retentionRole) next = { ...next, retentionRole: cp.retentionRole };
+    // slot_merge: superseded flag must survive the normalize rebuild
+    if (cp.supersededBy && !p.supersededBy) {
+      next = { ...next, supersededBy: cp.supersededBy };
+    }
+    return next;
+  });
+  // slot_add may have appended a point only on committed
+  for (const p of committed.points || []) {
+    if (!(cur.points || []).some((x: any) => x.id === p.id)) {
+      cur.points = [...(cur.points || []), p];
+    }
+  }
+  // slot_merge: redirects + folded target body + merged dispositions
+  const committedRedirects = committed.redirects || {};
+  if (Object.keys(committedRedirects).length) {
+    cur.redirects = { ...(cur.redirects || {}), ...committedRedirects };
+    const intoIds = new Set(Object.values(committedRedirects).map(String));
+    cur.points = (cur.points || []).map((p: any) => {
+      if (!intoIds.has(p.id)) return p;
+      const cp: any = committedById.get(p.id);
+      if (!cp) return p;
+      const curLen = String(p.elaboration || "").length;
+      const cpLen = String(cp.elaboration || "").length;
+      if (cpLen <= curLen) return p;
+      return {
+        ...p,
+        elaboration: cp.elaboration,
+        quality: cp.quality || p.quality,
+        seedOnly: cp.seedOnly,
+      };
+    });
+    const mergedDims = (committed.dimensionDispositions || []).filter(
+      (d: any) => String(d?.disposition || "") === "merged",
+    );
+    if (mergedDims.length) {
+      const byDim = new Map(
+        mergedDims.map((d: any) => [String(d.dimension || ""), d]),
+      );
+      cur.dimensionDispositions = (cur.dimensionDispositions || []).map(
+        (d: any) => {
+          const hit: any = byDim.get(String(d?.dimension || ""));
+          return hit
+            ? { ...d, disposition: "merged", mergedInto: hit.mergedInto }
+            : d;
+        },
+      );
+    }
+  }
+  cur.sideSettled = [...(committed.sideSettled || [])];
+  cur.extraClaims = [...(committed.extraClaims || cur.extraClaims || [])];
+  cur.capacityTrimDismissedSides = [
+    ...(committed.capacityTrimDismissedSides || []),
+  ];
+  // Settle reject/commit may set or clear the awaiting-custom side.
+  cur.settleAwaitingCustomSide = committed.settleAwaitingCustomSide ?? null;
+  // Merge reject appends to this ledger; preserve so detection skips it.
+  if (Array.isArray(committed.rejectedMergeIds)) {
+    cur.rejectedMergeIds = [...committed.rejectedMergeIds];
+  }
+  cur.pendingProposal = null;
+  cur.pendingSlotAdd = null;
+  cur.pendingStanceConfirm = null;
+  cur.pendingCapacityTrim = null;
+  if (committed.stance?.text) {
+    cur.stance = { ...committed.stance };
+    cur.stanceConfirmResolved = Boolean(committed.stanceConfirmResolved);
+  }
+  if (committedUserPoints != null) {
+    step2.userPoints = String(committedUserPoints)
+      .replace(/［待裁决：[^\］]*］/g, "")
+      .replace(/［待新增：[^\］]*］/g, "")
+      .trim();
+  }
+  step2.plannerPayload = cur;
+}
+
+/**
+ * Phase1 late: arm pendingProposal, scrub explore leaks, decide-round purity.
+ */
+function applyStep2ProposalChannelLate(
+  data: any,
+  session: any,
+  userMessage: string,
+): void {
+  const step2 = data?.progressUpdate?.step2Data;
+  if (!step2 || typeof step2 !== "object") return;
+  let payload = step2.plannerPayload;
+  if (!payload || typeof payload !== "object") return;
+
+  // Reattach: 「这段是说××的」
+  if (userMessageLooksLikeReattach(userMessage)) {
+    const m = String(userMessage).match(
+      /(?:是说|记到|补充)\s*[「『]?([^」』，。\n]{2,28})/,
+    );
+    const targetHint = String(m?.[1] || "").trim();
+    const fromId = String(payload.activePointId || "").trim();
+    const toId = targetHint
+      ? findPointIdByClaim(payload.points || [], targetHint)
+      : undefined;
+    if (fromId && toId && fromId !== toId) {
+      payload = {
+        ...payload,
+        points: reattachElaborationBetweenSlots({
+          points: payload.points || [],
+          fromId,
+          toId,
+        }),
+      };
+      step2.plannerPayload = payload;
+      const toClaim =
+        (payload.points || []).find((p: any) => p.id === toId)?.claim ||
+        targetHint;
+      const tip = `已改记到「${claimMatchCore(toClaim) || toClaim}」。`;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      data.text = `${part1}\n\n---\n\n${tip}${buildStep2ContentAwareFallback(session, step2)}`;
+      console.warn(`[Step2Proposal] Reattached ${fromId} → ${toId}`);
+      return;
+    }
+  }
+
+  // Strip legacy markers while proposal channel is authoritative
+  step2.userPoints = String(step2.userPoints || "")
+    .replace(/［待裁决：[^\］]*］/g, "")
+    .replace(/［待新增：[^\］]*］/g, "")
+    .trim();
+
+  const exhausted = /先这样|够了|没有更多|材料够了|先不定详略/.test(
+    String(userMessage || ""),
+  );
+  // After a settle reject, 「按你的建议」 hands the scheme back to the coach:
+  // clear the awaiting-custom flag so the fallback settle may re-arm.
+  if (
+    payload.settleAwaitingCustomSide &&
+    userMessageAsksForSettleRecommendation(userMessage)
+  ) {
+    payload = { ...payload, settleAwaitingCustomSide: null };
+    console.warn(
+      "[Step2Proposal] Awaiting-custom cleared → student asked for a recommendation",
+    );
+  }
+  let resettleSide: string | undefined;
+  if (userMessageRequestsResettle(userMessage)) {
+    const settled = payload.sideSettled || [];
+    resettleSide = settled[settled.length - 1];
+    if (resettleSide) {
+      payload = {
+        ...payload,
+        sideSettled: settled.filter((s: string) => s !== resettleSide),
+      };
+    }
+  }
+
+  const suggested =
+    String(step2.suggestedStance || "").trim() ||
+    extractStanceRecommendFromText(String(data.text || ""));
+
+  let pending = payload.pendingProposal;
+  if (!pending?.proposalId) {
+    pending = armNextProposal({
+      payload,
+      coachText: String(data.text || ""),
+      suggestedStance: suggested,
+      exhausted,
+      studentWantsResettleSide: resettleSide,
+      retentionSuggestion: step2.retentionSuggestion || null,
+    });
+  }
+
+  if (pending?.proposalId) {
+    payload = {
+      ...payload,
+      pendingProposal: pending,
+      pendingSlotAdd: null,
+      pendingStanceConfirm: null,
+      pendingCapacityTrim: null,
+    };
+    step2.plannerPayload = payload;
+    const ask = buildAskFromProposal(payload, pending);
+    const part1 = safeOverridePart1(String(data.text || ""));
+    data.text = `${part1}\n\n---\n\n${ask}`;
+    if (data.progressUpdate) data.progressUpdate.isCompleted = false;
+    console.warn(
+      `[Step2Proposal] Armed ${pending.kind} id=${pending.proposalId}`,
+    );
+    return;
+  }
+
+  // Explore ban: scrub self-initiated decision prose when no pending
+  if (textLooksLikeExploreDecisionLeak(String(data.text || ""))) {
+    const part1 = safeOverridePart1(String(data.text || ""));
+    const ask = buildStep2ContentAwareFallback(session, step2);
+    data.text = `${part1}\n\n---\n\n${ask}`;
+    console.warn("[Step2Proposal] Scrubbed explore decision leak");
+  }
+
+  // NOTE: the old 已记入：「X」 tip was removed — it read activePointId after the
+  // next-ask refocus, so it named the UPCOMING slot instead of where the student's
+  // content actually mounted, and it added no information over the coach's reply.
+
+  step2.plannerPayload = payload;
 }
 
 function fallbackNextStep(
@@ -827,39 +1409,216 @@ function isStep2ExploreDone(args: {
   session?: any;
   userMessage?: string;
 }): boolean {
-  const readyCount = activePoints(args.payload).filter(
-    (p) => p.quality === "ready",
-  ).length;
   const exhausted =
     typeof args.userMessage === "string" &&
     studentSignalsExhausted(args.userMessage);
-  if (readyCount < 2 && !exhausted) return false;
 
   const dispositions =
     args.step2Data?.dimensionDispositions ||
     args.session?.step2?.coachEvaluation?.dimensionDispositions ||
     args.payload?.dimensionDispositions ||
     [];
-  if (Array.isArray(dispositions) && dispositions.length > 0) {
-    const pending = dispositions.some(
-      (d: any) => String(d?.disposition || "").trim() === "pending",
-    );
-    if (pending) return false;
+
+  // Primary gate: every checklist slot walked (content + 详略 / drop / merge).
+  // Coverage buckets alone must NOT unlock stance.
+  if (
+    isStep2ChecklistWalkDone(args.payload, dispositions, { exhausted })
+  ) {
+    // Block while single-side capacity trim awaits confirm
+    const trim = args.payload?.pendingCapacityTrim;
+    if (
+      trim?.sideKey &&
+      Array.isArray(trim.pointClaims) &&
+      trim.pointClaims.length >= 3
+    ) {
+      return false;
+    }
+    return true;
   }
-  return true;
+
+  // No frozen slots yet: keep legacy floor (≥2 ready) so early explore can move.
+  // seedOnly Step1 sprouts do not count as walk-ready.
+  const readyCount = activePoints(args.payload).filter((p) =>
+    isPointExpandedForWalk(p),
+  ).length;
+  const hasFixed =
+    Boolean(args.payload?.slotsLocked) ||
+    (Array.isArray(args.payload?.fixedClaims) &&
+      args.payload.fixedClaims.length > 0);
+  if (!hasFixed) {
+    if (readyCount < 2 && !exhausted) return false;
+    if (Array.isArray(dispositions) && dispositions.length > 0) {
+      const pending = dispositions.some(
+        (d: any) => String(d?.disposition || "").trim() === "pending",
+      );
+      if (pending) return false;
+    }
+    return readyCount >= 2 || exhausted;
+  }
+
+  return false;
 }
 
 /**
- * Normalize Step2 → Planner payload every turn; stamp onto step2Data.
- * Also advances/skips explore_B when coverage buckets are already filled.
- * Hard rule: never enter stance/summary until explore is done.
+ * When checklist asks 详写/略写 and student replies with a short choice,
+ * stamp tags (supports「详细写1」/ pair brief siblings). Prefer normalize intent path.
  */
-function applyStep2PlannerPayloadNormalize(
-  question: string,
+function applyStep2InlineChecklistRetention(
   data: any,
   session: any,
   userMessage?: string,
 ): void {
+  if (!data?.progressUpdate?.step2Data) return;
+  const msg = String(userMessage || "").trim();
+  if (!msg || msg.length > 40) return;
+  const parsed = parseRetentionChoiceMessage(msg);
+  if (!parsed) return;
+
+  const step2 = data.progressUpdate.step2Data;
+  const payload =
+    step2.plannerPayload ||
+    session?.step2?.coachEvaluation?.plannerPayload ||
+    null;
+  const dispositions =
+    step2.dimensionDispositions ||
+    session?.step2?.coachEvaluation?.dimensionDispositions ||
+    payload?.dimensionDispositions ||
+    [];
+  const unwalked = listUnwalkedChecklistPoints(payload, dispositions).filter(
+    (u) => u.reason === "needs_retention",
+  );
+  // Still allow stamping even if already partially settled (pair brief)
+  const activePts = activePoints(payload);
+  if (!activePts.length) return;
+
+  const activeId = String(payload?.activePointId || "").trim();
+  const target =
+    (parsed.targetIndex
+      ? activePts[parsed.targetIndex - 1]
+      : undefined) ||
+    (activeId ? activePts.find((p) => p.id === activeId) : undefined) ||
+    (unwalked[0]
+      ? activePts.find((p) => p.id === unwalked[0].id)
+      : undefined) ||
+    activePts.find((p) => p.quality === "ready") ||
+    activePts[0];
+  if (!target?.claim) return;
+
+  let prevPoints = String(
+    step2.userPoints ||
+      session?.step2?.coachEvaluation?.userPoints ||
+      "",
+  );
+  if (parsed.role === "both_detail") {
+    for (const p of activePts) {
+      if (p.quality !== "ready" && String(p.elaboration || "").trim().length < 8) {
+        continue;
+      }
+      prevPoints = stampRetentionTagOnUserPoints(prevPoints, p.claim, "detail");
+    }
+    step2.userPoints = prevPoints;
+    console.warn(`[Step2Checklist] Inline retention → both_detail`);
+    return;
+  }
+  const role =
+    parsed.role === "drop"
+      ? "dropped"
+      : parsed.role === "brief"
+        ? "brief"
+        : "detail";
+  prevPoints = stampRetentionTagOnUserPoints(prevPoints, target.claim, role);
+  // Do NOT silently brief siblings — remaining needs_retention points are asked next.
+  step2.userPoints = prevPoints;
+  if (Array.isArray(step2.dimensionDispositions)) {
+    step2.dimensionDispositions = step2.dimensionDispositions.map((d: any) => {
+      const dim = String(d?.dimension || "").trim();
+      if (!dim || !headsCompatible(dim, target.claim)) return d;
+      if (d.disposition === "pending") {
+        return { ...d, disposition: "expanded", note: "inline_retention" };
+      }
+      return d;
+    });
+  }
+  console.warn(
+    `[Step2Checklist] Inline retention → ${role} on 「${target.claim}」 idx=${parsed.targetIndex || "-"}`,
+  );
+}
+
+async function classifyStep2StudentTurnLive(args: {
+  userMessage: string;
+  coachAsk: string;
+  boardClaims: string[];
+  hasPendingSlotAdd: boolean;
+  pendingSlotClaim?: string;
+  decision?: { type?: string; action?: string; claim?: string } | null;
+}): Promise<Step2StudentTurnIntent> {
+  const fromDecision = intentFromStructuredDecision(args.decision);
+  if (fromDecision) return fromDecision;
+
+  const heuristic = classifyStep2StudentTurnHeuristic({
+    userMessage: args.userMessage,
+    hasPendingSlotAdd: args.hasPendingSlotAdd,
+    coachAsk: args.coachAsk,
+  });
+  // High-confidence structural cases — skip LLM
+  if (
+    heuristic.kind === "meta_process" ||
+    heuristic.kind === "retention_choice" ||
+    heuristic.kind === "accept_slot_add" ||
+    heuristic.kind === "reject_slot_add" ||
+    heuristic.kind === "confirm_ack" ||
+    heuristic.confidence >= 0.9
+  ) {
+    return heuristic;
+  }
+
+  const msg = String(args.userMessage || "").trim();
+  if (!msg || msg.length < 4) return heuristic;
+
+  try {
+    const prompt = buildStep2StudentTurnIntentPrompt({
+      userMessage: msg,
+      coachAsk: args.coachAsk,
+      boardClaims: args.boardClaims,
+      hasPendingSlotAdd: args.hasPendingSlotAdd,
+      pendingSlotClaim: args.pendingSlotClaim,
+    });
+    const response = await generateContentWithFallback({
+      contents: prompt,
+      config: {
+        temperature: 0.1,
+        maxOutputTokens: 1024,
+        responseMimeType: "application/json",
+      },
+    });
+    const parsed = parseStep2StudentTurnIntentLlm(String(response?.text || ""));
+    if (parsed && parsed.kind !== "unknown") {
+      console.log(
+        `[Step2TurnIntent] llm kind=${parsed.kind} conf=${parsed.confidence}`,
+      );
+      return parsed;
+    }
+  } catch (err) {
+    console.warn("[Step2TurnIntent] LLM classify failed; using heuristic", err);
+  }
+  return heuristic;
+}
+
+/**
+ * Normalize Step2 → Planner payload every turn; stamp onto step2Data.
+ * Advances stage only when checklist walk is done (not mere bucket coverage).
+ * Hard rule: never enter stance/summary until explore is done.
+ */
+async function applyStep2PlannerPayloadNormalize(
+  question: string,
+  data: any,
+  session: any,
+  userMessage?: string,
+  options?: {
+    isHiddenKickoff?: boolean;
+    decision?: { type?: string; action?: string; claim?: string } | null;
+  },
+): Promise<void> {
   if (!data?.progressUpdate || typeof data.progressUpdate !== "object") return;
   if (
     !data.progressUpdate.step2Data ||
@@ -874,6 +1633,37 @@ function applyStep2PlannerPayloadNormalize(
     undefined;
   const brief = buildQuestionBrief(question, knownType);
 
+  // Lock confirmed 详写/略写 tags across model userPoints rewrites unless student asks.
+  const prevUserPoints = String(
+    session?.step2?.coachEvaluation?.userPoints ||
+      session?.step2?.userPoints ||
+      "",
+  );
+  // Anti-forgery FIRST: the model may never mint locked 详写/略写/放弃 tags
+  // itself — new locks only enter via server stamps after a confirmed
+  // decision (which run later in this pipeline). Applies even when the user
+  // requests a retention change: their change is stamped server-side too.
+  const incomingUserPoints = stripForgedRetentionLocks(
+    prevUserPoints,
+    String(step2.userPoints || prevUserPoints || ""),
+  );
+  const allowRetentionChange =
+    typeof userMessage === "string" &&
+    userMessageRequestsRetentionChange(userMessage);
+  const lockedUserPoints = preserveLockedRetentionInUserPoints(
+    prevUserPoints,
+    incomingUserPoints,
+    { allowUserChange: allowRetentionChange },
+  );
+  if (lockedUserPoints && lockedUserPoints !== incomingUserPoints) {
+    step2.userPoints = lockedUserPoints;
+    console.warn(
+      "[Step2RetentionLock] Restored confirmed 详写/略写 tags onto userPoints (system rewrite blocked).",
+    );
+  } else if (lockedUserPoints) {
+    step2.userPoints = lockedUserPoints;
+  }
+
   const exhausted =
     typeof userMessage === "string" && studentSignalsExhausted(userMessage);
   const forceExitUsed = Boolean(
@@ -885,6 +1675,53 @@ function applyStep2PlannerPayloadNormalize(
   const prevFp = plannerPayloadFingerprint(
     session?.step2?.coachEvaluation?.plannerPayload,
   );
+
+  const lastCoachAsk = String(step2._lastCoachAsk || "").trim();
+  const prevPayload = session?.step2?.coachEvaluation?.plannerPayload;
+  const boardClaimRaw = [
+    ...(Array.isArray(prevPayload?.fixedClaims) ? prevPayload.fixedClaims : []),
+    ...(Array.isArray(prevPayload?.points)
+      ? prevPayload.points
+          .filter((p: any) => p && !p.supersededBy)
+          .map((p: any) => String(p.claim || ""))
+      : []),
+  ].filter(Boolean);
+  const boardClaims: string[] = [];
+  const boardSeen = new Set<string>();
+  for (const c of boardClaimRaw) {
+    const key = claimMatchCore(c) || c;
+    if (!key || boardSeen.has(key)) continue;
+    if (boardClaims.some((x) => headsCompatible(claimMatchCore(x) || x, key))) {
+      continue;
+    }
+    boardSeen.add(key);
+    boardClaims.push(c);
+  }
+
+  let studentTurnIntent: Step2StudentTurnIntent;
+  if (options?.isHiddenKickoff) {
+    studentTurnIntent = {
+      kind: "confirm_ack",
+      confidence: 1,
+      source: "heuristic",
+    };
+  } else {
+    studentTurnIntent = await classifyStep2StudentTurnLive({
+      userMessage: typeof userMessage === "string" ? userMessage : "",
+      coachAsk: lastCoachAsk,
+      boardClaims,
+      hasPendingSlotAdd: Boolean(prevPayload?.pendingSlotAdd?.claim),
+      pendingSlotClaim: prevPayload?.pendingSlotAdd?.claim,
+      decision: options?.decision || null,
+    });
+  }
+  if (studentTurnIntent.kind !== "unknown") {
+    console.log(
+      `[Step2TurnIntent] kind=${studentTurnIntent.kind} source=${studentTurnIntent.source}`,
+    );
+  }
+  // Expose to post-process (block false slot-add after meta turns)
+  (step2 as any)._studentTurnIntent = studentTurnIntent;
 
   const payload = normalizeStep2PlannerPayload({
     session: {
@@ -901,9 +1738,30 @@ function applyStep2PlannerPayloadNormalize(
     questionType: brief.questionType,
     requiresStance: brief.requiresStance,
     forceExitUsed,
+    userMessage: typeof userMessage === "string" ? userMessage : undefined,
+    coachText: lastCoachAsk,
+    isHiddenKickoff: Boolean(options?.isHiddenKickoff),
+    decision: options?.decision || null,
+    studentTurnIntent,
   });
 
   step2.plannerPayload = payload;
+  // Keep pending new-slot marker in userPoints when awaiting confirm
+  if (payload.pendingSlotAdd?.claim) {
+    const base = stripPendingSlotAddMarker(
+      String(step2.userPoints || prevUserPoints || ""),
+    );
+    step2.userPoints =
+      `${base} ${formatPendingSlotAddMarker(payload.pendingSlotAdd)}`.trim();
+  } else {
+    // Accept or reject (or no pending) → strip marker
+    const stripped = stripPendingSlotAddMarker(
+      String(step2.userPoints || prevUserPoints || ""),
+    );
+    if (stripped !== String(step2.userPoints || "").trim()) {
+      step2.userPoints = stripped;
+    }
+  }
   // Never keep English polished points in the material contract
   step2.suggestedPoints = "";
   // Mirror coverage into legacy check fields for UI
@@ -923,8 +1781,8 @@ function applyStep2PlannerPayloadNormalize(
   ).trim();
 
   const missing = payload.coverage?.missingBuckets || [];
-  const readyCount = activePoints(payload).filter(
-    (p) => p.quality === "ready",
+  const readyCount = activePoints(payload).filter((p) =>
+    isPointExpandedForWalk(p),
   ).length;
   const exploreDone = isStep2ExploreDone({
     payload,
@@ -932,32 +1790,36 @@ function applyStep2PlannerPayloadNormalize(
     session,
     userMessage,
   });
+  const unwalked = listUnwalkedChecklistPoints(
+    payload,
+    step2.dimensionDispositions || payload.dimensionDispositions,
+  );
 
-  // explore_B = fill buckets only. No missing buckets ≠ stance unlocked.
-  if (stage === "explore_A" && readyCount >= 1 && missing.length > 0) {
+  // explore_A → explore_B when A-side walked or soft missing buckets remain.
+  // Stance ONLY when checklist walk is done (not merely missingBuckets===[]).
+  if (stage === "explore_A" && readyCount >= 1 && (missing.length > 0 || unwalked.some((u) => u.sideKey === "part_2" || u.sideKey === "view_b" || u.sideKey === "disadvantage" || u.sideKey === "solution" || u.sideKey === "negative"))) {
     stage = "explore_B";
     step2.currentStage = stage;
-  } else if (stage === "explore_A" && missing.length === 0 && exploreDone) {
+  } else if (
+    (stage === "explore_A" || stage === "explore_B") &&
+    exploreDone
+  ) {
     stage = brief.requiresStance ? "stance" : "summary";
     step2.currentStage = stage;
     console.warn(
-      `[Step2Payload] Explore done (no missing buckets) → stage=${stage}`,
-    );
-  } else if (stage === "explore_B" && missing.length === 0 && exploreDone) {
-    stage = brief.requiresStance ? "stance" : "summary";
-    step2.currentStage = stage;
-    console.warn(
-      `[Step2Payload] Explore done after coverage filled → stage=${stage}`,
+      `[Step2Payload] Checklist walk done → stage=${stage} (ready=${readyCount}, unwalked=${unwalked.length})`,
     );
   } else if (
     (stage === "stance" || stage === "summary") &&
     !exploreDone
   ) {
-    // Model jumped ahead — clamp back until explore finishes.
-    stage = missing.length > 0 ? "explore_B" : "explore_A";
+    // Model jumped ahead — clamp back until checklist finishes.
+    stage = missing.length > 0 || unwalked.some((u) => /part_2|view_b|disadvantage|solution|negative/.test(u.sideKey))
+      ? "explore_B"
+      : "explore_A";
     step2.currentStage = stage;
     console.warn(
-      `[Step2Payload] Blocked early stance/summary → clamped to ${stage} (ready=${readyCount})`,
+      `[Step2Payload] Blocked early stance/summary → clamped to ${stage} (ready=${readyCount}, unwalked=${unwalked.length})`,
     );
   }
 
@@ -1704,7 +2566,7 @@ function textOffersStep1Exit(text: string): boolean {
   const t = String(text || "");
   // Soft "continue or stop" ask — may mention Step 2 as an option, but is not
   // the hard completion CTA that unlocks the jump button alone.
-  return /如果(暂时)?想不[到出]|如果没有(更多|别的|了)?|还能想到别的|还有别的角度吗|没有了.*就.*第[二2]步|可以进入第[二2]步了/.test(
+  return /如果(暂时)?想不[到出]|如果没有(更多|别的|了)?|如果觉得足够|还能想到别的|还有别的角度吗|还有其他.{0,8}角度|没有了.*就.*第[二2]步|可以进入第[二2]步了|我们好进入下[一1]阶段/.test(
     t,
   );
 }
@@ -1767,22 +2629,29 @@ function isStep1SlotsComplete(step1Eval: Record<string, any>): boolean {
   const hasConstraints =
     isRealConstraintList(step1Eval.constraints) ||
     step1Eval.constraintsSkipped === true;
-  const dims = step1Eval.suggestedDimensions;
+  const dims = Array.isArray(step1Eval.suggestedDimensions)
+    ? step1Eval.suggestedDimensions.map(String)
+    : [];
   const effectiveCount = countEffectiveStep1Dimensions(dims);
+  const capDone = step1CapProbeComplete(dims, STEP1_DIM_MAX);
   return (
     hasType &&
     hasIssue &&
     hasConstraints &&
-    effectiveCount >= STEP1_DIM_MIN_EFFECTIVE
+    (effectiveCount >= STEP1_DIM_MIN_EFFECTIVE || capDone)
   );
 }
 
 /**
  * AI/server sufficiency: enough probed+expandable dimensions to stop diverging.
- * Quality-pending labels do not count. Prefer model flag only when count also ok.
+ * Cap-full + all probed is a deadlock relief even when effective < 3.
  */
 function computeStep1DimensionsSufficient(step1Eval: Record<string, any>): boolean {
-  const effective = countEffectiveStep1Dimensions(step1Eval?.suggestedDimensions);
+  const dims = Array.isArray(step1Eval?.suggestedDimensions)
+    ? step1Eval.suggestedDimensions.map(String)
+    : [];
+  if (step1CapProbeComplete(dims, STEP1_DIM_MAX)) return true;
+  const effective = countEffectiveStep1Dimensions(dims);
   if (effective < STEP1_DIM_MIN_EFFECTIVE) return false;
   if (step1Eval?.dimensionsSufficient === false) return false;
   return true;
@@ -2251,15 +3120,44 @@ function clearAllStep3PlanValues(plan: any): void {
   }
 }
 
+/** Real incomplete sibling body label, or null when none remain. Never invent "下一段". */
 function nextIncompleteStep3BodyLabel(
   subpoints: any[],
   activeId: string,
-): string {
+): string | null {
   const next = (subpoints || []).find(
     (sp: any) => sp?.id !== activeId && !isSubpointGenuinelyComplete(sp),
   );
-  if (!next) return "下一段";
-  return String(next.targetBody || next.theme || next.content || "下一段").trim() || "下一段";
+  if (!next) return null;
+  const label = String(
+    next.targetBody || next.theme || next.content || "",
+  ).trim();
+  return label || null;
+}
+
+const STEP3_WHOLE_STEP_JUMP_CTA =
+  "第三步段落逻辑链构建已全部完成！请点击左侧【立即跳转】进入第四步：逐句写作练习。";
+
+function textLooksLikeStep3NextBodyAdvance(text: string): boolean {
+  const t = String(text || "");
+  return (
+    t.includes("接下来我们写") ||
+    t.includes("「下一段」") ||
+    t.includes("这一段先告一段落") ||
+    (t.includes("下一段") && t.includes("核心分论点"))
+  );
+}
+
+/** Whole Step 3 done → jump CTA (never "next body"). */
+function rewriteStep3WholeStepJumpCta(data: any): void {
+  if (!data?.progressUpdate) return;
+  data.progressUpdate.isCompleted = true;
+  const split = splitTwoParts(String(data.text || ""), 3);
+  const part1 = sanitizeStep3RewritePart1(
+    split.part1,
+    "这一段的论证链已经完整。",
+  );
+  data.text = `${part1}\n\n---\n\n${STEP3_WHOLE_STEP_JUMP_CTA}`;
 }
 
 /** Strip whole-step completion CTA when other bodies still need work. */
@@ -2308,11 +3206,34 @@ function finalizeStep3WholeStepCompletion(
     });
 
   if (!hasEnoughBodies || !othersDone) {
-    const nextLabel = !hasEnoughBodies
-      ? `主体段 ${Math.max(subpoints.length, 0) + 1}`
-      : nextIncompleteStep3BodyLabel(subpoints, activeId);
-    // Always rewrite when the model claimed whole-step completion OR set the flag.
-    // Current-body done ≠ whole Step 3 done.
+    // Body count short → ask for the next real body slot.
+    if (!hasEnoughBodies) {
+      const nextLabel = `主体段 ${Math.max(subpoints.length, 0) + 1}`;
+      if (
+        textSuggestsStep3Complete(String(data.text || "")) ||
+        data.progressUpdate.isCompleted
+      ) {
+        rewriteStep3AdvanceToNextBody(data, nextLabel);
+      } else {
+        data.progressUpdate.isCompleted = false;
+      }
+      console.warn(
+        `[Step3Guard] Expected ${expectedBodyCount} bodies but only ${subpoints.length} found.`,
+      );
+      return;
+    }
+
+    // Enough bodies, but othersDone failed — only advance if a real sibling remains.
+    const nextLabel = nextIncompleteStep3BodyLabel(subpoints, activeId);
+    if (!nextLabel) {
+      // No incomplete sibling: do NOT invent「下一段」. Promote to whole-step jump.
+      rewriteStep3WholeStepJumpCta(data);
+      console.warn(
+        "[Step3Guard] No incomplete sibling body; promoting to whole-step jump CTA.",
+      );
+      return;
+    }
+
     if (
       textSuggestsStep3Complete(String(data.text || "")) ||
       data.progressUpdate.isCompleted
@@ -2321,24 +3242,14 @@ function finalizeStep3WholeStepCompletion(
     } else {
       data.progressUpdate.isCompleted = false;
     }
-    if (!hasEnoughBodies) {
-      console.warn(
-        `[Step3Guard] Expected ${expectedBodyCount} bodies but only ${subpoints.length} found.`,
-      );
-    } else {
-      console.warn(
-        "[Step3Guard] Active body may be filled, but sibling bodies lack quality board and/or student dialogue — withholding whole-step completion.",
-      );
-    }
+    console.warn(
+      "[Step3Guard] Active body may be filled, but sibling bodies lack quality board and/or student dialogue — withholding whole-step completion.",
+    );
     return;
   }
 
-  if (
-    textSuggestsStep3Complete(String(data.text || "")) ||
-    data.progressUpdate.isCompleted
-  ) {
-    data.progressUpdate.isCompleted = true;
-  }
+  // All bodies genuinely done — unify jump CTA (covers model text that still says「下一段」).
+  rewriteStep3WholeStepJumpCta(data);
 }
 
 /**
@@ -2418,6 +3329,17 @@ function attachStep3UiProgress(
   };
   // Keep whole-step flag aligned with the UI contract.
   data.progressUpdate.isCompleted = isStep3Finished;
+
+  // Final authority for coach copy: finished board ⇒ jump CTA, never「下一段」.
+  if (isStep3Finished) {
+    const t = String(data.text || "");
+    if (!textSuggestsStep3Complete(t) || textLooksLikeStep3NextBodyAdvance(t)) {
+      rewriteStep3WholeStepJumpCta(data);
+      console.warn(
+        "[Step3Guard] isStep3Finished=true — normalized coach text to whole-step jump CTA.",
+      );
+    }
+  }
 }
 
 type PendingPlanStep = {
@@ -6299,12 +7221,8 @@ function listUnresolvedStep1Dimensions(
 
 /**
  * Soft guard: ensure Step 1 effective dimensions are accounted for before
- * Step 2 completion. When the conversation has already advanced to stance/summary
- * with solid material, auto-disposition pending dimensions rather than blocking.
- *
- * The authoritative semantic judgment ("was this dimension discussed?") belongs
- * to the Intent Agent. This guard only catches the case where the model is
- * trying to complete during explore_A/B without addressing dimensions at all.
+ * Step 2 completion. Do NOT auto-expand pending while checklist slots remain
+ * unwalked — that previously unlocked stance with thin Step1 dimensions.
  */
 function enforceStep2DimensionDispositionGuard(
   data: any,
@@ -6327,13 +7245,25 @@ function enforceStep2DimensionDispositionGuard(
   const isCompletedFlag =
     !!data.progressUpdate.isCompleted || ctaOk;
 
+  const payload =
+    step2.plannerPayload ||
+    session?.step2?.coachEvaluation?.plannerPayload ||
+    null;
+  const unwalked = listUnwalkedChecklistPoints(payload, dispositions);
+  const checklistDone = isStep2ChecklistWalkDone(payload, dispositions);
+
   // Only hard-block during early exploration: the model is trying to jump
   // to completion without having even entered stance/summary stage.
   const earlyConverge = stage === "explore_A" || stage === "explore_B";
   if (!isCompletedFlag || !earlyConverge) {
-    // Soft pass: conversation has advanced (stance/summary) with solid material.
-    // Auto-disposition remaining pending dimensions as expanded — the Intent Agent
-    // will provide authoritative semantic matching when integrated.
+    // Soft-pass ONLY when checklist is already walked — never paper-complete
+    // pending dimensions while slots are still thin / missing 详略.
+    if (unwalked.length > 0 || !checklistDone) {
+      console.warn(
+        `[Step2DimDispositionGuard] Soft-pass SKIPPED; unwalked=${unwalked.length} stage=${stage} labels=[${unresolved.map((d) => d.dimension).join("、")}]`,
+      );
+      return;
+    }
     const finalDispositions = dispositions.map((d) => {
       if (d.disposition === "pending") {
         return { ...d, disposition: "expanded" as const };
@@ -6343,7 +7273,7 @@ function enforceStep2DimensionDispositionGuard(
     step2.dimensionDispositions = finalDispositions;
     const labels = unresolved.map((d) => d.dimension).join("、");
     console.warn(
-      `[Step2DimDispositionGuard] Soft-pass: auto-expanded pending dimensions [${labels}] in stage=${stage}`,
+      `[Step2DimDispositionGuard] Soft-pass: auto-expanded pending dimensions [${labels}] in stage=${stage} (checklist done)`,
     );
     return;
   }
@@ -6586,6 +7516,18 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
+    // Framework coverage: the planner ledger (subpoint.points/pointRoles) is
+    // block authority — append a block for any mapped point the coach's plan
+    // silently dropped (e.g. narrating an old "不独立成段" story from Step2).
+    const appendedLabels = ensureParagraphPlanCoversFrameworkPoints(
+      plan,
+      activeSp,
+    );
+    if (appendedLabels.length) {
+      console.warn(
+        `[Step3PlanCoverage] Appended ${appendedLabels.length} framework block(s) omitted from plan: ${appendedLabels.join("、")}`,
+      );
+    }
     data.progressUpdate.paragraphPlan = plan;
   }
 
@@ -7414,7 +8356,15 @@ function looksLikeQuestionEnding(text: string): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
   const tail = t.slice(-60);
-  return /[?？]/.test(tail);
+  if (/[?？]/.test(tail)) return true;
+  // Decision CTAs (采纳/拒绝 buttons) are valid endings even when phrased as a
+  // statement — momentum must not replace a legitimate proposal ask.
+  const ctaTail = t.slice(-160);
+  return (
+    /请点击[^。！!]{0,40}[「『]?采纳[」』]?/.test(ctaTail) ||
+    /[「『]采纳[」』][^。！!]{0,40}[「『]拒绝[」』]/.test(ctaTail) ||
+    /点击下方[^。！!]{0,40}采纳/.test(ctaTail)
+  );
 }
 
 /**
@@ -7424,7 +8374,397 @@ function looksLikeQuestionEnding(text: string): boolean {
  * and the student sees no forward action — swap in a rule-based fallback
  * question for the current stage/task instead of leaving it dangling.
  */
-function enforceStep2Momentum(data: any, session: any): void {
+/**
+ * Stance recommend confirm: ensure pendingStanceConfirm is armed for UI,
+ * handle accept → summary, reject → ask for custom stance.
+ */
+function applyStep2StanceConfirmPostProcess(
+  data: any,
+  session: any,
+  userMessage: string,
+  options?: { decision?: { type?: string; action?: string } | null },
+): void {
+  const step2 = data?.progressUpdate?.step2Data;
+  if (!step2 || typeof step2 !== "object") return;
+  const payload = step2.plannerPayload;
+  if (!payload || typeof payload !== "object") return;
+
+  const decisionType = String(options?.decision?.type || "").trim();
+  const decisionAction = String(options?.decision?.action || "").trim();
+  const requiresStance = step2.requiresStance !== false && payload.requiresStance !== false;
+  if (!requiresStance) {
+    payload.pendingStanceConfirm = null;
+    return;
+  }
+
+  // Sync flags onto step2 for session persistence via coachEvaluation merge
+  step2.stanceConfirmResolved = Boolean(payload.stanceConfirmResolved);
+  step2.stanceAwaitingCustom = Boolean(payload.stanceAwaitingCustom);
+
+  if (decisionType === "stance" && decisionAction === "accept") {
+    const locked = String(
+      step2.userStance || payload.stance?.text || "",
+    ).trim();
+    if (locked) {
+      step2.currentStage = "summary";
+      payload.pendingStanceConfirm = null;
+      payload.stanceConfirmResolved = true;
+      step2.stanceConfirmResolved = true;
+      if (data?.text) {
+        const split = splitTwoParts(String(data.text), 1);
+        data.text =
+          `${safeOverridePart1(split.part1 || "好的，立场已锁定。")}\n\n---\n\n` +
+          `立场已确认。若材料没有要改的地方，请确认进入下一步；若要改，直接指出要调整的论点。`;
+      }
+      console.warn("[Step2StanceConfirm] Accepted → summary");
+    }
+    return;
+  }
+
+  if (decisionType === "stance" && decisionAction === "reject") {
+    payload.pendingStanceConfirm = null;
+    payload.stanceAwaitingCustom = true;
+    step2.stanceAwaitingCustom = true;
+    step2.stanceConfirmResolved = false;
+    payload.stanceConfirmResolved = false;
+    if (data?.text) {
+      const split = splitTwoParts(String(data.text), 1);
+      data.text =
+        `${safeOverridePart1(split.part1 || "好的，我们不用刚才的推荐。")}\n\n---\n\n` +
+        `请直接用一两句话写出你的整体立场（例如利弊参半 / 更偏积极 / 更偏消极）。`;
+    }
+    console.warn("[Step2StanceConfirm] Rejected → awaiting custom stance");
+    return;
+  }
+
+  // Never re-arm after resolve
+  if (payload.stanceConfirmResolved) {
+    payload.pendingStanceConfirm = null;
+    return;
+  }
+
+  // Arm only when checklist walk is done (评价侧 thin → never stance CTA)
+  const dispositions =
+    step2.dimensionDispositions || payload.dimensionDispositions;
+  const checklistDone = isStep2ChecklistWalkDone(payload, dispositions);
+  const unwalkedStance = listUnwalkedChecklistPoints(payload, dispositions);
+  const sideNextStance = resolveNextSideWalkStep(payload, dispositions);
+  if (!checklistDone || unwalkedStance.length > 0 || sideNextStance.kind !== "done") {
+    payload.pendingStanceConfirm = null;
+    if (String(step2.currentStage || "") === "stance") {
+      step2.currentStage = "explore_B";
+    }
+  }
+  const stage = String(step2.currentStage || "").trim();
+  const suggested = String(step2.suggestedStance || "").trim();
+  if (
+    checklistDone &&
+    unwalkedStance.length === 0 &&
+    sideNextStance.kind === "done" &&
+    (stage === "stance" ||
+      textLooksLikePrematureStanceAsk(String(data.text || "")) ||
+      coachMessageLooksLikeStanceDecision(String(data.text || ""))) &&
+    !payload.stanceAwaitingCustom &&
+    !payload.pendingCapacityTrim?.sideKey &&
+    !payload.pendingSlotAdd?.claim
+  ) {
+    step2.currentStage = "stance";
+    const text =
+      suggested ||
+      String(payload.pendingStanceConfirm?.text || "").trim() ||
+      extractStanceRecommendFromText(String(data.text || "")) ||
+      String(step2.userStance || "").trim();
+    if (text) {
+      payload.pendingStanceConfirm = { text };
+      if (!suggested) step2.suggestedStance = text;
+      // No text rewrite here: applyStep2ProposalChannelLate migrates this
+      // pendingStanceConfirm into a kind:'stance' pendingProposal and emits a
+      // self-contained ask that carries the stance sentence itself. Rewriting
+      // to 「上面是…立场推荐」 used to drop the recommendation body entirely.
+      console.warn(
+        `[Step2StanceConfirm] Armed pending 「${text.slice(0, 40)}」`,
+      );
+    }
+  } else if (!checklistDone) {
+    payload.pendingStanceConfirm = null;
+  }
+}
+
+/** Persist pendingFocusClaim (thin-ask) as deepen focus for the next student reply. */
+function stampStep2ActivePointFromPendingFocus(data: any): void {
+  const step2 = data?.progressUpdate?.step2Data;
+  const payload = step2?.plannerPayload;
+  if (!step2 || !payload || typeof payload !== "object") return;
+  const focusClaim = String(step2.pendingFocusClaim || "").trim();
+  const outboundText = String(data?.text || "");
+
+  if (focusClaim) {
+    const id = findPointIdByClaim(payload.points || [], focusClaim);
+    if (id) {
+      payload.activePointId = id;
+      payload.focusMode = "deepen";
+      console.log(`[Step2Focus] deepen armed → ${id} (${focusClaim})`);
+    }
+    delete step2.pendingFocusClaim;
+    return;
+  }
+
+  // Non-deepen coach turns (summary / stance / retention / multi-point) clear focus.
+  if (
+    shouldClearStep2DeepenFocus(outboundText) ||
+    payload.focusMode !== "deepen"
+  ) {
+    if (payload.focusMode === "deepen" && shouldClearStep2DeepenFocus(outboundText)) {
+      console.log("[Step2Focus] deepen cleared (coach left single-point ask)");
+    }
+    if (shouldClearStep2DeepenFocus(outboundText)) {
+      payload.focusMode = "none";
+      payload.activePointId = undefined;
+    }
+  }
+}
+
+/**
+ * After normalize: (1) replace stale thin-ask if active point is now ready;
+ * (2) detect coach-proposed new slot → pendingSlotAdd (UI 采纳/拒绝);
+ * (3) never re-loop confirm ask after reject — only seed ask on first propose.
+ */
+function applyStep2FocusAndSlotAddPostProcess(
+  data: any,
+  session: any,
+  userMessage: string,
+  options?: { decision?: { type?: string; action?: string } | null },
+): void {
+  const step2 = data?.progressUpdate?.step2Data;
+  const payload = step2?.plannerPayload;
+  if (!step2 || !payload) return;
+
+  const text = String(data.text || "");
+  const split = splitTwoParts(text, 1);
+  const prevPending = session?.step2?.coachEvaluation?.plannerPayload?.pendingSlotAdd;
+  const hadPending = Boolean(prevPending?.claim);
+  const slotDecision = resolveSlotAddDecision({
+    userMessage,
+    decision: options?.decision,
+    hasPending: hadPending,
+  });
+  const declined = Array.isArray(payload.declinedSlotClaims)
+    ? payload.declinedSlotClaims.map((c: string) => String(c || "").trim())
+    : [];
+
+  const turnIntentKind = String(
+    (step2 as any)?._studentTurnIntent?.kind || "",
+  ).trim();
+  const dispositions =
+    step2.dimensionDispositions || payload.dimensionDispositions;
+  const unwalked = listUnwalkedChecklistPoints(payload, dispositions);
+  const checklistDone = isStep2ChecklistWalkDone(payload, dispositions);
+
+  // Meta / process critique must never leave a slot-add confirm UI.
+  if (
+    turnIntentKind === "meta_process" &&
+    (payload.pendingSlotAdd?.claim ||
+      /加入材料池|新的平行论点/.test(text))
+  ) {
+    payload.pendingSlotAdd = null;
+    step2.userPoints = stripPendingSlotAddMarker(
+      String(step2.userPoints || ""),
+    );
+    if (split.ok) {
+      const ask = buildStep2ContentAwareFallback(session, step2);
+      data.text = `${safeOverridePart1(text)}\n\n---\n\n好的，刚才那句是流程反馈，不算新论点。${ask}`;
+      console.warn(
+        "[Step2SlotAdd] Scrubbed false slot-add after meta_process turn",
+      );
+      return;
+    }
+  }
+
+  // HARD GATE: checklist unfinished → never coach-arm slot-add; walk next slot.
+  // Student accept of an already-pending add is still allowed mid-walk.
+  if (!checklistDone && unwalked.length > 0 && slotDecision !== "accept") {
+    const coachTriedSlotAdd =
+      Boolean(payload.pendingSlotAdd?.claim) ||
+      /加入材料池|新的平行论点|作为一条?新的|新增一条?论点/.test(text);
+    if (coachTriedSlotAdd) {
+      payload.pendingSlotAdd = null;
+      step2.userPoints = stripPendingSlotAddMarker(
+        String(step2.userPoints || ""),
+      );
+      const next = unwalked[0];
+      if (next?.id) {
+        payload.activePointId = next.id;
+        payload.focusMode = "deepen";
+        step2.pendingFocusClaim = next.claim;
+      }
+      if (split.ok || data?.text) {
+        const ask = buildStep2ContentAwareFallback(session, step2);
+        data.text = `${safeOverridePart1(text)}\n\n---\n\n${ask}`;
+      }
+      console.warn(
+        `[Step2SlotAdd] Checklist gate — scrubbed slot-add; next「${next?.claim || ""}」(unwalked=${unwalked.length})`,
+      );
+      return;
+    }
+  }
+
+  // Detect coach proposing a brand-new parallel point (not on locked board).
+  // Only when checklist walk is done (or student already opened a propose path).
+  // Process advance / same-theme near-synonym → no confirm UI.
+  if (
+    payload.slotsLocked &&
+    checklistDone &&
+    !payload.pendingSlotAdd?.claim &&
+    slotDecision !== "reject" &&
+    turnIntentKind !== "meta_process" &&
+    turnIntentKind !== "retention_choice" &&
+    turnIntentKind !== "confirm_ack" &&
+    turnIntentKind !== "reject_slot_add" &&
+    /加入材料池|新的平行论点|作为一条?新的|新增一条?论点/.test(text)
+  ) {
+    const quoted = [
+      ...text.matchAll(/『([^』]{2,40})』/g),
+      ...text.matchAll(/「([^」]{2,40})」/g),
+    ]
+      .map((m) => String(m[1] || "").trim())
+      .filter((c) => c.length >= 2 && !/目前还偏薄|材料池|采纳|拒绝/.test(c));
+    for (const q of quoted) {
+      const qCore = claimMatchCore(q) || q;
+      const wasDeclined = declined.some(
+        (c) =>
+          c === q ||
+          c === qCore ||
+          headsCompatible(c, q) ||
+          headsCompatible(claimMatchCore(c), qCore),
+      );
+      if (wasDeclined) continue;
+
+      const resolved = resolveProposedClaimAgainstBoard(
+        payload.points || [],
+        q,
+        text,
+      );
+      if (resolved.kind === "process_advance") {
+        console.warn(
+          `[Step2SlotAdd] Process-advance 「${qCore}」 — no confirm`,
+        );
+        if (split.ok) {
+          const ask = buildStep2ContentAwareFallback(session, step2);
+          data.text = `${safeOverridePart1(text)}\n\n---\n\n${ask}`;
+        }
+        return;
+      }
+      if (resolved.kind === "same_slot") {
+        payload.activePointId = resolved.point.id;
+        payload.focusMode = "deepen";
+        console.warn(
+          `[Step2SlotAdd] Same-theme 「${qCore}」 → deepen 「${resolved.point.claim}」`,
+        );
+        if (split.ok) {
+          data.text = `${safeOverridePart1(text)}\n\n---\n\n${buildSameSlotDeepenAsk(resolved.point)}`;
+        }
+        return;
+      }
+      // Truly new parallel material → arm confirm
+      payload.pendingSlotAdd = { claim: resolved.claim };
+      const base = stripPendingSlotAddMarker(String(step2.userPoints || ""));
+      step2.userPoints =
+        `${base} ${formatPendingSlotAddMarker(payload.pendingSlotAdd)}`.trim();
+      console.warn(
+        `[Step2SlotAdd] Pending new slot 「${resolved.claim}」 — awaiting 采纳/拒绝`,
+      );
+      break;
+    }
+  }
+
+  // If pending was already set but is process/same-theme, scrub before CTA
+  if (payload.pendingSlotAdd?.claim) {
+    const resolved = resolveProposedClaimAgainstBoard(
+      payload.points || [],
+      payload.pendingSlotAdd.claim,
+      text,
+    );
+    if (resolved.kind === "process_advance") {
+      payload.pendingSlotAdd = null;
+      step2.userPoints = stripPendingSlotAddMarker(
+        String(step2.userPoints || ""),
+      );
+      if (split.ok) {
+        data.text = `${safeOverridePart1(text)}\n\n---\n\n${buildStep2ContentAwareFallback(session, step2)}`;
+      }
+      console.warn("[Step2SlotAdd] Scrubbed process-advance pending");
+      return;
+    }
+    if (resolved.kind === "same_slot") {
+      payload.pendingSlotAdd = null;
+      step2.userPoints = stripPendingSlotAddMarker(
+        String(step2.userPoints || ""),
+      );
+      payload.activePointId = resolved.point.id;
+      payload.focusMode = "deepen";
+      if (split.ok) {
+        data.text = `${safeOverridePart1(text)}\n\n---\n\n${buildSameSlotDeepenAsk(resolved.point)}`;
+      }
+      console.warn(
+        `[Step2SlotAdd] Scrubbed same-theme pending → 「${resolved.point.claim}」`,
+      );
+      return;
+    }
+  }
+
+  if (!split.ok) return;
+  const part1 = split.part1;
+  let part2 = split.part2;
+
+  // Stale thin-ask after activePoint attach made the point ready.
+  const thinAsk = /「([^」]+)」目前还偏薄/.exec(part2 || "");
+  if (thinAsk) {
+    const claim = thinAsk[1].trim();
+    const pt = activePoints(payload).find(
+      (p) =>
+        p.claim === claim ||
+        headsCompatible(p.claim, claim) ||
+        p.claim.includes(claim) ||
+        claim.includes(p.claim),
+    );
+    if (pt && pt.quality === "ready") {
+      part2 = buildStep2ContentAwareFallback(session, step2);
+      data.text = `${part1}\n\n---\n\n${part2}`;
+      console.warn(
+        `[Step2Focus] Cleared stale thin-ask for ready point 「${claim}」`,
+      );
+      return;
+    }
+  }
+
+  // First-time propose only: seed Part2 confirm copy (UI shows 采纳/拒绝).
+  // Do NOT re-force this ask on later turns — reject clears pending and continues.
+  if (
+    payload.pendingSlotAdd?.claim &&
+    !hadPending &&
+    slotDecision !== "accept" &&
+    slotDecision !== "reject"
+  ) {
+    const ask = buildSlotAddConfirmAsk(payload.pendingSlotAdd.claim);
+    data.text = `${safeOverridePart1(text)}\n\n---\n\n${ask}`;
+    console.log(
+      `[Step2SlotAdd] Part2 → decision ask for 「${payload.pendingSlotAdd.claim}」`,
+    );
+  } else if (slotDecision === "reject" && hadPending) {
+    // Ensure coach text doesn't leave a stale "是否加入" as the only CTA.
+    if (/是否加入|加上这条|加入材料池/.test(part2 || text)) {
+      part2 = buildStep2ContentAwareFallback(session, step2);
+      data.text = `${safeOverridePart1(text)}\n\n---\n\n${part2}`;
+      console.log("[Step2SlotAdd] Rejected — cleared confirm loop, next ask");
+    }
+  }
+}
+
+function enforceStep2Momentum(
+  data: any,
+  session: any,
+  opts?: { channelAuthoredText?: boolean },
+): void {
   if (!data?.progressUpdate) return;
   const text = String(data.text || "");
   if (!text.trim()) return;
@@ -7457,28 +8797,57 @@ function enforceStep2Momentum(data: any, session: any): void {
   const missing: string[] = Array.isArray(payload?.coverage?.missingBuckets)
     ? payload.coverage.missingBuckets
     : [];
-  const readyCount = activePoints(payload).filter(
-    (p) => p.quality === "ready",
+  const readyCount = activePoints(payload).filter((p) =>
+    isPointExpandedForWalk(p),
   ).length;
   const exploreDone = isStep2ExploreDone({
     payload,
     step2Data: step2,
     session,
   });
-  // Coverage-first; legacy A/B solid signals only as soft fallback
+  const unwalked = listUnwalkedChecklistPoints(
+    payload,
+    step2.dimensionDispositions || payload?.dimensionDispositions,
+  );
+  // Coverage-first; legacy A/B solid signals only as soft fallback.
+  // When any seedOnly sprouts remain, ignore text-length solid (Step1 seeds
+  // inflate userPoints without a Step2 expand).
+  const hasSeedOnlySprouts = activePoints(payload).some(
+    (p) => p.seedOnly === true,
+  );
+  const aExpanded = activePoints(payload).some(
+    (p) =>
+      isPointExpandedForWalk(p) &&
+      /part_1|view_a|advantage|cause|positive|support_main/.test(
+        pointSideKey(p),
+      ),
+  );
+  const bExpanded = activePoints(payload).some(
+    (p) =>
+      isPointExpandedForWalk(p) &&
+      /part_2|view_b|disadvantage|solution|negative|oppose_or_qualify/.test(
+        pointSideKey(p),
+      ),
+  );
   const aSolid =
-    readyCount >= 1 || sideHasSolidExploreContent(userPoints, "A");
+    aExpanded ||
+    (!hasSeedOnlySprouts &&
+      (readyCount >= 1 || sideHasSolidExploreContent(userPoints, "A")));
   const bSolid =
     missing.length === 0
       ? true
-      : sideHasSolidExploreContent(userPoints, "B");
+      : bExpanded ||
+        (!hasSeedOnlySprouts && sideHasSolidExploreContent(userPoints, "B"));
 
   const afterExploreStage = () =>
     exploreDone
       ? requiresStance
         ? "stance"
         : "summary"
-      : missing.length > 0
+      : missing.length > 0 ||
+          unwalked.some((u) =>
+            /part_2|view_b|disadvantage|solution|negative/.test(u.sideKey),
+          )
         ? "explore_B"
         : "explore_A";
 
@@ -7489,7 +8858,11 @@ function enforceStep2Momentum(data: any, session: any): void {
     textSuggestsExploreSideAdvance(text, oldStage)
   ) {
     if (oldStage === "explore_A") {
-      stage = missing.length > 0 ? "explore_B" : afterExploreStage();
+      stage = afterExploreStage() === "stance" || afterExploreStage() === "summary"
+        ? afterExploreStage()
+        : missing.length > 0
+          ? "explore_B"
+          : afterExploreStage();
     } else {
       stage = afterExploreStage();
     }
@@ -7499,52 +8872,105 @@ function enforceStep2Momentum(data: any, session: any): void {
     );
   }
 
-  // Coverage-aware advance — stance only after exploreDone
-  if (stage === "explore_A" && aSolid) {
-    stage = missing.length > 0 ? "explore_B" : afterExploreStage();
-    step2.currentStage = stage;
-    console.warn(
-      `[Step2Momentum] explore_A solid → stage=${stage} (exploreDone=${exploreDone}, missing=${missing.join(",") || "none"})`,
-    );
-  } else if (stage === "explore_B" && missing.length === 0) {
+  // Checklist-aware advance — stance only after exploreDone (not bucket fill alone)
+  if (stage === "explore_A" && aSolid && !exploreDone) {
+    const next = afterExploreStage();
+    if (next === "explore_B") {
+      stage = "explore_B";
+      step2.currentStage = stage;
+      console.warn(
+        `[Step2Momentum] explore_A solid → stage=${stage} (exploreDone=${exploreDone}, unwalked=${unwalked.length})`,
+      );
+    }
+  } else if (
+    (stage === "explore_A" || stage === "explore_B") &&
+    exploreDone
+  ) {
     stage = afterExploreStage();
     step2.currentStage = stage;
     console.warn(
-      `[Step2Momentum] explore_B buckets filled → stage=${stage} (exploreDone=${exploreDone})`,
+      `[Step2Momentum] checklist done → stage=${stage}`,
     );
-  } else if (stage === "explore_B" && bSolid && aSolid && missing.length === 0) {
+  } else if (stage === "explore_B" && bSolid && aSolid && exploreDone) {
     stage = afterExploreStage();
     step2.currentStage = stage;
+  } else if (
+    (stage === "stance" || stage === "summary") &&
+    !exploreDone
+  ) {
+    stage = afterExploreStage();
+    if (stage === "stance" || stage === "summary") stage = "explore_B";
+    step2.currentStage = stage;
+    console.warn(
+      `[Step2Momentum] Clamped premature stance → ${stage} (unwalked=${unwalked.length})`,
+    );
   }
 
   if (stage === "summary") return;
+
+  // Text authored by the proposal channel this turn (accept ack + recap +
+  // next ask) is final — stage repairs above still ran, but momentum must
+  // not rewrite it (it was eating the server recap of committed roles).
+  if (opts?.channelAuthoredText) return;
 
   const split = splitTwoParts(text, 2);
   if (!split.ok) return;
   if (looksLikeQuestionEnding(split.part2)) return;
 
   let fallbackStage = stage;
-  if (fallbackStage === "explore_B" && missing.length === 0) {
-    fallbackStage = afterExploreStage();
-    if (fallbackStage === "summary") return;
-    step2.currentStage = fallbackStage;
+  if (fallbackStage === "explore_A" && aSolid && !exploreDone) {
+    const next = afterExploreStage();
+    if (next === "explore_B") {
+      fallbackStage = "explore_B";
+      step2.currentStage = fallbackStage;
+    }
   }
-  if (fallbackStage === "explore_A" && aSolid) {
-    fallbackStage = missing.length > 0 ? "explore_B" : afterExploreStage();
+  if (
+    (fallbackStage === "explore_A" || fallbackStage === "explore_B") &&
+    exploreDone
+  ) {
+    fallbackStage = afterExploreStage();
     if (fallbackStage === "summary") return;
     step2.currentStage = fallbackStage;
   }
 
   const fallback = buildStep2ContentAwareFallback(session, step2);
+  // Keep genuine Part1; never replace with the dead "记下了" phrase.
+  const keepP1 =
+    String(split.part1 || "").trim() || safeOverridePart1(text) || "好的。";
   const stanceRecommendationAlreadyPresent =
     fallbackStage === "stance" &&
-    /(我更推荐|我建议|推荐你|建议采用|更适合采用|最容易自洽)/.test(text);
+    /(我更推荐|我建议|推荐你|建议采用|更适合采用|最容易自洽|带让步的立场)/.test(
+      text,
+    );
   data.text = stanceRecommendationAlreadyPresent
-    ? `${split.part1}\n\n---\n\n${split.part2.trim()}\n\n这个推荐方向符合你的本意吗？你可以直接确认，也可以告诉我你想调整成哪种立场。`
-    : `${split.part1}\n\n---\n\n${fallback}`;
+    ? `${keepP1}\n\n---\n\n上面是基于你材料的立场推荐。请点击「采纳」锁定，或「拒绝」后告诉我你想改成哪种立场。`
+    : `${keepP1}\n\n---\n\n${fallback}`;
   console.warn(
-    `[Step2Momentum] Response ended without a question or CTA; appended content-aware prompt for resolved stage=${fallbackStage} (previous=${oldStage}, ready=${readyCount}, missing=${missing.join(",") || "none"}).`,
+    `[Step2Momentum] Response ended without a question or CTA; appended content-aware prompt for resolved stage=${fallbackStage} (previous=${oldStage}, ready=${readyCount}, unwalked=${unwalked.length}).`,
   );
+  scrubStep2StaleDecisionPendingOnContentAsk(data);
+}
+
+/**
+ * When the visible coach ask is content/deepen (补薄等), clear stale
+ * ［待裁决］ so UI does not keep showing 采纳/拒绝 on a non-decision turn.
+ */
+function scrubStep2StaleDecisionPendingOnContentAsk(data: any): void {
+  const text = String(data?.text || "");
+  if (!coachMessageIsContentAskNotDecision(text)) return;
+  const step2 = data?.progressUpdate?.step2Data;
+  if (!step2 || typeof step2 !== "object") return;
+  const prevPoints = String(step2.userPoints || "");
+  if (PENDING_RETENTION_MARKER_RE.test(prevPoints)) {
+    step2.userPoints = prevPoints
+      .replace(PENDING_RETENTION_MARKER_RE, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    console.warn(
+      "[Step2DecisionUI] Cleared stale ［待裁决］ — current ask is content, not a proposal",
+    );
+  }
 }
 
 function resolveStep2CurrentStage(data: any, session?: any): string {
@@ -7593,8 +9019,8 @@ function isStep2BlueprintContentComplete(
     const stanceFromPayload = String(payload.stance?.text || "").trim();
     if (stanceFromPayload || !payload.requiresStance) return true;
   }
-  const readyCount = activePoints(payload).filter(
-    (p) => p.quality === "ready",
+  const readyCount = activePoints(payload).filter((p) =>
+    isPointExpandedForWalk(p),
   ).length;
   if (readyCount >= 2) {
     const stance = String(
@@ -7645,19 +9071,50 @@ function enforceStep2Completion(data: any, session: any): void {
     data.progressUpdate,
     session,
   );
+  const step2 = data.progressUpdate.step2Data || {};
+  const payload = step2.plannerPayload || {};
+  const checklistDone = isStep2ChecklistWalkDone(
+    payload,
+    step2.dimensionDispositions || payload.dimensionDispositions,
+  );
+  // Stance counts only when it went through a confirmed channel（采纳 button
+  // or student's own text → stanceConfirmResolved）. A model-prefilled
+  // userStance/stance.text must never unlock the next step by itself.
+  const stanceOk =
+    step2.requiresStance === false ||
+    payload.requiresStance === false ||
+    Boolean(payload.stanceConfirmResolved) ||
+    Boolean(step2.stanceConfirmResolved);
+  const materialReady = checklistDone && stanceOk;
   const driftedToStep3 =
     !!data.progressUpdate.paragraphPlan ||
     (Array.isArray(data.progressUpdate.step3SubpointSteps) &&
       data.progressUpdate.step3SubpointSteps.length > 0);
 
-  if (stage === "summary" && ctaOk) {
+  // Material+stance locked + user/coach advancing → complete even if blueprint thin
+  if (
+    materialReady &&
+    (stage === "summary" || stage === "stance") &&
+    (ctaOk ||
+      /进入下一步|进入第三步|立即跳转|没有要改/.test(String(data.text || "")))
+  ) {
+    data.progressUpdate.isCompleted = true;
+    step2.currentStage = "summary";
+    payload.pendingStanceConfirm = null;
+    console.warn(
+      "[Step2CompletionGuard] Material-ready unlock → completed summary",
+    );
+    return;
+  }
+
+  if (stage === "summary" && ctaOk && materialReady) {
     data.progressUpdate.isCompleted = true;
     return;
   }
 
   // Content-gate fallback: completion CTA + real blueprint already present, but
   // currentStage still stuck at explore/stance (classic text/field desync).
-  if (ctaOk && contentOk) {
+  if (ctaOk && contentOk && materialReady) {
     data.progressUpdate.isCompleted = true;
     if (
       !data.progressUpdate.step2Data ||
@@ -7673,17 +9130,29 @@ function enforceStep2Completion(data: any, session: any): void {
   }
 
   // Anti-drift: model leaked Step 3 fields into a Step 2 response — keep complete.
-  if (driftedToStep3) {
+  if (driftedToStep3 && materialReady) {
     data.progressUpdate.isCompleted = true;
     return;
   }
 
-  if (data.progressUpdate.isCompleted) {
+  if (data.progressUpdate.isCompleted && !materialReady) {
+    data.progressUpdate.isCompleted = false;
+    console.warn(
+      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, checklistDone=${checklistDone}, stanceOk=${stanceOk})`,
+    );
+  } else if (data.progressUpdate.isCompleted && !ctaOk && !materialReady) {
     data.progressUpdate.isCompleted = false;
     console.warn(
       `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, ctaOk=${ctaOk}, contentOk=${contentOk})`,
     );
   }
+}
+
+function ensureStep1DataBucket(data: any, merged: Record<string, any>): any {
+  if (!data.progressUpdate.step1Data || typeof data.progressUpdate.step1Data !== "object") {
+    data.progressUpdate.step1Data = { ...merged };
+  }
+  return data.progressUpdate.step1Data;
 }
 
 function enforceStep1SlotCompletion(
@@ -7696,38 +9165,160 @@ function enforceStep1SlotCompletion(
   sanitizeStep1ConstraintMarkers(data.progressUpdate);
 
   const merged = mergeStep1Evaluation(data.progressUpdate, session);
+  let dims = Array.isArray(merged.suggestedDimensions)
+    ? [...merged.suggestedDimensions]
+    : [];
+
+  // Confirmed probe stamps: prior session tags win over model rewrite.
+  const priorDims =
+    session?.step1?.coachEvaluation?.suggestedDimensions ||
+    session?.step1?.boardOverrides?.suggestedDimensions ||
+    [];
+  const priorDimsList = Array.isArray(priorDims) ? priorDims.map(String) : [];
+  const preserved = preserveStep1ProbeTags(dims.map(String), priorDimsList);
+  if (
+    preserved.restoredCores.length > 0 ||
+    preserved.reappendedCores.length > 0
+  ) {
+    dims = preserved.dims;
+    const target = ensureStep1DataBucket(data, merged);
+    target.suggestedDimensions = dims;
+    if (preserved.restoredCores.length > 0) {
+      console.warn(
+        `[Step1Guard] Restored probe tags for: ${preserved.restoredCores.join("、")}`,
+      );
+    }
+    if (preserved.reappendedCores.length > 0) {
+      console.warn(
+        `[Step1Guard] Re-appended probed dims dropped by model: ${preserved.reappendedCores.join("、")}`,
+      );
+    }
+  }
+
+  // Phase A-1: strip same-turn self-reported probe/expandable tags on NEW labels.
+  const stripped = stripIllegalSameTurnProbeTags(
+    dims.map(String),
+    priorDimsList,
+  );
+  if (stripped.strippedCores.length > 0) {
+    dims = stripped.dims;
+    const target = ensureStep1DataBucket(data, merged);
+    target.suggestedDimensions = dims;
+    console.warn(
+      `[Step1Guard] Stripped same-turn probe tags on new dims: ${stripped.strippedCores.join("、")}`,
+    );
+  }
+
+  // B-lite: resolve last turn's server-forced probe via probeVerdict (server stamps).
+  const pendingProbeCore = String(
+    session?.step1?.coachEvaluation?.pendingProbeCore ||
+      merged.pendingProbeCore ||
+      "",
+  ).trim();
+  if (pendingProbeCore && String(userMessage || "").trim()) {
+    const verdict =
+      data.progressUpdate?.step1Data?.probeVerdict ?? merged.probeVerdict;
+    dims = resolvePendingProbeAnswer(
+      dims.map(String),
+      pendingProbeCore,
+      verdict,
+    );
+    const target = ensureStep1DataBucket(data, merged);
+    target.suggestedDimensions = dims;
+    target.pendingProbeCore = "";
+    target.probeVerdict = "";
+    console.warn(
+      `[Step1Guard] Resolved pending probe for「${pendingProbeCore}」verdict=${String(verdict || "thin/default")}`,
+    );
+  }
+
+  // Escape: ONLY student exhausted → stamp remaining bare as 质量待确认.
+  // Cap alone must NOT stamp (that aborted live probes when label count hit 6).
+  const dimLabelCount = countStep1DimensionLabels(dims);
+  const exhausted = studentSignalsExhausted(userMessage);
+  if (exhausted) {
+    const before = countUnprobedStep1Dimensions(dims);
+    if (before > 0) {
+      dims = stampUnprobedQualityPending(dims.map(String));
+      const target = ensureStep1DataBucket(data, merged);
+      target.suggestedDimensions = dims;
+      target.pendingProbeCore = "";
+      console.warn(
+        `[Step1Guard] Escape hatch: stamped ${before} unprobed dim(s) as 质量待确认 (student exhausted)`,
+      );
+    }
+  }
+
   const step1New =
     data.progressUpdate.step1Data &&
     typeof data.progressUpdate.step1Data === "object"
       ? data.progressUpdate.step1Data
       : null;
-  const dims = Array.isArray(merged.suggestedDimensions)
-    ? [...merged.suggestedDimensions]
-    : [];
+  // Keep merged view in sync for downstream counts.
+  merged.suggestedDimensions = dims;
+  if (step1New) step1New.suggestedDimensions = dims;
+
   const effectiveCount = countEffectiveStep1Dimensions(dims);
-  const dimsSufficient = computeStep1DimensionsSufficient(merged);
+  const dimsSufficient = computeStep1DimensionsSufficient({
+    ...merged,
+    suggestedDimensions: dims,
+  });
   if (step1New) {
     step1New.dimensionsSufficient = dimsSufficient;
   }
   const slotsOk = isStep1SlotsComplete({
     ...merged,
+    suggestedDimensions: dims,
     dimensionsSufficient: dimsSufficient,
   });
   const text = String(data.text || "");
   const softExitAsk = textOffersStep1Exit(text);
   const ctaOk = textSuggestsStep1Complete(text);
+  const unprobed = earliestUnprobedDimension(dims.map(String));
 
   // Soft exit round must never unlock the jump button.
   if (softExitAsk && !ctaOk) {
     data.progressUpdate.isCompleted = false;
   }
 
-  // Only stamp exitOffered when AI/server already judges dimensions sufficient.
-  if (dimsSufficient && (softExitAsk || step1DimsHaveExitOfferedTag(dims))) {
-    if (!step1New) {
-      data.progressUpdate.step1Data = { ...merged };
+  // v2 probe-first: any bare label → Part2 must probe the earliest one
+  // (blocks Task-B jump, soft exit, CTA, and model merge-probes).
+  if (unprobed) {
+    data.progressUpdate.isCompleted = false;
+    const target = ensureStep1DataBucket(data, merged);
+    target.suggestedDimensions = dims;
+    target.exitOffered = false;
+    // Do not claim sufficiency while bare labels remain.
+    if (!step1CapProbeComplete(dims.map(String), STEP1_DIM_MAX)) {
+      target.dimensionsSufficient = false;
     }
-    const target = data.progressUpdate.step1Data;
+    target.pendingProbeCore = stripStep1DimensionTags(unprobed);
+    const alreadyProbing = textLooksLikeProbeAskForDim(text, unprobed);
+    if (!alreadyProbing) {
+      const split = splitTwoParts(text, 1);
+      const part1 = safeOverridePart1(
+        split.part1 || "这个角度我先记下了。",
+      );
+      data.text = `${part1}\n\n---\n\n${buildBareDimensionProbeAsk(unprobed)}`;
+      console.warn(
+        `[Step1Guard] Probe-first: rewrote Part2 to probe「${target.pendingProbeCore}」(labels=${dimLabelCount}, unprobed=${countUnprobedStep1Dimensions(dims)})`,
+      );
+    } else {
+      console.warn(
+        `[Step1Guard] Probe-first: armed pendingProbeCore「${target.pendingProbeCore}」(model ask kept)`,
+      );
+    }
+    return;
+  }
+
+  // Only stamp exitOffered when AI/server already judges dimensions sufficient
+  // AND no unprobed bare labels remain.
+  if (
+    dimsSufficient &&
+    !unprobed &&
+    (softExitAsk || step1DimsHaveExitOfferedTag(dims))
+  ) {
+    const target = ensureStep1DataBucket(data, merged);
     target.dimensionsSufficient = true;
     ensureStep1ExitOfferedFlag(target, Array.isArray(target.suggestedDimensions)
       ? target.suggestedDimensions
@@ -7735,11 +9326,9 @@ function enforceStep1SlotCompletion(
   } else if (!dimsSufficient && softExitAsk) {
     // Model asked "enough?" too early — rewrite to keep collecting.
     data.progressUpdate.isCompleted = false;
-    if (!data.progressUpdate.step1Data) {
-      data.progressUpdate.step1Data = { ...merged };
-    }
-    data.progressUpdate.step1Data.dimensionsSufficient = false;
-    data.progressUpdate.step1Data.exitOffered = false;
+    const target = ensureStep1DataBucket(data, merged);
+    target.dimensionsSufficient = false;
+    target.exitOffered = false;
     const split = splitTwoParts(text, 1);
     const part1 = safeOverridePart1(
       split.part1 || "目前可展开的角度还偏少。",
@@ -7762,24 +9351,23 @@ function enforceStep1SlotCompletion(
   // (probe/exit must happen before CTA).
   if ((ctaOk || data.progressUpdate.isCompleted) && newDimSameTurn) {
     data.progressUpdate.isCompleted = false;
-    if (!data.progressUpdate.step1Data) {
-      data.progressUpdate.step1Data = { ...mergedAfter };
-    }
+    const target = ensureStep1DataBucket(data, mergedAfter);
+    const bare =
+      earliestUnprobedDimension(
+        Array.isArray(target.suggestedDimensions)
+          ? target.suggestedDimensions.map(String)
+          : dims.map(String),
+      ) || unprobed;
     const split = splitTwoParts(text, 1);
     const part1 = safeOverridePart1(
       split.part1 || "这个角度我先记下了。",
     );
-    let ask =
-      "这个角度你脑子里已经有具体场景或例子的苗头了吗？有的话简单说一句信号即可；还没有的话我们再换一个角度。";
-    if (dimsSufficient) {
-      ask =
-        "这个角度你脑子里已经有具体场景或例子的苗头了吗？如果还有别的分析角度也可以继续说；如果暂时想不到别的，告诉我就可以进入下一步了。";
-      ensureStep1ExitOfferedFlag(
-        data.progressUpdate.step1Data,
-        Array.isArray(data.progressUpdate.step1Data.suggestedDimensions)
-          ? data.progressUpdate.step1Data.suggestedDimensions
-          : dims,
-      );
+    const ask = bare
+      ? buildBareDimensionProbeAsk(bare)
+      : "这个角度你脑子里已经有具体场景或例子的苗头了吗？有的话简单说一句信号即可；还没有的话我们再换一个角度。";
+    if (bare) {
+      target.pendingProbeCore = stripStep1DimensionTags(bare);
+      target.exitOffered = false;
     }
     data.text = `${part1}\n\n---\n\n${ask}`;
     console.warn(
@@ -8147,10 +9735,11 @@ async function generateContentWithFallback(params: {
 // progressUpdate.step2Data.userPoints (the only Layer-1 field available in real
 // time during explore_A/explore_B) using a "［待裁决：...］" marker.
 //
-// Product rule (ask-then-expand): when two siblings exist and one is already solid,
-// do NOT silently assign 详写/略写. Ask the student which point to detail-write;
-// vague replies fall back to the heuristic default. Only then expand the chosen
-// detail point (or briefly fill an empty minor).
+// Product rule (recommend → confirm → tag):
+// Coach may recommend a 详写/略写 scheme, but MUST NOT lock tags until the student
+// explicitly confirms (「同意」「就这样」「①详写、②③略写」…). Bounce-backs like
+// 「你觉得呢」/「你定」are NOT confirmation — restate the proposal and ask to confirm.
+// Merge-into-one-body is Planner's job; Step2 only tags each board slot.
 
 // Marker format (new): ［待裁决：详=<developed>｜略=<uncovered>｜默认=<recommendation>］
 // Legacy format still parsed: ［待裁决：<uncovered>｜<recommendation>］
@@ -8168,8 +9757,17 @@ type PendingRetention = {
 function parseRetentionRecommendation(
   raw: string | undefined,
 ): RetentionRecommendation | null {
-  if (raw === "KEEP_MINOR" || raw === "DROP" || raw === "EXPAND_BOTH") return raw;
+  const t = String(raw || "").trim();
+  if (t === "KEEP_MINOR" || t === "DROP" || t === "EXPAND_BOTH") return t;
+  // Legacy side-walk markers: 默认=SIDE:part_1 → treat as KEEP_MINOR (详+略 scheme).
+  // Parsing as null used to fall through to EXPAND_BOTH and「采纳」never locked roles.
+  if (/^SIDE:/i.test(t)) return "KEEP_MINOR";
   return null;
+}
+
+function isNoBriefUncoveredLabel(uncovered: string): boolean {
+  const t = String(uncovered || "").trim();
+  return !t || t === "（无）" || t === "(无)" || t === "无";
 }
 
 function extractPendingRetention(userPointsText: string): PendingRetention | null {
@@ -8205,39 +9803,190 @@ function isThinRetentionLabel(point: string): boolean {
   return core.length < 12;
 }
 
-// Pure, testable decision table: heuristic DEFAULT only (used when the student
- // replies vaguely with "好的"/"你定"). The student is asked to choose 详写/略写
- // first; this table is the fallback, not the forced assignment.
+// Soft DEFAULT for retention. Checklist product rule: walk every sibling with
+// writable content first; do NOT default to 一详一略 (KEEP_MINOR).
+// KEEP_MINOR remains only for explicit student schemes / legacy pending markers.
 function decideStep2Retention(
   developedIsSolid: boolean,
   uncoveredRelevantToQuestion: boolean,
 ): { recommendation: RetentionRecommendation; reasonZh: string } {
+  // Uncovered sibling that still matters → expand it first, then 详略 by content.
+  if (uncoveredRelevantToQuestion) {
+    return {
+      recommendation: "EXPAND_BOTH",
+      reasonZh: developedIsSolid
+        ? "同侧还有未展开论点，先补可写内容再按各条内容量定详略（不默认一详一略）"
+        : "已展开的点还不够具体，未展开的兄弟维度也需要先补内容",
+    };
+  }
   if (!developedIsSolid) {
     return {
       recommendation: "EXPAND_BOTH",
       reasonZh: "已展开的点还不够具体，两个维度都需要先补充内容",
     };
   }
-  if (uncoveredRelevantToQuestion) {
-    return {
-      recommendation: "KEEP_MINOR",
-      reasonZh: "默认建议：已展开的点作详写，另一点作略写补充",
-    };
-  }
+  // Uncovered not relevant → suggest drop, never silent omit
   return {
     recommendation: "DROP",
-    reasonZh: "默认建议：专注详写已展开的点，另一点可先放下",
+    reasonZh: "另一点与题目关联较弱，建议先专注已展开的点；也可明确说要保留略写",
   };
 }
 
 type RetentionChoiceResult = {
+  /** false = do not write tags; ask student to confirm the proposal first */
+  applied: boolean;
   developedTag: string;
   uncoveredTag: string;
   needExpandDetail: string | null;
   expandMode: "detail" | "minor_brief" | null;
   allowTransition: boolean;
   summaryZh: string;
+  proposalAsk?: string;
 };
+
+/** Student bounces the choice back to the coach — NOT a confirmation. */
+function isRetentionDeferToCoach(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (!t) return false;
+  if (
+    /^(你觉得呢?|你定|你来定|老师定|你看着办|随便你|听你的|你决定)[。.!！？?\s]*$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return /你觉得呢|你来定一下|你帮我定|你定吧|老师定吧/.test(t);
+}
+
+/**
+ * Soft ack while a ［待裁决］ confirm-ask is pending → accept the soft default.
+ * 「你定/你觉得呢」still do NOT count (see isRetentionDeferToCoach).
+ */
+function isRetentionSoftAckConfirm(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (!t || isRetentionDeferToCoach(t)) return false;
+  return /^(好的?|好|可以|行|嗯+|哦|噢|ok|okay|yes|采纳)[。.!！？?\s]*$/i.test(t);
+}
+
+/** Explicit accept of a recommended 详写/略写 scheme (同意 / 就这样 / …). */
+function isRetentionExplicitConfirm(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (!t || isRetentionDeferToCoach(t)) return false;
+  if (isRetentionSoftAckConfirm(t)) return false;
+  return (
+    /就这样|就按这个|按这个方案|按你说的|按老师说的|按你推荐|就按你的|同意这个|确认方案|没问题就这样/i.test(
+      t,
+    ) ||
+    (/^(同意|确认)[。.!！？?\s]*$/i.test(t) )
+  );
+}
+
+/** Pending confirm-ask: explicit OR soft ack both lock the recommended scheme. */
+function isRetentionPendingConfirm(msg: string): boolean {
+  return isRetentionExplicitConfirm(msg) || isRetentionSoftAckConfirm(msg);
+}
+
+function buildRetentionProposalAsk(
+  developed: string,
+  uncovered: string,
+  rec: RetentionRecommendation | null,
+): string {
+  const dShort = shortRetentionLabel(developed) || "已展开的这一点";
+  const uParts = splitRetentionLabels(uncovered);
+  const uShort =
+    uParts.map((p) => shortRetentionLabel(p)).filter(Boolean).join("、") ||
+    shortRetentionLabel(uncovered) ||
+    "其余点";
+  if (rec === "EXPAND_BOTH") {
+    // Content walk — NOT a 采纳/拒绝 详略 lock
+    return (
+      `『${uShort}』这一条还没展开到可写程度。请先补 1–2 句具体场景、机制或受影响对象；` +
+      `补完后再按各条可写量分别定详写/略写（可以都详写，也可以一详一略——由内容量决定，不默认一详一略）。`
+    );
+  }
+  if (rec === "DROP") {
+    return `我建议详写『${dShort}』，『${uShort}』先放下不写。请点击下方「采纳」或「拒绝」（仅「采纳」会锁定；也可直接说出你的选择）。`;
+  }
+  // KEEP_MINOR: only when student/coach explicitly proposed a 详/略 scheme
+  return `我建议：**详写**『${dShort}』，**略写**『${uShort}』（略写只表示详略标记，仍各占一条论点）。请点击下方「采纳」或「拒绝」（仅「采纳」会锁定方案；其它回复视为先不锁定）。`;
+}
+
+/** Reject the whole 详写/略写 proposal (UI 拒绝 or explicit decline). */
+function isRetentionProposalReject(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (!t) return false;
+  if (isRetentionPendingConfirm(t)) return false;
+  return (
+    /^(拒绝|不采纳|不同意|不用|不要|算了)[。.!！？?\s]*$/i.test(t) ||
+    /不按这个方案|不同意这个方案|不要这个方案|换个方案|先不定/i.test(t)
+  );
+}
+
+function splitRetentionLabels(label: string): string[] {
+  return String(label || "")
+    .split(/[、，,｜|/]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+}
+
+function stripRetentionDecisionTags(userPoints: string): string {
+  return String(userPoints || "")
+    .replace(/（\s*已选详写[^）]*）/g, "")
+    .replace(/（\s*已选略写[^）]*）/g, "")
+    .replace(/（\s*保留-略写\s*）/g, "")
+    .replace(/（\s*用户放弃\s*）/g, "")
+    .replace(/（\s*待展开详写\s*）/g, "")
+    .replace(/（\s*已展开，作为主论点\s*）/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function userPointsGainedRetentionTags(prev: string, next: string): boolean {
+  const prevHas = /已选详写|已选略写|用户放弃/.test(String(prev || ""));
+  const nextHas = /已选详写|已选略写|用户放弃/.test(String(next || ""));
+  return !prevHas && nextHas;
+}
+
+function formatPendingRetentionMarker(pending: PendingRetention): string {
+  return `［待裁决：详=${pending.developed}｜略=${pending.uncovered}｜默认=${pending.recommendation || "EXPAND_BOTH"}］`;
+}
+
+/** Clear 详写/略写 pick in the message itself (not bounce-back). */
+function messageIsClearRetentionChoice(msg: string): boolean {
+  const t = String(msg || "").trim();
+  if (!t || isRetentionDeferToCoach(t)) return false;
+  if (isRetentionPendingConfirm(t)) return true;
+  if (/都写|都要|都展开|两个都|全都|都详|都补充|都详细/i.test(t)) return true;
+  if (
+    /放弃|不要|不用|算了|只写一个/i.test(t) &&
+    !/都写|都要|都展开/i.test(t)
+  ) {
+    return true;
+  }
+  if (/详写/.test(t) && /略写|不写|放弃/.test(t)) return true;
+  if (/[①②③④⑤⑥]|第\s*[1-6一二三四五六]/.test(t) && /详写|略写/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function extractRetentionTaggedLabels(userPoints: string): {
+  detail: string[];
+  brief: string[];
+} {
+  const detail: string[] = [];
+  const brief: string[] = [];
+  const text = String(userPoints || "").replace(PENDING_RETENTION_MARKER_RE, "");
+  for (const chunk of text.split(/[；;]/)) {
+    const c = chunk.trim();
+    if (!c) continue;
+    const label = shortRetentionLabel(c);
+    if (label.length < 2) continue;
+    if (/已选详写/.test(c)) detail.push(label);
+    else if (/已选略写|用户放弃|保留-略写/.test(c)) brief.push(label);
+  }
+  return { detail, brief };
+}
 
 function resolveRetentionUserChoice(params: {
   userMessage: string;
@@ -8250,11 +9999,28 @@ function resolveRetentionUserChoice(params: {
   const uncovered = params.uncovered;
   const dShort = shortRetentionLabel(developed);
   const uShort = shortRetentionLabel(uncovered);
+  const rec = params.defaultRec || "EXPAND_BOTH";
+  const awaiting = (summaryZh: string): RetentionChoiceResult => ({
+    applied: false,
+    developedTag: "",
+    uncoveredTag: "",
+    needExpandDetail: null,
+    expandMode: null,
+    allowTransition: false,
+    summaryZh,
+    proposalAsk: buildRetentionProposalAsk(developed, uncovered, rec),
+  });
 
-  const wantsBoth = /都写|都要|都展开|两个都|全都|都详|都补充/i.test(t);
+  if (isRetentionDeferToCoach(t)) {
+    return awaiting("等确认：学生把选择交回老师");
+  }
+
+  const wantsBoth = /都写|都要|都展开|两个都|全都|都详|都补充|都详细/i.test(t);
   const wantsDropUncovered =
     /放弃|不要|不用|算了|只写一个/i.test(t) &&
-    !/都写|都要|都展开/i.test(t);
+    !/都写|都要|都展开/i.test(t) &&
+    // Bare「不用/不要」= reject the proposal (UI path), not "drop uncovered point"
+    !/^(不用|不要|算了)[。.!！？?\s]*$/i.test(t);
   const picksDeveloped =
     (dShort.length >= 2 &&
       (t.includes(dShort.slice(0, Math.min(4, dShort.length))) ||
@@ -8269,18 +10035,27 @@ function resolveRetentionUserChoice(params: {
     /第二个|第\s*2\s*个|详写第二个/i.test(t);
 
   if (wantsBoth) {
+    const uncoveredThin = isThinRetentionLabel(uncovered);
+    const developedThin = isThinRetentionLabel(developed);
+    const needExpand = developedThin
+      ? developed
+      : uncoveredThin
+        ? uncovered
+        : null;
     return {
-      developedTag: "已展开，作为主论点",
-      uncoveredTag: "待展开详写",
-      needExpandDetail: uncovered,
-      expandMode: "detail",
-      allowTransition: false,
-      summaryZh: "都展开",
+      applied: true,
+      developedTag: "已选详写",
+      uncoveredTag: "已选详写",
+      needExpandDetail: needExpand,
+      expandMode: needExpand ? "detail" : null,
+      allowTransition: !needExpand,
+      summaryZh: "都详写",
     };
   }
 
   if (picksUncovered) {
     return {
+      applied: true,
       developedTag: "已选略写",
       uncoveredTag: "已选详写",
       needExpandDetail: uncovered,
@@ -8290,12 +10065,24 @@ function resolveRetentionUserChoice(params: {
     };
   }
 
-  if (picksDeveloped) {
-    const minorThin = isThinRetentionLabel(uncovered);
+  // 「①详写，②③略写」counts as an explicit scheme (same as picking developed=详写).
+  const numberedDetailBriefScheme =
+    /详写/.test(t) &&
+    /略写|不写|放弃/.test(t) &&
+    (/[①②③④⑤⑥]/.test(t) || /第\s*[1-6一二三四五六]/.test(t));
+
+  if (picksDeveloped || numberedDetailBriefScheme) {
+    const minorThin = splitRetentionLabels(uncovered).some((p) =>
+      isThinRetentionLabel(p),
+    );
     return {
+      applied: true,
       developedTag: "已选详写",
       uncoveredTag: minorThin ? "已选略写（待补一句）" : "已选略写",
-      needExpandDetail: minorThin ? uncovered : null,
+      needExpandDetail: minorThin
+        ? splitRetentionLabels(uncovered).find((p) => isThinRetentionLabel(p)) ||
+          uncovered
+        : null,
       expandMode: minorThin ? "minor_brief" : null,
       allowTransition: !minorThin,
       summaryZh: `详写『${dShort}』、略写『${uShort}』`,
@@ -8304,6 +10091,7 @@ function resolveRetentionUserChoice(params: {
 
   if (wantsDropUncovered) {
     return {
+      applied: true,
       developedTag: "已选详写",
       uncoveredTag: "用户放弃",
       needExpandDetail: null,
@@ -8313,37 +10101,64 @@ function resolveRetentionUserChoice(params: {
     };
   }
 
-  // Vague agreement ("好的"/"你定"/…) → heuristic default.
-  const rec = params.defaultRec || "KEEP_MINOR";
-  if (rec === "EXPAND_BOTH") {
+  // Confirm the coach proposal (同意 / 就这样 / 好 / 可以 …) → apply soft default.
+  // Only reached while ［待裁决］ is pending; 「你定/你觉得呢」still await.
+  if (isRetentionPendingConfirm(t)) {
+    if (rec === "EXPAND_BOTH") {
+      // Not a 详略 lock — treat as "continue walking the uncovered point"
+      return {
+        applied: false,
+        developedTag: "",
+        uncoveredTag: "",
+        needExpandDetail: uncovered,
+        expandMode: "detail",
+        allowTransition: false,
+        summaryZh: "继续补未展开点的可写内容（不定详略）",
+        proposalAsk: buildRetentionProposalAsk(developed, uncovered, "EXPAND_BOTH"),
+      };
+    }
+    if (rec === "DROP") {
+      return {
+        applied: true,
+        developedTag: "已选详写",
+        uncoveredTag: "用户放弃",
+        needExpandDetail: null,
+        expandMode: null,
+        allowTransition: true,
+        summaryZh: `确认：只详写『${dShort}』`,
+      };
+    }
+    // KEEP_MINOR (incl. side-level 详+略 / legacy SIDE:* markers)
+    if (isNoBriefUncoveredLabel(uncovered)) {
+      return {
+        applied: true,
+        developedTag: "已选详写",
+        uncoveredTag: "",
+        needExpandDetail: null,
+        expandMode: null,
+        allowTransition: true,
+        summaryZh: `确认：详写『${dShort}』`,
+      };
+    }
+    const briefParts = splitRetentionLabels(uncovered).filter(
+      (p) => !isNoBriefUncoveredLabel(p),
+    );
+    const minorThin = briefParts.some((p) => isThinRetentionLabel(p));
     return {
-      developedTag: "已展开，作为主论点",
-      uncoveredTag: "待展开详写",
-      needExpandDetail: uncovered,
-      expandMode: "detail",
-      allowTransition: false,
-      summaryZh: "默认：两边都补充",
-    };
-  }
-  if (rec === "DROP") {
-    return {
+      applied: true,
       developedTag: "已选详写",
-      uncoveredTag: "用户放弃",
-      needExpandDetail: null,
-      expandMode: null,
-      allowTransition: true,
-      summaryZh: `默认：只详写『${dShort}』`,
+      uncoveredTag: minorThin ? "已选略写（待补一句）" : "已选略写",
+      needExpandDetail: minorThin
+        ? briefParts.find((p) => isThinRetentionLabel(p)) || uncovered
+        : null,
+      expandMode: minorThin ? "minor_brief" : null,
+      allowTransition: !minorThin,
+      summaryZh: `确认：详写『${dShort}』、略写『${uShort}』`,
     };
   }
-  const minorThin = isThinRetentionLabel(uncovered);
-  return {
-    developedTag: "已选详写",
-    uncoveredTag: minorThin ? "已选略写（待补一句）" : "已选略写",
-    needExpandDetail: minorThin ? uncovered : null,
-    expandMode: minorThin ? "minor_brief" : null,
-    allowTransition: !minorThin,
-    summaryZh: `默认：详写『${dShort}』、略写『${uShort}』`,
-  };
+
+  // Unclear → do NOT lock; ask to confirm the proposal.
+  return awaiting("等确认：回复未构成明确详略选择");
 }
 
 /** Annotate developed/uncovered labels inside userPoints; fall back to append. */
@@ -8359,6 +10174,7 @@ function applyRetentionTagsToUserPoints(
     .trim();
 
   const tagOne = (source: string, label: string, tag: string): string => {
+    if (!tag || isNoBriefUncoveredLabel(label)) return source;
     const core = shortRetentionLabel(label);
     if (core.length < 2) return source;
     const re = new RegExp(
@@ -8378,7 +10194,15 @@ function applyRetentionTagsToUserPoints(
   };
 
   text = tagOne(text, developed, developedTag);
-  text = tagOne(text, uncovered, uncoveredTag);
+  // Merged brief in chat ("②③略写") → tag EACH slot; do not collapse board rows.
+  const briefLabels = splitRetentionLabels(uncovered);
+  if (briefLabels.length > 1) {
+    for (const label of briefLabels) {
+      text = tagOne(text, label, uncoveredTag);
+    }
+  } else {
+    text = tagOne(text, uncovered, uncoveredTag);
+  }
   return text.replace(/\s{2,}/g, " ").trim();
 }
 
@@ -8436,11 +10260,8 @@ function findDevelopedSiblingLabel(params: {
   return "已展开的这一点";
 }
 
-// Resolves the student's short reply to a pending retention question relative to
-// the recommendation that was actually proposed. An explicit contradiction of the
-// recommendation flips the outcome; anything else (including vague agreement like
-// "好的"/"都行"/"随便") is treated as accepting the recommendation.
-// Kept for verify-script / legacy call sites; prefer resolveRetentionUserChoice.
+// Legacy wrapper for verify-script / old call sites; prefer resolveRetentionUserChoice.
+// Vague ack /「你定」no longer auto-accept — returns "等确认".
 function resolvePendingRetentionChoice(
   userMessage: string,
   recommendation: RetentionRecommendation | null,
@@ -8451,9 +10272,11 @@ function resolvePendingRetentionChoice(
     uncovered: "另一点",
     defaultRec: recommendation,
   });
+  if (!result.applied) return "等确认";
   if (result.uncoveredTag.includes("放弃")) return "用户放弃";
   if (result.uncoveredTag.includes("待展开")) return "待展开详写";
   if (result.developedTag.includes("略写")) return "角色反转-详写另一点";
+  if (result.uncoveredTag.includes("已选详写")) return "都详写";
   return "保留-略写";
 }
 
@@ -8728,6 +10551,7 @@ async function applyStep2RetentionGuard(
   userMessage: string,
   messages: any[],
   question: string,
+  options?: { decision?: { type?: string; action?: string } | null },
 ): Promise<void> {
   if (!data?.progressUpdate?.step2Data) {
     console.log(
@@ -8740,16 +10564,95 @@ async function applyStep2RetentionGuard(
   const newStage = data.progressUpdate.step2Data.currentStage;
   const oldUserPoints = session?.step2?.coachEvaluation?.userPoints || "";
   const coachText = String(data.text || "");
+  const decision = options?.decision || null;
 
   console.log(
     `[Step2RetentionGuard] enter oldStage=${oldStage} newStage=${newStage || "(unset)"} userPointsLen=${String(oldUserPoints).length}`,
   );
 
-  const pending = extractPendingRetention(oldUserPoints);
+  let pending = extractPendingRetention(oldUserPoints);
+  // Verbal「可以/采纳」after coach 详略 ask that forgot ［待裁决］→ synthesize from last coach.
+  if (!pending) {
+    const decisionType0 = String(decision?.type || "").trim();
+    const decisionAction0 = String(decision?.action || "")
+      .trim()
+      .toLowerCase();
+    const acceptLike =
+      (decisionType0 === "retention" && decisionAction0 === "accept") ||
+      ((!decisionType0 || decisionType0 === "retention") &&
+        isRetentionPendingConfirm(userMessage));
+    if (acceptLike) {
+      const lastAi = [...(messages || [])]
+        .reverse()
+        .find(
+          (m: any) =>
+            m?.role === "assistant" ||
+            m?.role === "model" ||
+            m?.sender === "ai",
+        );
+      const lastAiText = String(
+        lastAi?.parts?.[0]?.text || lastAi?.content || lastAi?.text || "",
+      );
+      if (coachMessageLooksLikeRetentionDecision(lastAiText)) {
+        const scheme = parseSideRetentionSchemeFromCoachText(lastAiText);
+        if (scheme) {
+          pending = {
+            developed: scheme.developed,
+            uncovered: scheme.uncovered,
+            recommendation: "KEEP_MINOR",
+          };
+          console.log(
+            `[Step2RetentionGuard][SYNTH_PENDING] from last coach 详=${scheme.developed} 略=${scheme.uncovered}`,
+          );
+        }
+      }
+    }
+  }
   if (pending) {
+    const decisionType = String(decision?.type || "").trim();
+    const decisionAction = String(decision?.action || "")
+      .trim()
+      .toLowerCase();
+    const isRetentionDecision = decisionType === "retention";
+    const foreignDecision =
+      decisionType === "stance" ||
+      decisionType === "slot_add" ||
+      decisionType === "capacity_trim";
+    const rejectProposal =
+      (isRetentionDecision && decisionAction === "reject") ||
+      (!foreignDecision &&
+        (!decisionType || decisionType === "retention") &&
+        isRetentionProposalReject(userMessage));
+    const acceptProposal =
+      (isRetentionDecision && decisionAction === "accept") ||
+      (!foreignDecision &&
+        (!decisionType || decisionType === "retention") &&
+        isRetentionPendingConfirm(userMessage));
+
+    // 拒绝：清掉待裁决，不打 已选详写/略写，进入下一步追问（禁止死循环）
+    if (rejectProposal && !acceptProposal) {
+      const cleaned = stripRetentionDecisionTags(
+        String(
+          data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+        ).replace(PENDING_RETENTION_MARKER_RE, ""),
+      ).trim();
+      data.progressUpdate.step2Data.userPoints = cleaned;
+      data.progressUpdate.step2Data.currentStage = oldStage;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      const ask = buildStep2ContentAwareFallback(
+        session,
+        data.progressUpdate.step2Data,
+      );
+      data.text = `${part1}\n\n---\n\n好的，详略先不定。${ask}`;
+      console.log(
+        "[Step2RetentionGuard][PENDING_REJECTED] cleared 待裁决; no tags locked",
+      );
+      return;
+    }
+
     // Student is answering the 详写/略写 choice asked last turn.
     const choice = resolveRetentionUserChoice({
-      userMessage,
+      userMessage: acceptProposal && decisionAction === "accept" ? "同意" : userMessage,
       developed: pending.developed,
       uncovered: pending.uncovered,
       defaultRec: pending.recommendation,
@@ -8757,6 +10660,90 @@ async function applyStep2RetentionGuard(
     const basePoints = String(
       data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
     );
+
+    // Recommend → confirm: bounce-back「你定/你觉得呢」do NOT lock tags yet.
+    // Any other non-choice reply while pending = reject (same as UI「拒绝」) — no loop.
+    if (!choice.applied) {
+      // EXPAND_BOTH + soft ack /「同意」= continue content walk, not lock 详略.
+      // Clear ［待裁决］ so UI does not show 采纳/拒绝 on a content ask.
+      if (
+        choice.needExpandDetail &&
+        choice.expandMode === "detail" &&
+        (acceptProposal || isRetentionPendingConfirm(userMessage))
+      ) {
+        const cleanedWalk = stripRetentionDecisionTags(
+          String(basePoints).replace(PENDING_RETENTION_MARKER_RE, ""),
+        ).trim();
+        data.progressUpdate.step2Data.userPoints = cleanedWalk;
+        data.progressUpdate.step2Data.currentStage = oldStage;
+        data.progressUpdate.step2Data.pendingFocusClaim =
+          shortRetentionLabel(choice.needExpandDetail) || pending.uncovered;
+        const part1w = safeOverridePart1(String(data.text || ""));
+        const askW =
+          choice.proposalAsk ||
+          buildRetentionProposalAsk(
+            pending.developed,
+            pending.uncovered,
+            "EXPAND_BOTH",
+          );
+        data.text = `${part1w}\n\n---\n\n${askW}`;
+        console.log(
+          `[Step2RetentionGuard][PENDING_EXPAND_WALK] ${choice.summaryZh}; focus=${data.progressUpdate.step2Data.pendingFocusClaim}`,
+        );
+        return;
+      }
+      if (
+        !isRetentionDeferToCoach(userMessage) &&
+        String(userMessage || "").trim() &&
+        !acceptProposal
+      ) {
+        const cleanedReject = stripRetentionDecisionTags(
+          String(basePoints).replace(PENDING_RETENTION_MARKER_RE, ""),
+        ).trim();
+        data.progressUpdate.step2Data.userPoints = cleanedReject;
+        data.progressUpdate.step2Data.currentStage = oldStage;
+        const part1r = safeOverridePart1(String(data.text || ""));
+        const askR = buildStep2ContentAwareFallback(
+          session,
+          data.progressUpdate.step2Data,
+        );
+        data.text = `${part1r}\n\n---\n\n好的，详略先不定。${askR}`;
+        console.log(
+          "[Step2RetentionGuard][PENDING_REJECTED] unclear reply; cleared 待裁决",
+        );
+        return;
+      }
+      // KEEP_MINOR / DROP still awaiting clear confirm — keep marker.
+      // EXPAND_BOTH defer-to-coach: ask content walk WITHOUT re-parking 待裁决.
+      const cleaned = stripRetentionDecisionTags(
+        String(basePoints).replace(PENDING_RETENTION_MARKER_RE, ""),
+      ).trim();
+      const ask =
+        choice.proposalAsk ||
+        buildRetentionProposalAsk(
+          pending.developed,
+          pending.uncovered,
+          pending.recommendation,
+        );
+      const keepMarker =
+        pending.recommendation === "KEEP_MINOR" ||
+        pending.recommendation === "DROP";
+      data.progressUpdate.step2Data.userPoints = keepMarker
+        ? `${cleaned} ${formatPendingRetentionMarker(pending)}`.trim()
+        : cleaned;
+      if (!keepMarker) {
+        data.progressUpdate.step2Data.pendingFocusClaim =
+          shortRetentionLabel(pending.uncovered) || pending.uncovered;
+      }
+      data.progressUpdate.step2Data.currentStage = oldStage;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      data.text = `${part1}\n\n---\n\n${ask}`;
+      console.log(
+        `[Step2RetentionGuard][PENDING_AWAIT_CONFIRM] ${choice.summaryZh} keepMarker=${keepMarker}`,
+      );
+      return;
+    }
+
     data.progressUpdate.step2Data.userPoints = applyRetentionTagsToUserPoints(
       basePoints,
       pending.developed,
@@ -8764,6 +10751,41 @@ async function applyStep2RetentionGuard(
       choice.developedTag,
       choice.uncoveredTag,
     );
+
+    // Stamp planner retentionRole + drop same-side leftovers not in the scheme
+    // (e.g. empty「网络」) so side walk advances and we do not re-ask 详略/裁剪.
+    {
+      const payload = data.progressUpdate.step2Data.plannerPayload;
+      const pts = Array.isArray(payload?.points) ? payload.points : null;
+      if (pts) {
+        const settled = settleSideRetentionAfterAccept({
+          points: pts,
+          developed: pending.developed,
+          uncovered: pending.uncovered,
+        });
+        let up = String(data.progressUpdate.step2Data.userPoints || "");
+        for (const claim of settled.droppedClaims) {
+          up = stampRetentionTagOnUserPoints(up, claim, "dropped");
+        }
+        data.progressUpdate.step2Data.userPoints = up;
+        const dismissed = Array.isArray(payload?.capacityTrimDismissedSides)
+          ? [...payload.capacityTrimDismissedSides]
+          : [];
+        if (settled.sideKey && !dismissed.includes(settled.sideKey)) {
+          dismissed.push(settled.sideKey);
+        }
+        data.progressUpdate.step2Data.plannerPayload = {
+          ...payload,
+          points: applyRetentionRolesFromUserPoints(settled.points, up),
+          pendingCapacityTrim: null,
+          capacityTrimDismissedSides: dismissed,
+          pendingStanceConfirm: null,
+        };
+        console.log(
+          `[Step2RetentionGuard][SIDE_SETTLE] side=${settled.sideKey || "?"} dropped=${settled.droppedClaims.length} roles stamped; trim dismissed`,
+        );
+      }
+    }
 
     if (choice.needExpandDetail && choice.expandMode) {
       // Before asking to "expand further", check whether this turn's own answer
@@ -8801,6 +10823,46 @@ async function applyStep2RetentionGuard(
       `[Step2RetentionGuard][PENDING_RESOLVED] ${choice.summaryZh}; allowTransition=${choice.allowTransition}`,
     );
     return;
+  }
+
+  // No pending marker, but model locked tags / student bounced choice back →
+  // strip premature locks and ask for explicit confirm (do not advance).
+  {
+    const nextPoints = String(
+      data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+    );
+    const prematureTags = userPointsGainedRetentionTags(oldUserPoints, nextPoints);
+    const deferred = isRetentionDeferToCoach(userMessage);
+    const clearPick = messageIsClearRetentionChoice(userMessage);
+    if ((prematureTags && !clearPick) || (deferred && prematureTags)) {
+      const tagged = extractRetentionTaggedLabels(nextPoints);
+      const developed =
+        tagged.detail[0] ||
+        shortRetentionLabel(oldUserPoints) ||
+        "已展开的这一点";
+      const uncovered =
+        tagged.brief.join("、") ||
+        tagged.detail.slice(1).join("、") ||
+        "其余点";
+      const cleaned = stripRetentionDecisionTags(
+        nextPoints.replace(PENDING_RETENTION_MARKER_RE, ""),
+      ).trim();
+      // Content walk — do NOT park ［待裁决］ (avoids 采纳/拒绝 on「请补内容」).
+      data.progressUpdate.step2Data.userPoints = cleaned;
+      data.progressUpdate.step2Data.pendingFocusClaim =
+        shortRetentionLabel(uncovered) || uncovered;
+      data.progressUpdate.step2Data.currentStage = oldStage;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      data.text = `${part1}\n\n---\n\n${buildRetentionProposalAsk(
+        developed,
+        uncovered,
+        "EXPAND_BOTH",
+      )}`;
+      console.warn(
+        `[Step2RetentionGuard][PREMATURE_TAGS_STRIPPED] deferred=${deferred} prematureTags=${prematureTags}; expand-walk (no 待裁决)`,
+      );
+      return;
+    }
   }
 
   const stageTransition =
@@ -8937,22 +10999,43 @@ async function applyStep2RetentionGuard(
   let retentionQuestion: string;
   if (recommendation === "EXPAND_BOTH") {
     retentionQuestion =
-      `我们先记录下这一点（${reasonZh}）。你之前还提到『${uShort}』——能否也补充 1-2 句，让这一维度也有具体内容？` +
-      `若你想先选定详写哪些、其余略写或不写，也可以直接告诉我。`;
-  } else {
+      `目前材料池有：\n${listBlock}\n` +
+      `『${uShort}』还没展开到可写程度（${reasonZh}）。` +
+      `请先补 1–2 句具体场景、机制或受影响对象；补完后再按各条可写量定详写/略写` +
+      `（可以都详写，也可以一详一略——不默认一详一略）。`;
+  } else if (recommendation === "DROP") {
     retentionQuestion =
       `目前材料池有：\n${listBlock}\n` +
-      `请选择哪几个作为详写（其余略写或不写）。\n` +
-      `也可以说「都展开」或「你定」（${reasonZh}）。`;
+      `我建议详写『${dShort}』，『${uShort}』先放下（${reasonZh}）。\n` +
+      `请点击下方「采纳」或「拒绝」；也可直接说「保留略写」或「都展开」。`;
+  } else {
+    // Legacy KEEP_MINOR path (explicit scheme only)
+    retentionQuestion =
+      `目前材料池有：\n${listBlock}\n` +
+      `我建议：详写『${dShort}』，略写『${uShort}』（${reasonZh}）。\n` +
+      `是否按这个方案定下来？请回复「同意」「好」或直接说明你的详略选择。`;
   }
   data.text = `${part1}\n\n---\n\n${retentionQuestion}`;
 
-  const basePoints = String(
-    data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+  const basePoints = stripRetentionDecisionTags(
+    String(
+      data.progressUpdate.step2Data.userPoints || oldUserPoints || "",
+    ).replace(PENDING_RETENTION_MARKER_RE, ""),
   ).trim();
   const thinTag = effectiveCheck.developedIsSolid ? "" : "（待补例子）";
-  data.progressUpdate.step2Data.userPoints =
-    `${basePoints}${thinTag} ［待裁决：详=${developed}｜略=${uncovered}｜默认=${recommendation}］`.trim();
+  // EXPAND_BOTH = content walk: do NOT park ［待裁决］详略 marker (avoids 采纳/拒绝 UI).
+  // DROP / KEEP_MINOR = proposal needing confirm → keep pending marker.
+  if (recommendation === "EXPAND_BOTH") {
+    data.progressUpdate.step2Data.userPoints = `${basePoints}${thinTag}`.trim();
+    data.progressUpdate.step2Data.pendingFocusClaim = uShort || uncovered;
+  } else {
+    data.progressUpdate.step2Data.userPoints =
+      `${basePoints}${thinTag} ${formatPendingRetentionMarker({
+        developed,
+        uncovered,
+        recommendation,
+      })}`.trim();
+  }
 
   console.warn(
     `[Step2RetentionGuard][REVERTED] ${oldStage}->${newStage || "(verbal)"}; developed="${dShort}"; uncovered="${uShort}"; default=${recommendation}; via=${stageTransition ? "stage" : "verbal"}`,
@@ -9151,6 +11234,22 @@ async function startServer() {
         bodyPlans,
         input?.plannerPayload || null,
       );
+
+      // Observability: final body → point mapping (diagnose silent point loss)
+      try {
+        const mapLog = (bodyPlans || [])
+          .map((bp: any) => {
+            const ids = Array.isArray(bp?.mappedPointIds)
+              ? bp.mappedPointIds.map(String)
+              : [];
+            const claims = (
+              Array.isArray(bp?.mappedPoints) ? bp.mappedPoints : []
+            ).map((c: any) => String(c || "").slice(0, 12));
+            return `${bp?.id || "?"} → [${ids.join(",")}]（${claims.join("、") || "未水合"}）`;
+          })
+          .join("；");
+        console.log(`[Planner] final mapping: ${mapLog}`);
+      } catch {}
 
       // Material-insufficient degraded: both bodies lack real claims
       const claimsEmpty = (bodyPlans || []).every((bp: any) => {
@@ -9760,17 +11859,18 @@ ${memoryDigestStr}
   Dimension quality & exit rules (CRITICAL — Step 1 is divergent brainstorm with light quality filter; server enforces tags + exit gate):
   - Cap: never keep more than 6 dimension labels. At 6, stop asking for more angles and you MAY emit the hard Step-2 CTA.
   - Tag format (STRICT): write status tags as SEPARATE parentheses after the label. Correct: "公众健康（已探测）（可展开）". Incorrect / ignored by server: "公众健康（二手烟危害 - 可展开）", untagged "公众健康", or mixing explanation inside the status parentheses.
-  - Light expandability probe (ONCE per new dimension, REQUIRED before quality tags):
-    1) First record the raw label WITHOUT （可展开）/（空标签）.
-    2) Ask ONE tiny signal question — e.g. "这个角度你脑子里已经有具体场景或例子的苗头了吗？" Do NOT ask for the full scene/mechanism (that is Step 2).
-    3) On the student's NEXT answer, tag that dimension with （已探测） PLUS either （可展开） (any concrete cue) or （空标签） (no/不清楚/不知道/vague hedge). Ambiguous answers default to （空标签）.
-  - FORBIDDEN: tagging （可展开） in the same turn you first introduce a dimension; FORBIDDEN: emitting hard completion CTA in the same turn you first introduce a dimension.
-  - Probe anti-loop: each dimension gets at most ONE probe. If it fails (空标签), do NOT deepen that same dimension — invite a DIFFERENT new angle instead.
+  - Confirmed dimension LOCK (CRITICAL): once a dimension already carries server probe stamps （已探测）/（可展开）/（空标签）/（质量待确认）, copy that entry VERBATIM (same core label + same status tags) into suggestedDimensions every turn. You may APPEND new bare labels at the end. FORBIDDEN: stripping status tags, rewriting a confirmed label's tags, or dropping a confirmed dimension unless the student explicitly asks to remove/rename it. Server restores confirmed stamps if the model rewrites them.
+  - Light expandability probe (ONCE per new dimension, REQUIRED before quality tags) — SERVER OWNS THE LOOP:
+    1) First record the raw label WITHOUT （可展开）/（空标签）/（已探测）. FORBIDDEN: tagging status on the introduce turn.
+    2) While ANY unprobed (bare) label remains: Part 2 MUST be a ONE-dimension probe ask for the earliest bare label (e.g. "『××』这个角度你脑子里已经有具体场景或例子的苗头了吗？"). FORBIDDEN: jumping to the next task (e.g. Task B / 评价) while Task A / earlier labels are still unprobed. FORBIDDEN: merge-probing two labels in one ask. FORBIDDEN: re-probing a dimension that already has （已探测）.
+    3) On the student's NEXT answer to a probe: set progressUpdate.step1Data.probeVerdict to "expandable" (any concrete cue) or "thin" (no/不清楚/vague). Do NOT self-stamp （可展开）/（空标签） — the server stamps from probeVerdict. Ambiguous → "thin".
+  - FORBIDDEN: emitting hard completion CTA or soft exit while unprobed labels remain.
+  - Probe anti-loop: each dimension gets at most ONE probe. If it fails (thin), do NOT deepen that same dimension — invite a DIFFERENT new angle instead (only when no bare labels remain).
   - Effective count (server enforces): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, and （质量待确认） do NOT count toward sufficiency.
-  - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) effective dimensions >= 3; (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough". If not sufficient, keep asking for another NEW angle — do NOT ask "够用了吗".
-  - Soft exit offer ONLY after dimensionsSufficient=true: ask whether they want to add more; set exitOffered=true and tag （已询退出）. Soft ask MUST NOT include "点击【下一步】". Example soft ask: "这几个角度已经可以支撑分析了。还能想到别的吗？如果暂时想不到别的，告诉我，我们再进入第二步。"
-  - Hard completion CTA ONLY after soft exit was offered AND student confirms stop / says "没有更多了" / "先这样", OR cap=6: Part 2 MUST include both "点击" + "【下一步】" (or "下一步") AND "进入第二步", then set isCompleted:true.
-  - Cap reached but effective still < 3: stop probing, tag remaining thin labels （质量待确认）（已探测）, set dimensionsSufficient=true and exitOffered=true, then hard CTA — do NOT loop forever.
+  - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) effective dimensions >= 3; (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough"; (d) no bare/unprobed labels remain. If not sufficient, keep probing bare labels or ask for another NEW angle — do NOT ask "够用了吗".
+  - Soft exit offer ONLY after dimensionsSufficient=true and no bare labels: ask whether they want to add more; set exitOffered=true and tag （已询退出）. Soft ask MUST NOT include "点击【下一步】". Example soft ask: "这几个角度已经可以支撑分析了。还能想到别的吗？如果暂时想不到别的，告诉我，我们再进入第二步。"
+  - Hard completion CTA ONLY after soft exit was offered AND student confirms stop / says "没有更多了" / "先这样", OR (cap=6 AND every label already probed): Part 2 MUST include both "点击" + "【下一步】" (or "下一步") AND "进入第二步", then set isCompleted:true.
+  - Cap=6 means stop asking for MORE new angles. It does NOT skip probes on existing bare labels. Student exhausted with bare labels still open → server may stamp （质量待确认）.
 
   Per-task dimension flow (CRITICAL — ONLY for compound question types where questionBrief.taskMap names 2 distinct tasks: Two-part Question, Problem / Solution, Positive / Negative, multi-task Other):
   - Do NOT ask ONE generic "list 2-4 dimensions" question for these types. Split into two sequential, task-scoped questions, but phrase BOTH as natural, direct ANGLE-level questions — never as a meta/procedural question about the analysis method itself, and never as a Step-2-style content/evaluation question (see Granularity calibration above — you are still only collecting entry-point LABELS here, not impacts or judgments):
@@ -9782,8 +11882,8 @@ ${memoryDigestStr}
        - Do NOT invent the Task B dimension yourself — it must come from what the student actually said.
   - Single-task question types (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages) keep the existing single generic "list 2-4 dimensions" question — do NOT split these; they only have one task to analyze.
   - Tag each recorded dimension with which task(s) it covers using a short natural-language suffix so Step 2 can anchor correctly later, e.g. "经济发展（原因+评价均适用）" or "身份认同（评价）". Do not use raw field/stage names (taskMap, explore_A/B) as the tag text — and never expose this tagging logic to the student either.
-  - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), prefer at least 2 distinct angles before moving to the next task/slot. If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？") before moving on — do not silently transition to the next task with only 1 angle recorded for the current one. Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on (do not fabricate a 2nd to force the count).
-  - Sequencing with Dimension quality & exit rules above: after BOTH tasks have been asked (each following Per-task sufficiency), if the TOTAL EFFECTIVE dimension count is still below 3, ask for one more NEW angle (no exit option yet); do not fabricate to skip this.
+  - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), prefer at least 2 distinct angles before moving to the next task/slot. HARD: do NOT ask Task B while any Task A label is still unprobed — finish light probes on Task A first (server will rewrite Part 2 if you jump early). If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？") before moving on. Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on (do not fabricate a 2nd to force the count).
+  - Sequencing with Dimension quality & exit rules above: after BOTH tasks have been asked AND all collected labels are probed (each following Per-task sufficiency + probe-first), if the TOTAL EFFECTIVE dimension count is still below 3, ask for one more NEW angle (no exit option yet); do not fabricate to skip this.
   - Continuation-signal routing (CRITICAL — student may still be finishing the previous task after you already asked the next one):
     - If your previous question already moved to Task B (or the next slot), but the student's CURRENT message signals they are still continuing the previous task — e.g. "还没说完" / "我接着说" / "继续刚才" / "等一下" / "先补充一下" / "还有一个原因" / or they clearly keep elaborating causes when you just asked for evaluation angles — then route this turn's content into the PREVIOUS task/slot (Task A / prior slot). Do NOT treat it as an answer to the new question.
     - Silently merge the continuation into the correct prior slot's suggestedDimensions (apply the causal-chain vs parallel-angles test). Do NOT scold, do NOT re-ask the already-advanced question in the same turn, and do NOT pretend they answered Task B.
@@ -9906,19 +12006,30 @@ ${memoryDigestStr}
   - If NO (only one dimension was ever named, or the "other" one is just a synonym of the developed one), skip this rule entirely and proceed with the normal sufficiency-gated transition below.
   - Priority when BOTH an uncovered dimension AND insufficient depth exist: ask the depth follow-up first (existing Content-completeness boundary rule); do NOT ask about the uncovered dimension in that same turn. Only apply the retention question in a later turn once the developed point becomes sufficient OR is tagged （待补例子）.
   - Anti-loop vs retention precedence (CRITICAL): the "at most ONE depth follow-up per point" anti-loop rule caps follow-ups WITHIN a single developed point. It does NOT authorize skipping a sibling named dimension, and it does NOT override this Retention Rule. After accepting a thin developed point (with （待补例子） if needed), you MUST still check for uncovered siblings before transitioning; if one remains, ask the retention question and keep currentStage unchanged.
-  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, do NOT silently assign 详写/略写 for the student, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED and ask the student to CHOOSE which point(s) to detail-write:
-    - Present the current material-pool points as a numbered list (①②③…; use plannerPayload.fixedClaims / points when available — do NOT hardcode “only two points”).
-    - Ask: 请选择哪几个作为详写（其余略写或不写）. Mention they can also say「都展开」or「你定」. FORBIDDEN phrasing: 「选哪一个…另一个…」「两条都展开」「详写一个、略写一个」as if there were always exactly two.
-    - Do NOT push a forced KEEP/DROP recommendation as the main ask. A soft default may be mentioned only as the「你定」fallback.
-    - Example: "目前材料池有：\n① 生态危害\n② 垃圾处理成本\n③ 社会文化服务\n请选择哪几个作为详写（其余略写或不写）。也可以说「都展开」或「你定」。"
+  - When an uncovered dimension IS found and the developed point is already sufficient: do NOT silently drop it, do NOT silently assign 详写/略写 for the student, and do NOT advance currentStage yet. In THIS turn, keep currentStage UNCHANGED and WALK the uncovered sibling first:
+    - Present the current material-pool points as a numbered list (①②③…; use plannerPayload.fixedClaims / points when available).
+    - Ask the student to补 1–2 句 concrete scene/mechanism for the uncovered point. FORBIDDEN as soft default: automatically recommending「详写①、略写②」just because there are two points.
+    - After BOTH (or all) sibling points have writable content, THEN ask 详略 based on content volume (可以都详写，也可以一详一略——由可写量决定). Only then may you present a numbered 详略 scheme for confirm (UI「采纳/拒绝」).
+    - Student may reply「都详写」/「①详写，②略写」/「放弃某条」. FORBIDDEN: treating「你觉得呢」/「你定」as confirmation.
+    - Example (uncovered still thin): "目前材料池有：\n① 西方文化冲击（已有场景）\n② 数字化网络（尚未展开）\n请先给②补 1–2 句机制；补完后再定详略。"
+    - Example (both have content, then 详略): "两条都有可写内容了。按内容量，你更想详写哪一条、略写哪一条？也可以都详写。"
   - When the developed point is still thin: ask for 1-2 sentences on the uncovered dimension too (both need content before a 详写/略写 choice is meaningful).
-  - On the NEXT turn, interpret the student's reply as a ROLE CHOICE (not a veto of your assignment):
-    - Explicit pick of point ① or ② (or named labels) as 详写 → tag that point 已选详写 and the other 已选略写. If the chosen 详写 point still lacks a concrete scene/mechanism, ask ONE expansion question for it before leaving this side. If the chosen 略写 point is only an empty label, ask ONE brief "一两句话说明" question; otherwise do not depth-follow-up the 略写 point.
-    - 「都展开」/「全都展开」→ expand the still-thin/uncovered sibling next.
+  - On the NEXT turn, interpret the student's reply as content expansion OR an explicit ROLE CHOICE:
+    - Content for the uncovered sibling → hang onto that slot; do NOT lock 详略 yet unless they explicitly chose.
+    - Explicit pick of point ① or ② as 详写 → tag that point 已选详写 and the other 已选略写 (only when they stated a scheme).
+    - 「都展开」/「都详写」→ tag each chosen point 已选详写 (or expand still-thin siblings next).
     - 「放弃/只要一个」→ tag the other as 用户放弃 and proceed.
-    - Vague agreement ("好的"/"随便"/"你定") → apply the soft default (usually: already-developed point = 详写, sibling = 略写) and then follow the same expand-if-needed rule above.
-    - Anti-loop: at most ONE 详写/略写 choice question per side; after the choice is recorded, do not re-ask the same choice.
-  - Real-time Save (state carrier): record the retention decision inside progressUpdate.step2Data.userPoints using an explicit status tag on the EXISTING point text, e.g. "A面：生态危害（具体展开…）（已选详写）；垃圾处理成本高（…）（已选略写）". FORBIDDEN: appending a new empty duplicate like "社会文化生活和服务（）" or "环境保护（已选详写）" without content — only tag the already-recorded point. Do NOT invent "待定" placeholders inside point bodies. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+    - Confirm after an explicit 详略 confirm-ask ("同意"/"好"/"就这样"/UI「采纳」) → apply THAT scheme only (never invent 一详一略 if the ask was only「请补内容」).
+    - Bounce-back ("你觉得呢"/"你定") → do NOT tag; restate and ask clearly.
+    - Anti-loop: at most ONE 详写/略写 choice question per side after content is ready; after the choice is recorded, do not re-ask the same choice.
+    - STRUCTURED RETENTION PROPOSAL: on the recommend turn, ALSO populate progressUpdate.step2Data.retentionSuggestion = { detail: [...], brief: [...], reason: "一句话理由（≤40 字）" } with claim labels copied EXACTLY from the frozen board. Base the split on content QUALITY/specificity (which points have the most concrete scene/mechanism), not just text length. The server builds the confirm buttons from this field; omit it on non-recommend turns.
+  - Real-time Save (state carrier): ONLY after confirm/clear pick (UI「采纳」or explicit「同意/好/①详写②略写」), record the retention decision inside progressUpdate.step2Data.userPoints using an explicit status tag on the EXISTING point text, e.g. "A面：生态危害（具体展开…）（已选详写）；垃圾处理成本高（…）（已选略写）". When student says「都详写/都展开」, tag EACH chosen point with（已选详写）— never use soft aliases like「待展开详写」. On the recommend turn, keep a ［待裁决：…］ marker without 已选 tags; UI shows「采纳/拒绝」—「拒绝」clears the marker without locking tags. Do NOT rely on 'clustering' or 'outliers' during explore_A/explore_B — userPoints (+ ［待裁决］) is the real-time carrier. FORBIDDEN: appending a new empty duplicate like "社会文化生活和服务（）" or "环境保护（已选详写）" without content — only tag the already-recorded point. Do NOT invent "待定" placeholders inside point bodies. Never say explore_A/B, currentStage, or recommendation enum names in chat text.
+  - CRITICAL — RETENTION LOCK: Once a point already carries（已选详写）/（已选略写）/（用户放弃）, later turns MUST keep that tag when rewriting userPoints. FORBIDDEN: silently changing 详写→略写/未标 to suit summary or layout. Only change tags when the student explicitly asks to change 详写/略写. FORBIDDEN: locking 详写/略写 on the recommend turn before student 采纳.
+  - CRITICAL — ACTIVE POINT FOCUS / MOUNT: Server mounts STUDENT material only (never hidden kickoff / system opener text). Order: (1) semantic match onto an existing frozen claim (e.g. student says「强势文化」→ slot「文化全球化」), (2) else the current deepen/active slot, (3) else park as pendingSlotAdd for confirm — never silent-drop student text. When you ask to deepen ONE named point (thin / 「还偏薄」), arm that point so the next reply can hang there. For multi-point / summary / stance turns, clear single-slot focus; write structured userPoints that name each claim. Do NOT dump unrelated content into the first slot. Do NOT copy kickoff/instruction text into userPoints.
+  - CRITICAL — CHECKLIST FIRST, THEN NEW SLOT: Walk by SIDE: (1) expand every frozen slot on the current side until each has writable content; (2) THEN one 详略 recommend for that whole side with UI「采纳/拒绝」; (3) only then move to the next side. FORBIDDEN during expand/explore turns: spontaneously proposing 详略 schemes, stance「采纳」locks, or「加入材料池」unless the student themselves just proposed a brand-new parallel point. FORBIDDEN: asking 详略 for a single point while siblings on the same side are still thin. FORBIDDEN:「进入第二问」while any cause-side slot is still thin or the cause-side 详略 is unsettled. FORBIDDEN: proposing「加入材料池」for task labels like「原因/成因」or for a list item already on the board. New-slot confirm only when the student proposes a brand-new parallel point (system will show confirm UI).
+  - CRITICAL — NEW SLOT ONLY AFTER CONFIRM: Right-board slots are frozen from Step1. FORBIDDEN: asking the student to deepen an off-board angle before it is on the board — and FORBIDDEN while checklist slots remain unwalked. If checklist is done and you want a brand-new parallel point, FIRST propose加入材料池 with UI「采纳 / 拒绝」; ONLY after「采纳」may you deepen it. Reject → return to material review. Do NOT invent a new board row until the student clicks「采纳」(or explicitly says「同意」/「加上这条」/「采纳」). 「拒绝」/「不用」/「不加入」or any non-accept reply clears the proposal — do NOT re-ask the same join question. Bare「可以/好的」must NOT add a slot. Prefer attaching受影响对象/场景答案 onto the current Step1 dimension rather than proposing a new parallel slot.
+  - CRITICAL — CHECKLIST BEFORE STANCE: Do NOT recommend stance / say「材料齐了」while any Step1 frozen slot is still unwalked (no content or no side-level 详略). Stance +「采纳/拒绝」only after the checklist is complete.
+  - CRITICAL — INITIAL BOARD: Newly seeded Step1 dimensions start as 待加深/thin until the student provides real elaboration. Never treat a long dimension label alone as「可写」.
 
   1. Stage "explore_A": Explore Side A / Task 1 (按上面的题型映射) — EXPAND phase
      - Priority from Step 1 tags: prefer dimensions tagged （可展开） first; for （质量待确认）/（空标签）, ask ONE concrete-scene probe before investing a full expansion turn.
@@ -9969,6 +12080,7 @@ ${memoryDigestStr}
        2) Recommend which overall stance fits the material; optionally which points to keep vs drop.
        3) Ask the student to confirm or correct in one turn when possible. Do NOT assign bodies here.
      - Coach recommendation first (CRITICAL): infer the most defensible stance from the student's recorded A/B material. Recommend ONE stance directly and give 1-2 concrete reasons tied to which side is richer, more expandable, or easier to qualify. Do not make the student choose blindly from a neutral menu.
+     - After recommending: put the recommendation into suggestedStance AND userStance preview fields; the UI shows 「采纳/拒绝」buttons. Do NOT ask them to type 「同意/不同意」as the only confirm path. Say briefly that they can click 采纳 to lock or 拒绝 to give their own stance.
      - Recommendation integrity: use only points already supplied by the student. You may compare their relative strength and expandability, but MUST NOT invent a new argument merely to justify your recommendation.
      - Agree/Disagree example shape: "根据你前面给出的材料，我更推荐『部分同意』：你对……的论据更具体，而另一面可以作为限制条件。这个方向符合你的本意吗？" Rephrase naturally; do not force this literal wording.
      - Positive / Negative (or outweigh-style) example shape: "我更推荐『利大于弊』：你给出的两个好处都能展开成具体场景，而缺点更适合作为可缓解的让步。你愿意采用这个立场吗？" Rephrase naturally and cite the student's actual points.
@@ -10660,6 +12772,11 @@ Student says:
                         description:
                           "True when the question has no hard qualifiers and constraints were silently skipped (constraints should be []).",
                       },
+                      probeVerdict: {
+                        type: Type.STRING,
+                        description:
+                          "When the previous coach turn probed ONE bare dimension (server pendingProbeCore): set 'expandable' if the student's reply has any concrete cue/scene seed, or 'thin' if no/unclear/vague. Leave empty when not answering a probe. Server stamps tags from this field — do NOT self-stamp （可展开）/（空标签）.",
+                      },
                     },
                     required: [
                       "correctType",
@@ -10688,6 +12805,26 @@ Student says:
                         type: Type.STRING,
                         description:
                           "DEPRECATED. Always return empty string. No English polished points.",
+                      },
+                      retentionSuggestion: {
+                        type: Type.OBJECT,
+                        description:
+                          "ONLY on the turn you present a side's 详略 scheme (every slot on that side already has writable content): your structured scheme. detail/brief/drop = claim labels copied EXACTLY from the frozen board list; reason = ONE short Chinese sentence (≤40 字, no repetition). The server builds the confirm UI from THIS field — chat text is display only. Omit on all other turns.",
+                        properties: {
+                          detail: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING },
+                          },
+                          brief: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING },
+                          },
+                          drop: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING },
+                          },
+                          reason: { type: Type.STRING },
+                        },
                       },
                       blueprint: {
                         type: Type.OBJECT,
@@ -11094,17 +13231,84 @@ Student says:
       // call that catches cases where the prompt-only rule gets diluted by the large
       // Step 2 prompt and the model silently drops an uncovered sibling dimension.
       if (currentStepNum === 2 && data?.progressUpdate) {
-        await applyStep2RetentionGuard(data, session, userMessage, messages, question);
+        const proposalEarly = applyStep2ProposalChannelEarly(
+          data,
+          session,
+          userMessage,
+          req.body?.decision || null,
+        );
+        // Legacy retention marker path only when proposal channel did not handle.
+        if (!proposalEarly.handled) {
+          await applyStep2RetentionGuard(
+            data,
+            session,
+            userMessage,
+            messages,
+            question,
+            { decision: req.body?.decision || null },
+          );
+        }
         applyNoStanceGate(question, data, session);
         enforceStep2DimensionDispositionGuard(data, session);
         enforceStep2StanceMaterialGuard(data, session, userMessage);
-        applyStep2PlannerPayloadNormalize(
+        if (
+          !data.progressUpdate.step2Data ||
+          typeof data.progressUpdate.step2Data !== "object"
+        ) {
+          data.progressUpdate.step2Data = {};
+        }
+        // Previous coach ask → recover activePoint when payload focus was never stamped.
+        data.progressUpdate.step2Data._lastCoachAsk =
+          extractLastCoachQuestion(messages);
+        // Inline retention stamps only when the proposal channel did not
+        // already resolve this turn (avoids double/conflicting stamps).
+        if (!proposalEarly.handled) {
+          applyStep2InlineChecklistRetention(data, session, userMessage);
+        }
+        await applyStep2PlannerPayloadNormalize(
           question,
           data,
           session,
           userMessage,
+          {
+            isHiddenKickoff: Boolean(isHiddenKickoff),
+            decision: req.body?.decision || null,
+          },
         );
-        enforceStep2Momentum(data, session);
+        if (proposalEarly.handled && proposalEarly.committedPayload) {
+          mergeCommittedProposalIntoPayload(
+            data.progressUpdate.step2Data,
+            proposalEarly.committedPayload,
+            proposalEarly.committedUserPoints,
+          );
+        }
+        applyStep2FocusAndSlotAddPostProcess(data, session, userMessage, {
+          decision: req.body?.decision || null,
+        });
+        enforceStep2Momentum(data, session, {
+          channelAuthoredText: Boolean(proposalEarly.handled),
+        });
+        // Momentum / thin-ask may stamp pendingFocusClaim — persist onto activePointId.
+        stampStep2ActivePointFromPendingFocus(data);
+        // Capacity trim merged into side 详略 — never force a second裁剪 ask.
+        {
+          const step2 = data.progressUpdate?.step2Data;
+          if (step2?.plannerPayload?.pendingCapacityTrim) {
+            step2.plannerPayload.pendingCapacityTrim = null;
+          }
+        }
+        enforceStep2AskContract(data, session, {
+          safeOverridePart1,
+          buildContentAwareFallback: buildStep2ContentAwareFallback,
+        });
+        // Stance/slot legacy post-process only if proposal channel idle.
+        if (!data.progressUpdate.step2Data?.plannerPayload?.pendingProposal) {
+          applyStep2StanceConfirmPostProcess(data, session, userMessage, {
+            decision: req.body?.decision || null,
+          });
+        }
+        scrubStep2StaleDecisionPendingOnContentAsk(data);
+        applyStep2ProposalChannelLate(data, session, userMessage);
       }
 
       // Heuristic + anti-drift completion (runs AFTER backfill text repair & slot check)

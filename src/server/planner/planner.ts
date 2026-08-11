@@ -25,12 +25,16 @@ import { buildFallbackBodyPlans } from './planner-fallback';
 import { parseAIResponse } from './planner-utils';
 import {
   activePoints,
+  appendMissingPointBlocks,
   applyRetentionRolesFromUserPoints,
   buildPlannerMaterialDigest,
+  expandPackedDetailBodies,
   hydrateBodyPlansFromPayload,
   mergeBriefOnlyBodies,
   normalizeStep2PlannerPayload,
+  resolvePointId,
 } from '../step2/planner-payload';
+import { isClaimSentence } from '../../utils/step3ClaimPrefill';
 
 export {
   buildPendingDraftsFromFullSubClaims,
@@ -216,6 +220,40 @@ export function detectBriefOnlyBodyWarns(
 }
 
 /**
+ * Coverage guard: every active non-dropped Step2 point must be mapped into
+ * some body. A missing detail point fails QA (retry / fallback); a missing
+ * brief point only warns — normalize auto-appends it as a minor block.
+ */
+export function detectPointCoverageIssues(
+  bodyPlans: BodyPlan[],
+  plannerPayload?: Step2PlannerPayload | null,
+): MechanicalQaResult['issues'] {
+  if (!plannerPayload) return [];
+  const redirects = plannerPayload.redirects || {};
+  const mapped = new Set<string>();
+  for (const bp of bodyPlans) {
+    const ids = Array.isArray(bp?.mappedPointIds) ? bp.mappedPointIds : [];
+    for (const id of ids) {
+      mapped.add(resolvePointId(String(id), redirects));
+    }
+  }
+  const issues: MechanicalQaResult['issues'] = [];
+  for (const p of activePoints(plannerPayload)) {
+    if (p.retentionRole === 'dropped') continue;
+    if (mapped.has(String(p.id))) continue;
+    const isDetail = p.retentionRole === 'detail';
+    issues.push({
+      severity: isDetail ? 'fail' : 'warn',
+      field: 'bodyPlans.mappedPointIds',
+      reason: isDetail
+        ? `详写点 ${p.id}（${p.claim}）未映射到任何 Body`
+        : `略写点 ${p.id}（${p.claim}）未映射到任何 Body；normalize 将自动补入`,
+    });
+  }
+  return issues;
+}
+
+/**
  * 机械 QA — 纯函数，不调 LLM
  */
 export function runMechanicalQa(
@@ -235,6 +273,9 @@ export function runMechanicalQa(
 
   // Soft: brief-only body at bodyCount=3 (does not fail; normalize merges)
   issues.push(...detectBriefOnlyBodyWarns(bodyPlans, plannerPayload));
+
+  // Coverage: unmapped detail point → fail; unmapped brief → warn (auto-fixed)
+  issues.push(...detectPointCoverageIssues(bodyPlans, plannerPayload));
 
   // 2. 每个 plan 的 step value 全空 + key 唯一
   const allKeys = new Set<string>();
@@ -333,13 +374,32 @@ export function normalizePlannerBodyPlans(
 ): BodyPlan[] {
   // Soft fix: 3 bodies where one is brief-only → merge into nearest detail body
   const merged = mergeBriefOnlyBodies(bodyPlans, plannerPayload || null);
-  const hydrated = hydrateBodyPlansFromPayload(merged, plannerPayload || null);
+  // Respect Step2 detail locks: don't leave detail points as minor / packed dual_point
+  const expanded = expandPackedDetailBodies(merged, plannerPayload || null);
+  const hydrated = hydrateBodyPlansFromPayload(expanded, plannerPayload || null);
+  // Coverage safety net: points the planner forgot get a synthesized block
+  appendMissingPointBlocks(hydrated, plannerPayload || null);
   for (const bp of hydrated) {
     // Theme heads (环境保护) must not sit in subClaim as fake 论点句.
     // Full claim sentences stay in subClaim as planning hints only —
     // Step3 stages them as pending for confirm (no silent board write).
     demoteThemeHeadSubClaims(bp?.paragraphPlan, bp);
     prefillClaimSlotsFromSubClaims(bp?.paragraphPlan); // no-op by design
+
+    // Body theme must reflect the blocks actually in this body — never a
+    // model-written leftover naming a point that lives elsewhere (or nowhere).
+    const blocks = Array.isArray(bp?.paragraphPlan?.pointBlocks)
+      ? bp.paragraphPlan.pointBlocks
+      : [];
+    const majorLabel = String(
+      (blocks.find((b: any) => String(b?.role || '') === 'major') || blocks[0])
+        ?.label || '',
+    ).trim();
+    const isGenericLabel =
+      /^(?:分论点|分点|略写补充|补充点)\s*\d*$/.test(majorLabel);
+    if (majorLabel && !isGenericLabel && !isClaimSentence(majorLabel)) {
+      bp.theme = majorLabel;
+    }
   }
   return hydrated;
 }
