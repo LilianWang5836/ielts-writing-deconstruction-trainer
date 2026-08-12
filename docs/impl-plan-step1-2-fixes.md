@@ -182,8 +182,10 @@
 - **P0 ✅ 已实施并复验（2026-08-12）**：Step3 下一问钳制——服务端在模型 P2 不指向真实 firstEmpty 时用规范问句覆盖（直接修发现 A 的 UX 瑕疵）。
   - `step3Quality.step3TextAsksConfirmedSlot(text, plan)`：命中"请先把「分论点」说具体一点"类已确认槽回退 → `detectStep3IllegalCoachText` 返回 `ask_confirmed_slot` → veto 到 firstEmpty 规范问句。
   - 单测 `scripts/replay-step3-next-ask-clamp.mjs`（5 断言）；tsc 0 错误；10 个纯函数 replay 全绿；Step3 e2e ALL PASS；真实旅程 t9 确认分论点后 P2 转向 firstEmpty（展开原因），未再回退已确认槽。提交：`test(journey)…镜像客户端 Step3 进度回写` + `fix(step3): P0 下一问钳制…`。
-- **P1**：`---` 分隔符缺失时跳过修复重试（文本充实即单段兜底 + fallback part2），全步降延迟（修发现 C）。
-- **P2**：③ merge ID 对齐（骨架锁已稳定块结构，旅程中标签合并非瓶颈，ROI 降低）；② userPoints 只读投影/flag 状态机（Step2 旅程正常，双写分叉是理论风险，可后置）。
+- **P1 ✅ 已实施（2026-08-12）**：`---` 分隔符缺失时跳过修复重试（文本充实即单段兜底 + fallback part2），全步降延迟（修发现 C）。提交 `7112353`。
+- **P2 ✅ 部分实施（2026-08-12）**：
+  - **P2a ✅ 已实施**：③ merge 按 pointBlock id 对齐——水合给 pointBlock 打 `mappedPointId` 稳定身份戳（位置绑定 + redirects 解析），`blockMatchesMappedPoint`/`pickPrimaryPointBlock`/`enforceFrameworkPointBlockCount` 优先按 id 匹配，label 文本降为兜底；`buildStep3FrameworkLedger` 携带解析后 id。单测 `scripts/replay-merge-by-id.mjs`（5 断言）。提交 `84b007f`。
+  - **P2b / P2c ⏳ 延后（明确理由）**：② userPoints 完全只读投影（停用反向同步 `applyRetentionRolesFromUserPoints`）与 flag 状态机集中化——这两项是**低 ROI 的大重构**：② 已让结构化 retentionRole 权威（文本只对未标注点补缺），实际"双写分叉"已消除，反向同步只服务于旧会话兼容；flag 状态机集中化是纯重构、无行为变化，回归风险高、收益不显。建议在有完整回归套件的新会话推进，且需迁移 `replay-checklist-walk-gate`/`replay-single-truth` 断言。
 
 ### ⚠️ 说明
 
