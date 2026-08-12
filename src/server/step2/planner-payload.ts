@@ -1484,7 +1484,12 @@ function claimKey(claim: string): string {
     .slice(0, 40);
 }
 
-/** Short dimension / topic head for merge (e.g. 人际关系). */
+/** Short dimension / topic head for merge (e.g. 人际关系 / AI 接管重复性劳动).
+ *  MUST handle English/number-leading labels ("AI 接管重复性劳动，工人转型…"
+ *  → head "AI 接管重复性劳动").  A label that starts with a Latin/digit token
+ *  must not fall through to the empty-string branch, otherwise the whole
+ *  sentence becomes the claim with empty elaboration and the point is dropped
+ *  as an "empty shell" (the Discussion/AI deadlock root cause). */
 export function dimensionHead(text: string): string {
   const t = stripRetentionTags(String(text || '').trim());
   const paren = t.match(/^([\u4e00-\u9fffA-Za-z0-9·、]{2,20})[（(]/);
@@ -1492,8 +1497,15 @@ export function dimensionHead(text: string): string {
   // Bare head or head with trailing empty already stripped
   const bare = t.match(/^([\u4e00-\u9fff·、]{2,20})$/);
   if (bare) return bare[1].trim();
-  const short = t.match(/^([\u4e00-\u9fff·、]{2,16})/);
-  return short ? short[1].trim() : '';
+  // short: 中文/英文/数字开头均可，遇到全角逗号/顿号/空格即停。
+  // 中文："相关人群可以利用通勤、午休等零散…" → head 前 16 字；
+  // 英文："AI 接管重复性劳动，工人转型…" → head "AI 接管重复性劳动"。
+  const short = t.match(/^([\u4e00-\u9fffA-Za-z0-9·、\s]{2,20})[，,；;。．]?/);
+  if (short) {
+    const head = short[1].trim();
+    if (head.length >= 2) return head;
+  }
+  return '';
 }
 
 /**
@@ -2302,7 +2314,11 @@ export function upsertPointsFromClaims(
       continue;
     }
 
-    if (!elab && dim && rawClaim === dim) continue; // empty shell
+    // Empty shell = a short bare dimension label (e.g. "人际关系") with no body.
+    // A long claim sentence must NOT be dropped even when elab is empty and
+    // rawClaim === dim (English-headed points like "AI 接管重复性劳动…" used
+    // to hit this guard and vanish → Discussion Step2 deadlock).
+    if (!elab && dim && rawClaim === dim && rawClaim.replace(/\s+/g, '').length < 12) continue;
     const minLen = /[\u4e00-\u9fff]/.test(rawClaim) ? 2 : CLAIM_MIN;
     const claim = dim || rawClaim;
     if (claim.length < minLen) continue;
