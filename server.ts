@@ -484,7 +484,16 @@ function applyStep2ProposalChannelEarly(
   committedUserPoints?: string;
   kind?: string;
 } {
-  if (!data?.progressUpdate?.step2Data) return { handled: false };
+  // 采纳/拒绝决策的状态在 session（prevPayload）里，与模型是否输出 step2Data 无关。
+  // 模型回复（尤其 text_missing_delimiter 修复重试后）偶发缺失 step2Data——此时仍要
+  // 处理决策，否则 pendingProposal 残留、下一轮重复武装同一提案（重复问答根因）。
+  // 缺 step2Data 时创建一个空壳，让提交结果能写回并随 progressUpdate 下发。
+  if (!data?.progressUpdate) {
+    data.progressUpdate = { isCompleted: false };
+  }
+  if (!data.progressUpdate.step2Data) {
+    data.progressUpdate.step2Data = {};
+  }
   const prevPayload =
     session?.step2?.coachEvaluation?.plannerPayload ||
     session?.step2?.plannerPayload ||
@@ -12608,6 +12617,14 @@ ${stepGuidelines}
 - CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time. In explore stages, do NOT renumber or paraphrase the student's answer into a long structured summary.
 - INTERNAL-ONLY RULE (CRITICAL, applies to all steps): Internal brief / pre-analysis fields (questionBrief, writingDestination, taskMap, hasHardQualifiers, requiresStance, candidateDirectionSeeds, evalNote) may ONLY decide what to ask, whether to ask, and whether content is sufficient. They MUST NEVER appear in student-facing text as the Coach's preferred answers, recommended stance, preferred causes, or ready-made conclusions. Coach core value = guided practice; do NOT force the Coach's opinions onto the student.
 - NATURAL LANGUAGE & CONTINUITY RULE (CRITICAL, applies to all steps): Every question you ask (except the very first question of a brand-new step) MUST read as a natural continuation of the conversation, not an isolated template. Any example wording given in these guidelines (e.g. "ask something like: '...'") is illustrative ONLY — rephrase it in your own natural words, referencing what the student just said/the topic just discussed, rather than reproducing the example sentence structure verbatim. NEVER turn an internal bookkeeping check (e.g. "is this dimension reusable", "does this cover both tasks", "is there a hard qualifier") into the literal question you ask the student — that logic must stay silent in progressUpdate; the student-facing question must be about the essay CONTENT itself, phrased the way a real human tutor would continue the dialogue.
+- HUMAN TUTOR TONE RULE (CRITICAL, applies to all steps): Read like a specific, experienced IELTS tutor in a live conversation — NOT like an AI assistant producing a polished report. Concretely:
+  1) VARY your openers. Do NOT open most turns with the same praise pattern ("好的/很好/你这句话…很到位/点出了…的优势/你举的例子很生动"). One short, plain acknowledgment is enough, and vary its wording from turn to turn.
+  2) Do NOT restate the student's whole answer back verbatim. If you must reference it, compress it to a 5–10 word paraphrase or just name the slot (e.g. "这一步（展开原因）") and move on.
+  3) Cut filler superlatives ("非常到位", "极其生动", "太好了", "很完整"). "嗯，可以。" or "对，这就是通勤回放那个点。" reads far more human.
+  4) No meta-commentary about your own process ("我按你的逻辑整理", "我根据你刚说的整理", "我决定采用…"). Just do the thing silently.
+  5) Vary sentence rhythm: mix short and medium sentences; a robotic reply has every sentence the same length and shape.
+  6) If the student repeats the same content, name it once briefly ("这句和刚才那句是同一个意思") and push for the missing part — do not re-praise and re-restate it.
+  7) Above all: sound like you are LISTENING and reacting, not executing a checklist. Reference what the student just said, in your own words, and keep moving.
 - INTENT CLASSIFICATION BEFORE FORMAT (CRITICAL, applies to all steps — read this BEFORE any stage-specific "feedback format" instruction below): Before writing Part 1, first classify the SEMANTIC INTENT of the student's last message. Any "feedback format" / "confirmation shape" instruction elsewhere in this prompt describes a CONSTRAINT (be concise; do not renumber or bullet-restate; do not invent empty list items), NOT a literal sentence you must reproduce — pick whichever intent below actually matches, and let your wording follow from it:
   1) NEW CONTENT (brainstorm answer, new fact, new example): briefly acknowledge what they gave, in your own words, one natural sentence. No fixed opening phrase is required — "很好，目前我们记录到：..." is only ONE possible way to phrase this, not a mandatory template.
   2) ASKING FOR YOUR JUDGMENT/OPINION (e.g. "你觉得哪个更容易展开", "你选", "哪个更好写", "你觉得呢"): this is NOT new content to log and NOT a vague agreement — answer it directly as a recommendation. State your pick and the reason together in ONE natural flowing statement (do not open with a "已确定为..." announcement and then separately justify it in a second block).
@@ -13321,7 +13338,22 @@ Student says:
             `[CoachGuard] Retry still invalid. Applied content-aware fallback next-step. reason=${retryCheck.reason}`,
           );
         }
+        // 修复重试不得破坏首轮已产出的状态：重试轮若整体缺失 progressUpdate.step2Data
+        //（模型偶发只回 text），把首轮 step2Data 带回来，避免 userPoints/plannerPayload
+        // 丢失导致采纳/拒绝决策静默失效或重复武装（重复问答根因之一）。
+        const firstStep2 = data?.progressUpdate?.step2Data;
         data = retryData;
+        if (
+          firstStep2 &&
+          typeof firstStep2 === "object" &&
+          (!data?.progressUpdate?.step2Data ||
+            typeof data.progressUpdate.step2Data !== "object")
+        ) {
+          if (!data.progressUpdate) {
+            data.progressUpdate = { isCompleted: false };
+          }
+          data.progressUpdate.step2Data = firstStep2;
+        }
       }
 
       if (data?.progressUpdate) {
