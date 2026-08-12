@@ -1338,6 +1338,7 @@ export function armNextProposal(params: {
     // its actual judgment, no prose reverse-parsing. Only trusted when at
     // least one detail label resolves onto this side's slots.
     const sug = params.retentionSuggestion;
+    let usedStructuredSuggestion = false;
     if (sug && Array.isArray(sug.detail) && sug.detail.length) {
       const sidePts =
         side === 'general' && isGeneralOnlyBoard(payload)
@@ -1378,6 +1379,7 @@ export function armNextProposal(params: {
             !mergeAlreadyRejected(payload, merge.proposalId) &&
             validateProposal(payload, merge).ok
           ) {
+            usedStructuredSuggestion = true;
             return merge;
           }
           // Merge target unresolvable (or already rejected): never let real
@@ -1402,8 +1404,19 @@ export function armNextProposal(params: {
             '来自教练评估方案',
           proposalId: `settle-${side}`,
         });
-        if (prop && validateProposal(payload, prop).ok) return prop;
+        if (prop && validateProposal(payload, prop).ok) {
+          usedStructuredSuggestion = true;
+          return prop;
+        }
       }
+    }
+    // 显式降级（文档 item5-4）：结构化 retentionSuggestion 提供了但本侧不可用
+    // （detail 为空 / 标签解析不到本侧槽位），将退回 prose/长度启发式——记录日志，
+    // 避免"静默退回"。
+    if (sug && !usedStructuredSuggestion) {
+      console.warn(
+        `[Step2Proposal] retentionSuggestion 退化未用（side=${side}），退回 prose/长度启发式：detail=${JSON.stringify(sug.detail || []).slice(0, 120)}`,
+      );
     }
     // Priority 2: parse the coach's narrated scheme from prose (compat).
     const fromCoach = params.coachText
