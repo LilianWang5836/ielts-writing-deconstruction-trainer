@@ -161,6 +161,27 @@
   - 新增 `scripts/replay-single-truth.mjs`（4 断言）；tsc + 全量 replay + Step2/Step3 e2e 通过。
   - ⚠️ 其余清理（`userPoints` 完全只读投影、flag 状态机集中化、`retentionSuggestion` 退化重试）仍为后续项。
 - **e2e 脚本修复**：`replay-e2e-step3-coverage.mjs` 的 coach 会话补传 `session.step2_5`（真实客户端行为），断言改为"active body 自身 mapped 点全覆盖"，消除对 planner 非确定性输出的依赖。
+- **② 收尾（部分）**（提交 `39b8529`）：`retentionSuggestion` 退化显式化——结构化建议提供但本侧不可用时记录 warn 日志，不再静默退回 prose/长度启发式（文档 item5-4）。纯观察性改动。
+
+### ⏳ 剩余收尾（需更谨慎的重构，建议在有完整 e2e 的新会话推进）
+
+- **②**：`userPoints` 完全只读投影（由结构化派生）、flag 状态机集中化（`settleAwaitingCustomSide / rejectedMergeIds / stanceConfirmResolved / sideSettled / stanceAwaitingCustom / declinedSlotClaims / capacityTrimDismissedSides / pendingProposal`）。
+- **③**：merge 按 pointBlock id 对齐（需把 `bodyPlans.mappedPointIds` 管线接入 `pickPrimaryPointBlock`/`blockMatchesMappedPoint`，当前 `framework` 只来自 clustering）、软守卫降级/退役。
+
+### 真实旅程发现（2026-08-12，`replay-full-journey.mjs`，本地 DeepSeek key）
+
+用本地 key 驱动了完整 Step1→Step2→Planner→Step3→Step4 真实交互（33 轮），结论：
+- **Step1/Step2 正常**：Step2 详略提案（详写在职人员/略写低龄学生）→ 采纳 → 角色锁定；立场提案 → 采纳 → 立场锁定（"线上不应完全取代线下，但可作为补充"）。提案通道 + 按钮白名单端到端工作。
+- **Planner 正常**：2 bodies、未降级。
+- **Step3 骨架 + 填槽协议工作**：分论点→原因→机制逐槽经 pendingText→「对」→写入看板推进；③ 骨架锁保持块结构稳定。**但发现真问题 A**：教练的自然语言下一问偶发**回退到已确认的槽**（t13 学生答了原因、教练却问"分论点"；t16 确认原因后教练又问"分论点"）——服务端看板正确，是模型 P2 偏离 firstEmpty。
+- **Step3 深度门槛按设计工作（B）**：对离题/泛泛的回答（如给"场景"而非"结果/影响"）持续追问，正确拒绝；模拟学生未能给出有效"影响"答案导致 Step3 22 轮未完成（脚本局限，非产品 bug）。
+- **发现 C**：DeepSeek 偶发省略 `---` 分隔符 → `text_missing_delimiter` 触发修复重试（额外延迟/成本）。
+- **发现 D**：`step3LastRejectCode` 正常出现（离题回答被硬拒）。
+
+**据此更新收尾优先级（按真实 ROI）**：
+- **P0**：Step3 下一问钳制——服务端在模型 P2 不指向真实 firstEmpty 时用规范问句覆盖（直接修发现 A 的 UX 瑕疵）。
+- **P1**：`---` 分隔符缺失时跳过修复重试（文本充实即单段兜底 + fallback part2），全步降延迟（修发现 C）。
+- **P2**：③ merge ID 对齐（骨架锁已稳定块结构，旅程中标签合并非瓶颈，ROI 降低）；② userPoints 只读投影/flag 状态机（Step2 旅程正常，双写分叉是理论风险，可后置）。
 
 ### ⚠️ 说明
 
