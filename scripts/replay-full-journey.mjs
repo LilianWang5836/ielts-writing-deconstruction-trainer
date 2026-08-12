@@ -230,31 +230,61 @@ function studentStep2(p2, session) {
 }
 
 let step3BodyIdx = 0;
+const step3RoleCount = {};
 function studentStep3(p2, session) {
   const payload = session.step2.coachEvaluation?.plannerPayload;
   const pending = payload?.pendingProposal;
   if (pending) return { text: '采纳', decision: { type: 'proposal', action: 'accept', proposalId: pending.proposalId } };
-  if (/确认|对吗|对吗？|可以吗|对不对|同意/.test(p2)) return { text: '对' };
-  if (/分论点|核心观点|论点|主张|观点句/.test(p2)) {
-    return '线上学习最大的优势是时间与空间上的灵活性，这让它非常适合在职和远程学习者。';
+  if (/确认|对吗|可以吗|对不对|同意|确认写入|点击.*确认/.test(p2)) return { text: '对' };
+  // 角色识别：影响/结果 优先于 场景（教练的「结果/影响」问句常带「比如」提示）。
+  // 正则要能接住教练的自然问法（"是如何…的 / 怎么操作 / 具体怎么利用"）。
+  let role = 'meta';
+  if (/分论点|核心观点|论点|主张|观点句/.test(p2)) role = 'claim';
+  else if (/原因|为什么|起因|通常意味着|怎么解决|如何解决/.test(p2)) role = 'reason';
+  else if (/机制|如何实现|怎么实现|通过什么|怎么发生|链条|具体是怎么|怎么操作|是利用|利用.*学习/.test(p2)) role = 'mechanism';
+  else if (/影响|结果|好处|作用|效果|最终|带来.*(什么|好处)/.test(p2)) role = 'impact';
+  else if (/场景|例子|举例|典型|人群|受益|具体做|做什么/.test(p2)) role = 'scenario';
+  const ANSWERS = {
+    claim: '线上学习最大的优势是时间与空间上的灵活性，这让它非常适合在职和远程学习者。',
+    reason: '因为线上课程把学习拆成了可以随时回放的单元，学生能完全按自己的节奏和通勤时间安排学习，打破了固定课表的限制。',
+    mechanism: '具体来说，平台把每节课切片成短课，学生下班后在家用手机就能回看，系统还会记录学习进度并推送复习提醒，从而让"随时可学"真正落地。',
+    scenario: '比如一位在职妈妈，每天通勤两小时，她可以在通勤路上用手机看回放、在地铁里做练习题，周末再集中完成作业，这就是线上学习的典型场景。',
+    impact: '这样一来，很多原本因为时间和地点限制无法接受教育的人都能持续学习，整体上提升了教育资源在不同人群中的可及性。',
+    meta: '这个分论点主要围绕线上学习的灵活性与可及性，先讲原因，再用一个具体场景来说明。',
+  };
+  const count = (step3RoleCount[role] = (step3RoleCount[role] || 0) + 1);
+  // 同一角色被再次追问：给更细的展开，而不是原句复读（避免死循环）。
+  if (role === 'claim' && count >= 2) {
+    return '我指的分论点是：线上学习不受时间和地点限制，在职和远程学习者都能按自己的节奏安排学习。';
   }
-  if (/原因|为什么|起因/.test(p2)) {
-    return '因为线上课程把学习拆成了可以随时回放的单元，学生能完全按自己的节奏和通勤时间安排学习，打破了固定课表的限制。';
+  if (role === 'impact' && count >= 2) {
+    return '长期看，过去因为上班或住得远而上不了课的人现在能稳定学下去，教育机会在不同人群间变得更公平了。';
   }
-  if (/机制|如何|怎么发生|通过什么|链条/.test(p2)) {
-    return '具体来说，平台把每节课切片成短课，学生下班后在家用手机就能回看，系统还会记录学习进度并推送复习提醒，从而让"随时可学"真正落地。';
+  // meta 兜底被重复命中：轮换给出实质内容，避免同一句复读。
+  if (role === 'meta' && count >= 2) {
+    const metaPool = [
+      '我觉得这个点可以这样展开：在职人员可以随时回放课程，把学习塞进通勤、午休这些零碎时间。',
+      '本质上就是：线上课程不受固定时间和教室的限制，学生想什么时候学、在哪里学都可以，所以特别适合在职和偏远地区的人。',
+    ];
+    return metaPool[(count - 2) % metaPool.length];
   }
-  if (/场景|例子|比如|举例|人群|受益/.test(p2)) {
-    return '比如一位在职妈妈，每天通勤两小时，她可以在通勤路上用手机看回放、在地铁里做练习题，周末再集中完成作业，这就是线上学习的典型场景。';
-  }
-  if (/影响|结果|好处|作用|效果/.test(p2)) {
-    return '这样一来，很多原本因为时间和地点限制无法接受教育的人都能持续学习，整体上提升了教育资源在不同人群中的可及性。';
-  }
-  return '这个分论点主要围绕线上学习的灵活性与可及性，先讲原因，再用一个具体场景来说明。';
+  return ANSWERS[role];
 }
 
+let step4Idx = 0;
 function studentStep4(p2) {
-  return 'Online learning offers learners the flexibility to study at their own pace, which makes education more accessible for working adults.';
+  if (/场景|例子|具体|通勤|午休|地铁|时刻|描述/.test(p2)) {
+    return 'During her daily two-hour commute, a working mother watches short video lectures on her phone and does practice questions on the subway, then finishes assignments on weekends.';
+  }
+  if (/主题句|topic|中心句|论点句/.test(p2)) {
+    return 'Online learning offers learners the flexibility to study at their own pace, which makes education more accessible for working adults.';
+  }
+  const pool = [
+    'Online learning offers learners the flexibility to study at their own pace, which makes education more accessible for working adults.',
+    'Working adults can fit study around their jobs because online courses are available anytime and anywhere.',
+  ];
+  step4Idx += 1;
+  return pool[step4Idx % pool.length];
 }
 
 // ---- 驱动一个 step 直到 isCompleted（限轮次）----
