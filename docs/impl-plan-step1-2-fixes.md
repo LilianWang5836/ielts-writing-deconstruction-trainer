@@ -179,7 +179,9 @@
 - **发现 D**：`step3LastRejectCode` 正常出现（离题回答被硬拒）。
 
 **据此更新收尾优先级（按真实 ROI）**：
-- **P0**：Step3 下一问钳制——服务端在模型 P2 不指向真实 firstEmpty 时用规范问句覆盖（直接修发现 A 的 UX 瑕疵）。
+- **P0 ✅ 已实施并复验（2026-08-12）**：Step3 下一问钳制——服务端在模型 P2 不指向真实 firstEmpty 时用规范问句覆盖（直接修发现 A 的 UX 瑕疵）。
+  - `step3Quality.step3TextAsksConfirmedSlot(text, plan)`：命中"请先把「分论点」说具体一点"类已确认槽回退 → `detectStep3IllegalCoachText` 返回 `ask_confirmed_slot` → veto 到 firstEmpty 规范问句。
+  - 单测 `scripts/replay-step3-next-ask-clamp.mjs`（5 断言）；tsc 0 错误；10 个纯函数 replay 全绿；Step3 e2e ALL PASS；真实旅程 t9 确认分论点后 P2 转向 firstEmpty（展开原因），未再回退已确认槽。提交：`test(journey)…镜像客户端 Step3 进度回写` + `fix(step3): P0 下一问钳制…`。
 - **P1**：`---` 分隔符缺失时跳过修复重试（文本充实即单段兜底 + fallback part2），全步降延迟（修发现 C）。
 - **P2**：③ merge ID 对齐（骨架锁已稳定块结构，旅程中标签合并非瓶颈，ROI 降低）；② userPoints 只读投影/flag 状态机（Step2 旅程正常，双写分叉是理论风险，可后置）。
 
