@@ -208,16 +208,20 @@ async function main() {
   console.log(`    active subpoint ${sp.id}: points=${JSON.stringify(sp.points)}`);
 
   // 3) Step3 kickoff 第一轮（学生回答论点槽）
+  // 真实客户端会把 session.step2_5（planner 产出）一并传给 coach；
+  // ① 守卫 buildStep3FrameworkLedger 依赖 session.step2_5.bodyPlans。
+  const coachSession = {
+    ...session,
+    step2_5: planner.step2_5,
+    step3,
+  };
   const resp = await postCoach({
     question: QUESTION,
     step: 3,
     userMessage: '网络普及让更多人能接触到线上课程，这就是一个原因。',
     messages: [{ sender: 'user', text: '网络普及让更多人能接触到线上课程，这就是一个原因。' }],
     stepContext: {},
-    session: {
-      ...session,
-      step3,
-    },
+    session: coachSession,
   });
 
   const plan = resp?.progressUpdate?.step3?.paragraphPlan ||
@@ -231,12 +235,32 @@ async function main() {
   console.log(`    Step3 plan blocks: ${blockLabels}`);
   console.log(`    coach part2: ${String(resp.text || '').split(/\n\s*---\s*\n/)[1] || ''}`.slice(0, 200));
 
-  check('Step3 骨架覆盖 mapped 的维度短语点（① 端到端生效）', () => {
-    const covered = (plan.pointBlocks || []).some((b) => {
-      const label = String(b.label || b.subClaim || '');
-      return label.includes('网络普及') || label.includes('线上');
-    });
-    assert.ok(covered, `点被丢：blocks=${blockLabels}`);
+  // 断言：当前 active body 自身的 mappedPoints 都必须被响应 plan 覆盖。
+  const activeBp = (planner.step2_5.bodyPlans || []).find(
+    (b) => String(b.id) === String(step3.activeSubpointId),
+  );
+  assert.ok(activeBp, '应能定位 active body 的 bodyPlan');
+  const activeMapped = Array.isArray(activeBp.mappedPoints)
+    ? activeBp.mappedPoints.map((p) => String(p || '').trim()).filter(Boolean)
+    : [];
+  const core = (t) =>
+    String(t || '')
+      .replace(/[（(][^（）()]*[）)]/g, '')
+      .replace(/详写|略写|放下|已选|保留-|用户放弃/g, '')
+      .trim();
+  check('Step3 骨架覆盖 active body 全部 mapped 点（① 端到端生效）', () => {
+    for (const mp of activeMapped) {
+      const covered = (plan.pointBlocks || []).some((b) => {
+        const label = core(String(b.label || b.subClaim || ''));
+        const mpc = core(mp);
+        return (
+          label &&
+          mpc &&
+          (label === mpc || label.includes(mpc) || mpc.includes(label))
+        );
+      });
+      assert.ok(covered, `active body mapped 点被丢：${mp}；blocks=${blockLabels}`);
+    }
   });
 
   console.log('\nE2E Step3 coverage: ALL PASS');

@@ -2492,6 +2492,10 @@ export function applyRetentionRolesFromUserPoints(
   if (!corpus.trim()) return points;
   return points.map((p) => {
     if (p.supersededBy) return p;
+    // ② 单一真相源：结构化 retentionRole 优先。userPoints 文本只对"未标注"的
+    // 点做补缺（兼容旧会话/文本先行），不再用可能过期或被污染的字符串覆盖
+    // 已确认的结构化角色（含 dropped）——消除"双写不同步"的分叉方向。
+    if (p.retentionRole) return p;
     const role = inferRetentionRoleFromText(
       p.claim,
       corpus,
