@@ -6,9 +6,9 @@
  * 运行前提：本地服务 3000 端口 + .env.local 已配 LLM key。
  * Run: npx tsx scripts/replay-full-journey.mjs
  *
- * 存档：对话记录按时间戳写入 docs/recorded-session-<时间戳>.txt（与项目记录
- * 同路径归档，保留多轮历史）；同时继续写 /tmp/journey-transcript.log 便于
- * 运行中实时 tail。
+ * 存档：对话记录按时间戳写入 docs/recorded-sessions/recorded-session-<时间戳>.txt
+ *（项目存档统一放 docs/recorded-sessions/，保留多轮历史）；同时继续写
+ * /tmp/journey-transcript.log 便于运行中实时 tail。
  */
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -21,9 +21,9 @@ const QUESTION =
 
 let turnCount = 0;
 const transcript = [];
-// 存档到项目 docs/（部署路径），时间戳精确到秒以便保留多轮历史
+// 存档到 docs/recorded-sessions/（项目测试对话记录统一目录），时间戳精确到秒以便保留多轮历史
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const docsDir = path.join(scriptDir, '..', 'docs');
+const docsDir = path.join(scriptDir, '..', 'docs', 'recorded-sessions');
 const stamp = new Date()
   .toISOString()
   .replace(/[-:T]/g, '')

@@ -200,7 +200,7 @@
 ### 📋 本次修改评估（2026-08-12）
 
 - **Step2 重复问答根因已修**：提案决策不再因 step2Data 缺失被丢弃（修复重试丢 step2Data 的连带问题），立场提案现只确认一次即进下一步（此前重复 3 次）。
-- **AI 味显著下降**：HUMAN TUTOR TONE RULE 后，教练反馈更简洁自然（复验记录 `recorded-session-20260812112958.txt`），Step3 逐槽确认推进。
+- **AI 味显著下降**：HUMAN TUTOR TONE RULE 后，教练反馈更简洁自然（复验记录 `docs/recorded-sessions/recorded-session-20260812112958.txt`），Step3 逐槽确认推进。
 - **P0/P1/P2a 全部落地并有确定性单测**：P0 下一问钳制（`replay-step3-next-ask-clamp`）、P1 跳修复重试、P2a merge 按 id 对齐（`replay-merge-by-id`）。
 - **验证面**：tsc 0 错误；纯函数 replay 11/11；Step3 e2e 断言修复后 3/3；多题型 e2e 3/3；真实旅程 Step1/Step2 完成、Step3 逐槽推进。
 - **剩余**：P2b/P2c（低 ROI 重构，延后）；Step3 模型偶发跳过确认（DECLARE-OR-EXPAND 遵循度，可加服务端启发式——留待后续）。

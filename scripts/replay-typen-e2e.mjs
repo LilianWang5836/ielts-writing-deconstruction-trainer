@@ -7,8 +7,9 @@
  * 每种题型：真实 planner 出 bodyPlans → 模拟客户端建 Step3 subpoints
  * （isClaimSentence 过滤）→ Step3 kickoff → 断言 paragraphPlan 存在且
  * active body 的 mapped points 被覆盖（① 守卫），以及 chat 无内部术语。
- * 并驱动一段迷你多轮对话，按题型存档到 docs/recorded-session-<题型>-<时间戳>.txt
- * （与 replay-full-journey 同路径，便于回看各题型真实教练交互）。
+ * 并驱动一段迷你多轮对话，按题型存档到
+ * docs/recorded-sessions/recorded-session-<题型>-<时间戳>.txt
+ *（项目测试对话记录统一目录，便于回看各题型真实教练交互）。
  *
  * Run（需本地服务 + LLM=DeepSeek）: npx tsx scripts/replay-typen-e2e.mjs
  */
@@ -19,9 +20,9 @@ import { fileURLToPath } from 'node:url';
 
 const BASE = process.env.PROBE_BASE_URL || 'http://localhost:3000';
 
-// ---- 存档：docs/recorded-session-<题型>-<时间戳>.txt ----
+// ---- 存档：docs/recorded-sessions/recorded-session-<题型>-<时间戳>.txt ----
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const docsDir = path.join(scriptDir, '..', 'docs');
+const docsDir = path.join(scriptDir, '..', 'docs', 'recorded-sessions');
 const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
 function archiveTranscript(slug, lines) {
   fs.mkdirSync(docsDir, { recursive: true });
