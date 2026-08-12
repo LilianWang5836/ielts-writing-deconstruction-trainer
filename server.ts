@@ -167,6 +167,15 @@ function parseAIResponse(text: string | undefined, defaultData: any = {}): any {
           text: textMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'),
         };
       }
+      // 纯文本兜底：DeepSeek 等 OpenAI 兼容端点偶发直接输出非 JSON 的教练文本。
+      // 仅当调用方默认数据带 text 字段（面向文本的调用，如 coach）时，
+      // 才把内容充实的原文作为教练消息，避免暴露 "Error parsing AI response."。
+      if (defaultData && typeof defaultData.text === "string") {
+        const prose = responseText.replace(/```/g, "").trim();
+        if (prose.length >= 20) {
+          return { ...defaultData, text: prose };
+        }
+      }
       return defaultData;
     }
   }
@@ -9587,18 +9596,40 @@ async function generateOpenAICompat(params: {
     .replace(/\/+$/, "");
   const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 
-  const messages = (Array.isArray(params.contents) ? params.contents : [])
-    .map((c: any) => {
+  // Normalize Gemini-style contents → OpenAI messages.
+  // contents 可能是字符串（多数 chat 路径直接传 prompt）或
+  // [{ role, parts:[{text}] }]（buildCoachRequest/buildIntentRequest/buildPlannerRequest）。
+  // 旧实现只处理数组，字符串会得到空 messages → DeepSeek 400 "Empty input messages"。
+  const rawContents = params.contents;
+  const messages: Array<{ role: string; content: string }> = [];
+  if (typeof rawContents === "string") {
+    const t = String(rawContents).trim();
+    if (t) messages.push({ role: "user", content: t });
+  } else if (Array.isArray(rawContents)) {
+    for (const c of rawContents) {
       const parts = Array.isArray(c?.parts) ? c.parts : [];
       const text = parts
         .map((p: any) => String(p?.text || ""))
         .join("")
         .trim();
-      if (!text) return null;
-      const role = c?.role === "assistant" ? "assistant" : "user";
-      return { role, content: text };
-    })
-    .filter(Boolean);
+      if (!text) continue;
+      const role =
+        c?.role === "assistant" || c?.role === "model"
+          ? "assistant"
+          : "user";
+      messages.push({ role, content: text });
+    }
+  }
+  // Gemini-style systemInstruction → OpenAI system message（放最前）。
+  const sys = String(params.config?.systemInstruction || "").trim();
+  if (sys) {
+    messages.unshift({ role: "system", content: sys });
+  }
+  if (!messages.length) {
+    throw new Error(
+      "OpenAI-compatible: empty contents — no message to send to LLM.",
+    );
+  }
 
   // max_tokens 上限：不同端点上限不同（DeepSeek deepseek-chat=8192，
   // OpenAI=16384）。调用方常传 32768（Gemini 用），超限会被端点 400 拒绝，
@@ -9645,6 +9676,9 @@ async function generateOpenAICompat(params: {
     data?.choices?.[0]?.message?.content || "",
   );
   return {
+    // 顶层 text：多数调用方用 response.text（Gemini GenerateContentResponse
+    // 自带 .text getter，OpenAI 兼容路径必须补上，否则 undefined）。
+    text: content,
     candidates: [{ content: { parts: [{ text: content }] } }],
   };
 }
