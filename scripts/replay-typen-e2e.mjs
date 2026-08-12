@@ -7,12 +7,48 @@
  * 每种题型：真实 planner 出 bodyPlans → 模拟客户端建 Step3 subpoints
  * （isClaimSentence 过滤）→ Step3 kickoff → 断言 paragraphPlan 存在且
  * active body 的 mapped points 被覆盖（① 守卫），以及 chat 无内部术语。
+ * 并驱动一段迷你多轮对话，按题型存档到 docs/recorded-session-<题型>-<时间戳>.txt
+ * （与 replay-full-journey 同路径，便于回看各题型真实教练交互）。
  *
  * Run（需本地服务 + LLM=DeepSeek）: npx tsx scripts/replay-typen-e2e.mjs
  */
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const BASE = process.env.PROBE_BASE_URL || 'http://localhost:3000';
+
+// ---- 存档：docs/recorded-session-<题型>-<时间戳>.txt ----
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const docsDir = path.join(scriptDir, '..', 'docs');
+const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+function archiveTranscript(slug, lines) {
+  fs.mkdirSync(docsDir, { recursive: true });
+  const file = path.join(docsDir, `recorded-session-${slug}-${stamp}.txt`);
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  return file;
+}
+
+function splitCoachText(text = '') {
+  const parts = String(text).split(/\n\s*---\s*\n/);
+  return {
+    p1: String(parts[0] || '').trim(),
+    p2: parts.length > 1 ? parts.slice(1).join('---').trim() : '',
+  };
+}
+
+// 主题无关的迷你模拟学生：用 active body 自己的 mapped point 作答（各题型素材自洽）。
+function studentReplyFor(p2, sp) {
+  const firstPoint =
+    Array.isArray(sp.points) && sp.points.length
+      ? sp.points[0]
+      : String(sp.content || '线上学习具有灵活性优势。');
+  if (/确认|对吗|可以吗|对不对|请点击.*确认|写入看板/.test(String(p2 || ''))) {
+    return '对';
+  }
+  return firstPoint;
+}
 
 async function postCoach(body) {
   const res = await fetch(`${BASE}/api/coach/chat`, {
@@ -359,20 +395,69 @@ async function runQuestionType(cfg) {
   const sp = step3.subpoints.find((s) => s.id === step3.activeSubpointId);
   if (!sp) return { name: cfg.name, ok: false, reason: 'no_active_subpoint' };
 
-  // 3) Step3 kickoff（真实客户端带 step2_5）
+  // 3) Step3 kickoff（真实客户端带 step2_5）+ 迷你多轮对话，按题型存档
   const coachSession = { ...session, step2_5: planner.step2_5, step3 };
+  const archiveLines = [
+    `# 多题型验证 · ${cfg.name} · ${new Date().toISOString()} · 真实 Planner+Step3（本地 DeepSeek）`,
+    `# 题目: ${QUESTION}`,
+    `# Planner: bodies=${bodyPlans.length} status=${planner.step2_5?.status} degraded=${planner.step2_5?.degraded}`,
+    `# 首段 mapped points（客户端 isClaimSentence 过滤后）: ${JSON.stringify(sp.points)}`,
+    '',
+    '## Step3 对话',
+  ];
+  const pushTurn = (user, data) => {
+    const { p1, p2 } = splitCoachText(data?.text);
+    archiveLines.push(`[学生] ${user}`);
+    if (p1) archiveLines.push(`[教练P1] ${p1}`);
+    if (p2) archiveLines.push(`[教练P2] ${p2}`);
+    const pl = data?.progressUpdate?.paragraphPlan;
+    if (pl && Array.isArray(pl.pointBlocks)) {
+      archiveLines.push(
+        `[plan] mode=${pl.mode} blocks=${pl.pointBlocks
+          .map((b) => String(b.label || b.subClaim || '').slice(0, 24))
+          .join(' | ')}`,
+      );
+    }
+    archiveLines.push('');
+  };
+
+  const messages = [{ sender: 'user', text: '我们开始写第一个主体段吧。' }];
   let resp;
   try {
     resp = await postCoach({
       question: QUESTION,
       step: 3,
       userMessage: '我们开始写第一个主体段吧。',
-      messages: [{ sender: 'user', text: '我们开始写第一个主体段吧。' }],
+      messages,
       stepContext: {},
       session: coachSession,
     });
   } catch (e) {
     return { name: cfg.name, ok: false, reason: `step3_http:${e.message}` };
+  }
+  pushTurn('我们开始写第一个主体段吧。', resp);
+
+  // 迷你多轮：学生用首段 mapped point 作答 → 教练确认/追问（最多 3 轮，逐轮容错）
+  for (let i = 0; i < 3; i++) {
+    const p2 = splitCoachText(resp?.text).p2;
+    const reply = studentReplyFor(p2, sp);
+    messages.push({ sender: 'user', text: reply });
+    try {
+      resp = await postCoach({
+        question: QUESTION,
+        step: 3,
+        userMessage: reply,
+        messages,
+        stepContext: {},
+        session: { ...session, step2_5: planner.step2_5, step3: resp?.progressUpdate ? step3 : step3 },
+      });
+    } catch (e) {
+      archiveLines.push(`[提示] 迷你对话第 ${i + 1} 轮中断：${e.message}`);
+      break;
+    }
+    pushTurn(reply, resp);
+    // 学生已确认（对）→ 说明确认协议走通，可提前结束
+    if (/^对$/.test(reply.trim())) break;
   }
 
   const plan = resp.progressUpdate?.paragraphPlan;
@@ -399,14 +484,16 @@ async function runQuestionType(cfg) {
   } else {
     console.log('  ✅ 通过：paragraphPlan 存在、块覆盖 active mapped 点、chat 无内部术语');
   }
+  const archived = archiveTranscript(cfg.slug, archiveLines);
+  console.log(`  已存档: ${path.basename(archived)}`);
   return { name: cfg.name, ok, reason: ok ? '' : `blocks=${blocks.length} jargon=${jargon.length} covered=${covered}` };
 }
 
 async function main() {
   const cfgs = [
-    { name: 'Agree/Disagree（在线学习）', makeSession: makeAgreeDisagreeSession },
-    { name: 'Discuss both views（AI）', makeSession: makeDiscussBothViewsSession },
-    { name: 'Problem/Solution（高糖食品）', makeSession: makeProblemSolutionSession },
+    { name: 'Agree/Disagree（在线学习）', slug: 'agree-disagree', makeSession: makeAgreeDisagreeSession },
+    { name: 'Discuss both views（AI）', slug: 'discussion', makeSession: makeDiscussBothViewsSession },
+    { name: 'Problem/Solution（高糖食品）', slug: 'problem-solution', makeSession: makeProblemSolutionSession },
   ];
   const results = [];
   for (const cfg of cfgs) {

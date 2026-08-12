@@ -1,0 +1,30 @@
+# 多题型验证 · Problem/Solution（高糖食品） · 2026-08-12T13:54:35.471Z · 真实 Planner+Step3（本地 DeepSeek）
+# 题目: The increasing consumption of sugar-rich foods and drinks is leading to serious health problems worldwide. What are the causes of this issue, and what solutions can be implemented to solve it?
+# Planner: bodies=2 status=passed degraded=false
+# 首段 mapped points（客户端 isClaimSentence 过滤后）: ["高糖食品消费过量导致肥胖和糖尿病激增"]
+
+## Step3 对话
+[学生] 我们开始写第一个主体段吧。
+[教练P1] 好，我们开始构建第一个主体段。你之前提到这个段落要论证“高糖食品消费过量导致肥胖和糖尿病激增”。我们先把这句话作为一个完整的论点句。你觉得这样说可以吗？还是想调整一下表达？
+[教练P2] 继续推进「高糖食品消费的原因」：请先回答这一步「分论点」的具体内容。
+[plan] mode=single_point blocks=高糖食品消费的原因
+
+[学生] 高糖食品消费过量导致肥胖和糖尿病激增
+[教练P1] 好的，我们开始构建第一个主体段的逻辑链。你这句话“高糖食品消费过量导致肥胖和糖尿病激增”就是本段的分论点。接下来我们要把它的论证过程一步步补完整。
+[教练P2] 先来想第一步：为什么高糖食品消费会过量？背后有哪些具体原因？比如，是因为方便食品和含糖饮料太普及，还是因为人们缺乏营养知识？
+[plan] mode=single_point blocks=高糖食品消费的原因
+
+[学生] 高糖食品消费过量导致肥胖和糖尿病激增
+[教练P1] 我按你的逻辑整理如下（关联紧密的多层可写在一起，未刻意删减）：
+高糖食品消费过量导致肥胖和糖尿病激增
+
+如果你觉得符合你的意思，请点击下方的【确认】按钮写入看板。
+[plan] mode=single_point blocks=高糖食品消费的原因
+
+[学生] 高糖食品消费过量导致肥胖和糖尿病激增
+[教练P1] 我按你的逻辑整理如下（关联紧密的多层可写在一起，未刻意删减）：
+高糖食品消费过量导致肥胖和糖尿病激增
+
+如果你觉得符合你的意思，请点击下方的【确认】按钮写入看板。
+[plan] mode=single_point blocks=高糖食品消费的原因
+

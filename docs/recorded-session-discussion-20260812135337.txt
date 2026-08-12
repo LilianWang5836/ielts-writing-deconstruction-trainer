@@ -1,0 +1,28 @@
+# 多题型验证 · Discuss both views（AI） · 2026-08-12T13:54:10.177Z · 真实 Planner+Step3（本地 DeepSeek）
+# 题目: With the rapid development of Artificial Intelligence (AI), some think it will bring more benefits to workers, while others fear it will cause widespread unemployment. Discuss both views and give your opinion.
+# Planner: bodies=2 status=passed degraded=false
+# 首段 mapped points（客户端 isClaimSentence 过滤后）: ["AI 提升生产力并催生新型高价值岗位"]
+
+## Step3 对话
+[学生] 我们开始写第一个主体段吧。
+[教练P1] 好的，我们开始构建第一个主体段。你的分论点是：**AI 提升生产力并催生新型高价值岗位**。这是一个单一观点，我们打算用一条逻辑链来展开：先明确分论点，再解释原因，接着给出具体机制，最后说明影响。
+
+我们先来明确分论点：用你自己的话，把这句话说得更具体一点——AI 到底是怎么提升生产力、又催生了哪些新型高价值岗位？
+[教练P2] 继续推进「AI 提升生产力并创造新岗位」：请先回答这一步「分论点」的具体内容。
+
+[学生] AI 提升生产力并催生新型高价值岗位
+[教练P1] 我们继续。
+[教练P2] 请先把「分论点」说具体一点。
+[plan] mode=single_point blocks=AI 提升生产力并创造新岗位
+
+[学生] AI 提升生产力并催生新型高价值岗位
+[教练P1] 好的，我们开始构建第一个主体段。你的分论点是。
+
+我们先来明确一下这个分论点的具体表述。你可以把它说得更完整一些，比如：AI 接管重复性劳动后，工人转向创意和协作型工作，从而提升整体生产力。你觉得这个表述准确吗？或者你有自己的说法？
+[教练P2] 请把你的分论点用一句完整的话告诉我。
+
+[学生] AI 提升生产力并催生新型高价值岗位
+[教练P1] 好的，我们开始构建第一个主体段。你选定的分论点是。这句话本身已经是一个完整的观点句，可以作为分论点。接下来，我们需要展开论证：为什么 AI 能提升生产力并创造新岗位？具体机制是什么？请想一想，AI 具体是如何做到这一点的？比如，它替代了哪些工作，又创造了哪些新机会？
+[教练P2] 继续推进「AI 提升生产力并创造新岗位」：请先回答这一步「分论点」的具体内容。
+[plan] mode=single_point blocks=AI 提升生产力并创造新岗位
+
