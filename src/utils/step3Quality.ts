@@ -695,6 +695,106 @@ export function mergeParagraphPlanPreserveBlocks(prevPlan: any, nextPlan: any): 
   };
 }
 
+function frameworkLabelCore(text: string): string {
+  return String(text || '')
+    .replace(/[（(][^（）()]*[）)]/g, '')
+    .replace(/详写|略写|放下|已选|保留-|用户放弃/g, '')
+    .trim();
+}
+
+function frameworkLabelsMatch(a: string, b: string): boolean {
+  const x = frameworkLabelCore(a);
+  const y = frameworkLabelCore(b);
+  if (x.length < 2 || y.length < 2) return false;
+  return (
+    x === y ||
+    x.includes(y) ||
+    y.includes(x) ||
+    (x.length >= 4 && y.includes(x.slice(0, 4))) ||
+    (y.length >= 4 && x.includes(y.slice(0, 4)))
+  );
+}
+
+/**
+ * The paragraph's framework (subpoint.points + pointRoles, planner-derived
+ * ledger) is the block authority — the coach LLM may narrate a paragraph with
+ * fewer angles (e.g. still believing its own "网络普及不独立成段" story from
+ * Step2 prose) and emit a plan that silently drops a mapped point's block.
+ * Append a synthesized block for every non-dropped framework point that no
+ * block represents. Returns the labels appended.
+ */
+export function ensureParagraphPlanCoversFrameworkPoints(
+  plan: any,
+  subpoint: any,
+): string[] {
+  if (!plan || !Array.isArray(plan.pointBlocks) || !plan.pointBlocks.length) {
+    return [];
+  }
+  const points: string[] = Array.isArray(subpoint?.points)
+    ? subpoint.points.map((p: any) => String(p || '').trim()).filter(Boolean)
+    : [];
+  if (!points.length) return [];
+  const roleOf = new Map<string, string>();
+  (Array.isArray(subpoint?.pointRoles) ? subpoint.pointRoles : []).forEach(
+    (r: any) => {
+      const key = frameworkLabelCore(String(r?.point || ''));
+      if (key) roleOf.set(key, String(r?.role || '').trim());
+    },
+  );
+
+  const appended: string[] = [];
+  for (const point of points) {
+    const role = roleOf.get(frameworkLabelCore(point)) || '';
+    if (role === 'dropped' || role === 'drop') continue;
+    const represented = plan.pointBlocks.some(
+      (b: any) =>
+        frameworkLabelsMatch(String(b?.label || ''), point) ||
+        frameworkLabelsMatch(String(b?.subClaim || ''), point),
+    );
+    if (represented) continue;
+    const bid = `fw-${plan.pointBlocks.length + 1}-${frameworkLabelCore(point).slice(0, 6)}`;
+    const isDetail = role === 'detail';
+    plan.pointBlocks.push({
+      id: bid,
+      label: frameworkLabelCore(point) || point,
+      subClaim: '',
+      role: isDetail ? 'major' : 'minor',
+      expansionStrategy: isDetail ? 'mechanism' : 'explanation',
+      steps: isDetail
+        ? [
+            {
+              key: `${bid}_s1`,
+              label: '分论点',
+              placeholder: '确认本段核心主张',
+              value: '',
+            },
+            {
+              key: `${bid}_s2`,
+              label: '展开原因',
+              placeholder: '解释这个主张为什么成立',
+              value: '',
+            },
+            {
+              key: `${bid}_s3`,
+              label: '典型场景',
+              placeholder: '举一个具体场景或例子',
+              value: '',
+            },
+          ]
+        : [
+            {
+              key: `${bid}_s1`,
+              label: '补充点',
+              placeholder: '用一两句带过此略写点',
+              value: '',
+            },
+          ],
+    });
+    appended.push(frameworkLabelCore(point) || point);
+  }
+  return appended;
+}
+
 /** Body N is selectable only when all prior bodies are genuinely completed. */
 export function canSelectSubpoint(subpoints: any[], targetId: string): boolean {
   const idx = subpoints.findIndex((sp) => sp.id === targetId);
