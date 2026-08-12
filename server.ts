@@ -13292,7 +13292,32 @@ Student says:
         console.warn(
           `[CoachGuard] Response requires repair. reason=${firstCheck.reason}`,
         );
-        const correctionSuffix = `
+
+        // P1（发现 C）：`---` 分隔符缺失（text_missing_delimiter）但文本本身充实
+        // （真实教练消息，非空/非解析失败兜底）时，跳过修复重试——用单段文本作为
+        // part1、服务端 fallbackNextStep 生成 part2，省一次 LLM 调用，且保留首轮
+        // progressUpdate（避免 step2Data 丢失）。仅限"缺分隔符"这一种纯格式缺陷；
+        // 空文本/part2 过短等仍需重试。
+        const rawTextForP1 = String(data?.text || "").trim();
+        const p1SingleBlockSubstantive =
+          firstCheck.reason === "text_missing_delimiter" &&
+          rawTextForP1.length >= 12 &&
+          !/^Error parsing AI response\./.test(rawTextForP1);
+        if (p1SingleBlockSubstantive) {
+          const p1Part2 = fallbackNextStep(
+            currentStepNum,
+            session,
+            data?.progressUpdate?.step2Data,
+          );
+          data.text = `${rawTextForP1}\n\n---\n\n${p1Part2}`;
+          if (!data.progressUpdate) {
+            data.progressUpdate = { isCompleted: false };
+          }
+          console.warn(
+            "[CoachGuard] P1: text_missing_delimiter but substantive — skipped repair retry; server part2 attached.",
+          );
+        } else {
+          const correctionSuffix = `
 
 [SYSTEM CORRECTION]
 你的上一次输出存在格式或推进缺陷（reason=${firstCheck.reason}）。
@@ -13353,6 +13378,7 @@ Student says:
             data.progressUpdate = { isCompleted: false };
           }
           data.progressUpdate.step2Data = firstStep2;
+        }
         }
       }
 
