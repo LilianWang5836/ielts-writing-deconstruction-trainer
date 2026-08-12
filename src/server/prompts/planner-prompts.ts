@@ -54,35 +54,31 @@ export const STRATEGY_TABLE: Record<string, StrategyDef[]> = {
   'Advantages / Disadvantages': [
     {
       name: 'advantage_outweighs',
-      description: '承认存在缺点，但优点更重要',
+      description: '承认存在缺点，但优点更重要；段数按详写主线动态取 2 或 3',
       appliesWhen: '优势材料明显多于/强于劣势材料',
       argumentRelation: 'concedes',
       layoutPattern: 'concession_then_support',
-      bodyCount: 2,
     },
     {
       name: 'disadvantage_outweighs',
-      description: '承认存在优点，但缺点影响更大',
+      description: '承认存在优点，但缺点影响更大；段数按详写主线动态取 2 或 3',
       appliesWhen: '劣势材料明显多于/强于优势材料',
       argumentRelation: 'concedes',
       layoutPattern: 'concession_then_support',
-      bodyCount: 2,
     },
     {
       name: 'different_stakeholders',
-      description: '不同群体受不同影响（如政府 vs 普通人）',
+      description: '不同群体受不同影响（如政府 vs 普通人）；段数按详写主线动态取 2 或 3',
       appliesWhen: '材料涉及多个利益相关方，影响方向不同',
       argumentRelation: 'side_by_side',
       layoutPattern: 'side_by_side',
-      bodyCount: 2,
     },
     {
       name: 'different_situations',
-      description: '不同环境/年龄段/时代下影响不同',
+      description: '不同环境/年龄段/时代下影响不同；段数按详写主线动态取 2 或 3',
       appliesWhen: '材料在不同条件下表现差异明显',
       argumentRelation: 'side_by_side',
       layoutPattern: 'side_by_side',
-      bodyCount: 2,
     },
   ],
   'Discuss Both Views': [
@@ -270,7 +266,8 @@ ${pointsBlock}
 - 哪些是 ready（有场景/机制）/ thin；哪些是 详写(detail) / 略写(brief) / 放下(dropped)
 - 标签桶是否满足题型硬性要求
 - Agree/Disagree 且 strength=full：允许双主段 thematic_split，不必强行让步段
-- Discuss Both / 利弊：两侧桶都必须落入不同 Body
+- Discuss Both / 利弊【分桶硬约束】：A 侧（优点/View A）与 B 侧（缺点/View B）的材料不得落入同一 Body（跨侧不混段）。
+  这不等于 bodyCount 必须为 2。同侧可以有多个 Body，也可以 dual_point 并段。
 
 【第2步：选择论证策略】
 可选策略（仅限以下，不可编造；策略名只决定段间关系，不决定段数）：
@@ -279,15 +276,19 @@ ${strategyBlock}
 决策规则：
 ① 题型要求（${input.questionType}）
 ② 是否需要明确立场（${input.requiresStance ? '是' : '否'}）+ polarity/strength
-③ points 强弱、retentionRole（详写/略写）、标签桶
+③ points 强弱、retentionRole（详写/略写）、标签桶 —— 用户已确认的详写/略写是硬输入，禁止静默改标
 ④ 观点之间的逻辑关系（支持/让步/并列/因果/问题→解决）
-⑤ Body Count（必须动态判断 2 或 3，禁止因策略名而默认永远 2）：
-   - 先看「详写 + ready」能否各自支撑一段；再看略写是否必须单独成段
-   - 详写优先各自成 Body；略写默认合并进主题最近的详写 Body（作 supporting / dual_point），不要仅为略写硬开第三段
-   - 仅当存在 ≥3 条互不从属、均可独立展开的主线（多为 3 条详写，或 Problem→Cause→Solution / Discuss Both+个人立场需要三段）时选 bodyCount=3
-   - 2 详写 + 1 略写 → 通常 bodyCount=2（略写并进相关段）
+⑤ Body Count（必须按「可展开主线数量 + 篇幅 + 立场一致性」动态判断 2 或 3；禁止因利弊/side_by_side 默认永远 2）：
+   - 先数 retentionRole=detail 且主题互不从属、可独立展开的主线
+   - 详写点优先各自成 Body；略写默认并入同侧最近的详写 Body（dual_point / supporting）
+   - 利弊/Discuss Both 合法示例：
+     · 优 2 详写 + 劣 1 详写 → 优先 bodyCount=3（优/优/劣）；仅当材料明显偏薄才考虑把同侧两点并一段
+     · 优 2 + 劣 2 → 可为 3（例如两优各一段、两劣并一段）等，只要跨侧不混
+     · 优 1 + 劣 1 → 通常 bodyCount=2
+   - 需要立场时：立场侧应更厚（更多/更长 Body），让步侧可短；FORBIDDEN 为「左右对称」把主侧详写压成 minor
    - 未标详略时：按 ready 点是否主题独立推断，并在 rationale 注明「未标详略，按可写点推断」
-   - FORBIDDEN：只因为策略是 concession / partial_agreement 就固定 bodyCount=2
+   - FORBIDDEN：只因为策略是 concession / partial_agreement / side_by_side / 利弊题就固定 bodyCount=2
+   - FORBIDDEN：把用户已标 detail 的点降成 brief/minor 来凑 2 段
    - 在 rationale 用中文说明为何选 2 或 3（引用 point id 与详略）
 
 输出 YAML：
@@ -296,7 +297,7 @@ stance: agree|disagree|balanced|not_required
 argumentStrategy: ${strategies.map(s => s.name).join('|')}
 argumentRelation: supports|concedes|side_by_side|causal|solves|parallel
 layoutPattern: support|concession_then_support|side_by_side|problem_solution|causal|parallel
-bodyCount: 2|3   # 按上方材料动态填写，勿套死值
+bodyCount: 2|3   # 按上方材料动态填写，勿套死值；side_by_side ≠ 必须 2
 \`\`\`
 
 【第3步：分配材料到 Body】
@@ -307,10 +308,10 @@ bodyCount: 2|3   # 按上方材料动态填写，勿套死值
   - 仅当 mapped claim 已是完整主张句时，才写入 subClaim（完整句）
   - 若 mapped claim 只是主题词/维度头（如「环境保护」「人际关系」），把词放进 pointBlock.label 或 body theme，subClaim 留空——Step3 会先让学生确认论点句
   - FORBIDDEN：把主题词当成 subClaim 假装论点已完成
-- 详写点优先独占 Body；略写点合并为 Supporting Points / 同一 Body 的次要 pointBlock（dual_point）
+- 详写点优先独占 Body；仅略写点合并为 Supporting Points / 同一 Body 的次要 pointBlock（dual_point）
 - dropped 点不要映射进 Body
 - 详略与 pointBlock.role：
-  - 详写主线 → pointBlock.role = "major"
+  - retentionRole=detail → pointBlock.role 必须是 "major"（禁止打成 minor）
   - 并入的略写点 → pointBlock.role = "minor"（supporting）
 
 输出 YAML：
