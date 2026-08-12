@@ -23,6 +23,7 @@ import {
   promoteAcknowledgedStep3DraftTarget,
   promoteAcknowledgedFlatStep3Target,
   ensureParagraphPlanCoversFrameworkPoints,
+  enforceStep3SkeletonLock,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 import {
@@ -7514,6 +7515,26 @@ function buildStep3FrameworkLedger(
 }
 
 /**
+ * ③ 权威骨架：当前 active body 对应的 planner bodyPlans.paragraphPlan
+ * （含 pointBlocks）。用于把教练回合返回的 plan 对齐到 planner 骨架。
+ */
+function buildStep3Skeleton(session: any, activeSp: any): any | null {
+  const bodyPlans = session?.step2_5?.bodyPlans;
+  if (!Array.isArray(bodyPlans)) return null;
+  const rawId = String(activeSp?.id || '').trim();
+  const idxMatch = rawId.match(/^body-?(\d+)$/i);
+  const bp =
+    bodyPlans.find((b: any) => String(b?.id || '') === rawId) ||
+    (idxMatch ? bodyPlans[Number(idxMatch[1]) - 1] : undefined) ||
+    bodyPlans[0];
+  const plan = bp?.paragraphPlan;
+  if (plan && Array.isArray(plan.pointBlocks) && plan.pointBlocks.length) {
+    return plan;
+  }
+  return null;
+}
+
+/**
  * Step 3 confirm-then-write state machine (LLM ask+eval / server write+flow):
  * 1) Freeze confirmed slots; clear all unconfirmed (ignore model prefill).
  * 2) Pending from validated step3SlotEval.pendingText (1 slot) or pendingDrafts
@@ -7577,6 +7598,18 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
+    // ③ 骨架硬传承：把模型回合返回的 plan 对齐到 planner 骨架（bodyPlans pointBlocks）。
+    // 块级结构性 diff（增删块/改序/改角色）一律拒收；仅允许 value 级修改。
+    const skeleton = buildStep3Skeleton(session, activeSp);
+    if (skeleton) {
+      const rejectedBlocks = enforceStep3SkeletonLock(plan, skeleton);
+      if (rejectedBlocks > 0) {
+        console.warn(
+          `[Step3SkeletonLock] Rejected ${rejectedBlocks} structural-diff pointBlock(s) from coach turn (planner skeleton is frozen).`,
+        );
+      }
+      data.progressUpdate.paragraphPlan = plan;
+    }
     // Framework coverage: the planner ledger (bodyPlans.mappedPointIds +
     // plannerPayload.points[].retentionRole) is block authority — append a block
     // for any mapped point the coach's plan silently dropped (e.g. narrating an
@@ -12490,6 +12523,7 @@ ${memoryDigestStr}
   - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
   - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`subClaim\` is planning only — does NOT write the board. First pointBlock step must be a claim slot (分论点/核心观点).
   - CRITICAL — KICKOFF / FIRST PLANNING TURN: ALL \`steps[].value\` empty. firstEmpty MUST be the claim slot when it is empty — never skip to 展开原因. Theme heads (人际关系) are labels only. DEFAULT: mode=expand — seed a question from Step2 toward a full 论点句 (NOT「为什么」as a reason ask; NOT「分论点已确立」). Only if a full claim sentence is already especially complete may you mode=confirm on the claim slot. FORBIDDEN: rubber-stamp whole chain; FORBIDDEN: confirm 原因/机制 on kickoff while claim empty.
+  - CRITICAL — FROZEN SKELETON (③ 骨架硬传承): When a \`paragraphPlan\` is already present (seeded from the Step2 Planner's bodyPlans), its \`pointBlocks\` are the AUTHORITATIVE skeleton. You MUST NOT add, remove, rename, or reorder pointBlocks, and MUST NOT change a block's \`role\` (major/minor) or \`expansionStrategy\`. You may only fill \`steps[].value\` (and do a single per-slot label reclass within a block when allowed). If the student wants a different body/point structure, do NOT edit the blocks yourself — the server handles re-planning via the structure-change flow; you only acknowledge and let them request it.
   - CRITICAL — ANTI-REDUNDANT CONFIRMS: Do not slice one Step2 idea into multiple near-duplicate confirm sentences. Each confirm must add a new argument layer (e.g. claim = conclusion; reason = why; mechanism = how).
   - CRITICAL — STUCK / 「不知道」: One short Step2 clue or narrower follow-up; then let them speak before confirm.
   - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, guide【确认】button (do NOT ask them to reply「对」in text); micro-edits go in the input. After they confirm, NEXT reply asks the next empty beat (expand or confirm based on remaining material).

@@ -702,6 +702,79 @@ function frameworkLabelCore(text: string): string {
     .trim();
 }
 
+/**
+ * ③ 骨架硬传承：把模型回合返回的 paragraphPlan 对齐到权威骨架（planner bodyPlans
+ * 的 pointBlocks）。块级结构（id/label/role/expansionStrategy/顺序）以骨架为准；
+ * 块内 steps 以骨架为基础、叠加模型对同 key 的 value/status/label 修改，
+ * 模型新增的步骤 key 允许追加（支持槽内 reclass/合并）。
+ * 模型结构性 diff（新增/删除块、改块顺序/角色）一律拒收。
+ * 返回被拒收的模型块数量（>0 表示发生结构性 diff）。
+ */
+export function enforceStep3SkeletonLock(
+  plan: any,
+  skeleton: any,
+): number {
+  if (
+    !plan ||
+    !skeleton ||
+    !Array.isArray(skeleton.pointBlocks) ||
+    !skeleton.pointBlocks.length
+  ) {
+    return 0;
+  }
+  if (!Array.isArray(plan.pointBlocks)) {
+    plan.pointBlocks = skeleton.pointBlocks.map((b: any) => ({ ...b }));
+    return 0;
+  }
+
+  const skeletonBlocks = skeleton.pointBlocks;
+  const planById = new Map<string, any>();
+  plan.pointBlocks.forEach((b: any, i: number) => {
+    const id = String(b?.id || '').trim();
+    if (id) planById.set(id, b);
+    else planById.set(`__idx_${i}`, b);
+  });
+
+  const aligned: any[] = [];
+  skeletonBlocks.forEach((skel: any, i: number) => {
+    const id = String(skel?.id || '').trim();
+    const modelBlock = (id && planById.get(id)) || planById.get(`__idx_${i}`);
+    // 骨架 steps 为基础，叠加模型同 key 的修改；模型新增 key 允许追加。
+    const skeletonSteps = Array.isArray(skel?.steps) ? skel.steps : [];
+    const modelSteps = Array.isArray(modelBlock?.steps) ? modelBlock.steps : [];
+    const modelByKey = new Map<string, any>(
+      modelSteps.map((s: any) => [String(s?.key || ''), s]),
+    );
+    const steps = skeletonSteps.map((s: any) => {
+      const key = String(s?.key || '');
+      const m = key ? modelByKey.get(key) : undefined;
+      return m ? { ...s, ...m } : { ...s };
+    });
+    const seen = new Set(steps.map((s: any) => String(s?.key || '')));
+    modelSteps.forEach((m: any) => {
+      const key = String(m?.key || '');
+      if (key && !seen.has(key)) {
+        steps.push({ ...m });
+        seen.add(key);
+      }
+    });
+    aligned.push({ ...skel, steps });
+  });
+
+  // 模型新增的块（骨架里没有）→ 拒收
+  let rejected = 0;
+  plan.pointBlocks.forEach((b: any) => {
+    const id = String(b?.id || '').trim();
+    const isSkeleton = skeletonBlocks.some((s) => {
+      const sid = String(s?.id || '').trim();
+      return Boolean(id && sid && id === sid);
+    });
+    if (!isSkeleton) rejected += 1;
+  });
+  plan.pointBlocks = aligned;
+  return rejected;
+}
+
 function frameworkLabelsMatch(a: string, b: string): boolean {
   const x = frameworkLabelCore(a);
   const y = frameworkLabelCore(b);
