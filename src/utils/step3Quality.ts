@@ -723,24 +723,46 @@ function frameworkLabelsMatch(a: string, b: string): boolean {
  * Append a synthesized block for every non-dropped framework point that no
  * block represents. Returns the labels appended.
  */
+/** One entry of the Step2→Step3 planner ledger (bodyPlans.mappedPointIds +
+ * plannerPayload.points[].retentionRole). label 可含维度短语（非完整句）。 */
+export interface Step3FrameworkLedgerEntry {
+  label: string;
+  /** detail | brief | dropped（来自 Step2Point.retentionRole）。 */
+  role?: string;
+}
+
 export function ensureParagraphPlanCoversFrameworkPoints(
   plan: any,
   subpoint: any,
+  frameworkLedger?: Step3FrameworkLedgerEntry[] | null,
 ): string[] {
   if (!plan || !Array.isArray(plan.pointBlocks) || !plan.pointBlocks.length) {
     return [];
   }
-  const points: string[] = Array.isArray(subpoint?.points)
-    ? subpoint.points.map((p: any) => String(p || '').trim()).filter(Boolean)
-    : [];
-  if (!points.length) return [];
+  // 数据源优先级：planner 账本（bodyPlans.mappedPointIds/mappedPoints +
+  // retentionRole）→ 旧路径 subpoint.points（会被客户端 isClaimSentence 滤空）。
+  let points: string[] = [];
   const roleOf = new Map<string, string>();
-  (Array.isArray(subpoint?.pointRoles) ? subpoint.pointRoles : []).forEach(
-    (r: any) => {
-      const key = frameworkLabelCore(String(r?.point || ''));
-      if (key) roleOf.set(key, String(r?.role || '').trim());
-    },
-  );
+  if (Array.isArray(frameworkLedger) && frameworkLedger.length) {
+    for (const e of frameworkLedger) {
+      const label = String(e?.label || '').trim();
+      if (!label) continue;
+      points.push(label);
+      const role = String(e?.role || '').trim();
+      if (role) roleOf.set(frameworkLabelCore(label), role);
+    }
+  } else {
+    points = Array.isArray(subpoint?.points)
+      ? subpoint.points.map((p: any) => String(p || '').trim()).filter(Boolean)
+      : [];
+    (Array.isArray(subpoint?.pointRoles) ? subpoint.pointRoles : []).forEach(
+      (r: any) => {
+        const key = frameworkLabelCore(String(r?.point || ''));
+        if (key) roleOf.set(key, String(r?.role || '').trim());
+      },
+    );
+  }
+  if (!points.length) return [];
 
   const appended: string[] = [];
   for (const point of points) {

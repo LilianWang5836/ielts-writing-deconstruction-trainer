@@ -62,6 +62,7 @@ import {
   preserveLockedRetentionInUserPoints,
   stripForgedRetentionLocks,
   resolveNextSideWalkStep,
+  resolvePointId,
   resolveProposedClaimAgainstBoard,
   resolveSlotAddDecision,
   settleSideRetentionAfterAccept,
@@ -7453,6 +7454,57 @@ function enforceStep3LogicCompletion(
 }
 
 /**
+ * Planner-ledger (bodyPlans.mappedPointIds + plannerPayload.points[].retentionRole)
+ * for the active body — the authoritative framework source for Step3 coverage.
+ * Returns null when the planner ledger is unavailable (fall back to subpoint.points).
+ */
+function buildStep3FrameworkLedger(
+  session: any,
+  activeSp: any,
+): { label: string; role: string }[] | null {
+  const bodyPlans = session?.step2_5?.bodyPlans;
+  const plannerPayload =
+    session?.step2?.coachEvaluation?.plannerPayload ||
+    session?.step2?.plannerPayload;
+  if (!Array.isArray(bodyPlans) || !Array.isArray(plannerPayload?.points)) {
+    return null;
+  }
+  const rawId = String(activeSp?.id || '').trim();
+  const idxMatch = rawId.match(/^body-?(\d+)$/i);
+  const bp =
+    bodyPlans.find((b: any) => String(b?.id || '') === rawId) ||
+    (idxMatch ? bodyPlans[Number(idxMatch[1]) - 1] : undefined) ||
+    bodyPlans[0];
+  if (!bp) return null;
+
+  const pointsById = new Map<string, any>();
+  for (const p of plannerPayload.points || []) {
+    pointsById.set(String(p?.id || ''), p);
+  }
+  const redirects = plannerPayload.redirects || {};
+  const labels = Array.isArray(bp?.mappedPoints)
+    ? bp.mappedPoints.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+  const ids = Array.isArray(bp?.mappedPointIds)
+    ? bp.mappedPointIds.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+  const ledger: { label: string; role: string }[] = [];
+  if (ids.length) {
+    ids.forEach((id: string, i: number) => {
+      const resolved = resolvePointId(id, redirects);
+      const pt = pointsById.get(resolved);
+      const label = String(pt?.claim || labels[i] || id || '').trim();
+      const role = String(pt?.retentionRole || '').trim();
+      if (label) ledger.push({ label, role });
+    });
+  } else {
+    for (const label of labels) ledger.push({ label, role: '' });
+  }
+  return ledger.length ? ledger : null;
+}
+
+/**
  * Step 3 confirm-then-write state machine (LLM ask+eval / server write+flow):
  * 1) Freeze confirmed slots; clear all unconfirmed (ignore model prefill).
  * 2) Pending from validated step3SlotEval.pendingText (1 slot) or pendingDrafts
@@ -7516,12 +7568,16 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
-    // Framework coverage: the planner ledger (subpoint.points/pointRoles) is
-    // block authority — append a block for any mapped point the coach's plan
-    // silently dropped (e.g. narrating an old "不独立成段" story from Step2).
+    // Framework coverage: the planner ledger (bodyPlans.mappedPointIds +
+    // plannerPayload.points[].retentionRole) is block authority — append a block
+    // for any mapped point the coach's plan silently dropped (e.g. narrating an
+    // old "不独立成段" story from Step2). subpoint.points is client-filtered by
+    // isClaimSentence (dimension phrases dropped), so it is only a fallback.
+    const frameworkLedger = buildStep3FrameworkLedger(session, activeSp);
     const appendedLabels = ensureParagraphPlanCoversFrameworkPoints(
       plan,
       activeSp,
+      frameworkLedger,
     );
     if (appendedLabels.length) {
       console.warn(
