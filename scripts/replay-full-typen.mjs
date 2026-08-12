@@ -39,6 +39,12 @@ const TYPES = [
       '网络普及让更多人能接触线上课程',
     ],
     stance: '我倾向于部分同意：线上优势明显，但不应完全取代线下。',
+    // 主题正确素材（按类别：benefit/cause/solution），供 Step2 分类作答
+    points: [
+      { cat: 'benefit', text: '在职人员能利用通勤、午休等零散时间在线学习，省去往返线下课堂的时间成本。' },
+      { cat: 'benefit', text: '低龄学生在学校有老师现场监督，不易分心；在家上网课则容易走神。' },
+      { cat: 'benefit', text: '网络普及让偏远地区也能接触到线上课程，降低了教育资源获取门槛。' },
+    ],
   },
   {
     slug: 'discussion',
@@ -56,6 +62,11 @@ const TYPES = [
       '配套再培训以缓冲冲击',
     ],
     stance: '我认为 AI 总体利大于弊，但需配套再培训来缓冲失业。',
+    points: [
+      { cat: 'benefit', text: 'AI 接管重复性劳动后，把人们解放出来转向创意与协作型工作，催生更多新型高价值岗位。' },
+      { cat: 'cause', text: 'AI 会取代制造业、客服等标准化程度高的岗位，导致部分工人短期失业。' },
+      { cat: 'solution', text: '应通过政府与企业联合的再培训计划，帮助受冲击的工人学习新技能并转岗。' },
+    ],
   },
   {
     slug: 'problem-solution',
@@ -73,10 +84,15 @@ const TYPES = [
       '政府与个人责任分工',
     ],
     stance: '', // requiresStance=false → 不回答立场
+    points: [
+      { cat: 'cause', text: '含糖食品与饮料更便宜、更易得，加上广告的反复引导，人们逐渐养成高糖饮食习惯。' },
+      { cat: 'solution', text: '应通过征收糖税、强制营养标识和公共健康教育来减少含糖食品的摄入。' },
+      { cat: 'solution', text: '还应引导食品行业改良配方，在不过度牺牲口味的前提下降低含糖量。' },
+    ],
   },
 ];
 
-// ---- 主题无关材料点池（主张句+场景/机制结构，够过 Step2 深度门槛）----
+// ---- 通用兜底材料点池（仅当题型未提供 points 时使用）----
 const STEP2_POINTS = [
   '相关人群可以利用通勤、午休等零散时间通过便捷渠道学习或办事，省去往返固定场所的时间成本。',
   '对自制力较弱的人群，现场有人监督提醒，更容易保持专注并坚持完成任务。',
@@ -113,6 +129,7 @@ let archiveFile = '';
 let logLine = () => {};
 let dimIdx = 0;
 let step2PointIdx = 0;
+let usedPoints = new Set();
 let step3RoleCount = {};
 let step4Idx = 0;
 
@@ -143,15 +160,58 @@ function studentStep2(p2, session, type) {
   if (pending) {
     return { text: '采纳', decision: { type: 'proposal', action: 'accept', proposalId: pending.proposalId } };
   }
-  if (/立场|同意|不同意|态度|观点|完全同意|部分同意/.test(p2) && type.stance) {
+  // 完成/进入下一步确认：教练说"材料池和立场已经齐了…确认进入下一步"时，
+  // 回"确认进入下一步"——绝不能因"立场"二字误回立场句（否则死循环）。
+  if (/进入下一步|确认进入|若没有要改|没有更多了|材料池和立场已经齐了|可以进入下一步/.test(p2)) {
+    return '没有了，确认进入下一步。';
+  }
+  // 仅在教练真正问立场时回答（推荐立场 / 你更倾向 / 同意还是不同意 等）
+  if (/推荐立场|你更倾向|同意还是不同意|完全同意|完全不同意|部分同意/.test(p2) && type.stance) {
     return type.stance;
   }
-  if (/展开|补充|具体|场景|机制|例子|人群|详写|略写|还有|另一个|新点|角度|维度|方面/.test(p2)) {
-    const pt = STEP2_POINTS[step2PointIdx % STEP2_POINTS.length];
+  // 分类作答：教练明确要"原因/成因"或"解决/措施"时，从题型主题正确的素材里取对应类。
+  const pts = Array.isArray(type.points) && type.points.length ? type.points : STEP2_POINTS.map((t) => ({ cat: 'benefit', text: t }));
+  const take = (cats) => {
+    const pool = pts.filter((x) => cats.includes(x.cat));
+    const p = pool.find((x) => !usedPoints.has(x.text)) || pool[0];
+    if (p) {
+      usedPoints.add(p.text);
+      step2PointIdx += 1;
+      return p.text;
+    }
+    return null;
+  };
+  if (/原因|成因|为什么|导致|推动|诱因|是.*造成的/.test(p2)) {
+    const t = take(['cause', 'reason']);
+    if (t) return t;
+  }
+  if (/解决|措施|方案|怎么办|应对|建议|手段|如何.*缓解/.test(p2)) {
+    const t = take(['solution', 'measure']);
+    if (t) return t;
+  }
+  // 一般补充/展开：优先未用过的点（避免复读死循环）
+  const unused = pts.filter((x) => !usedPoints.has(x.text));
+  const p = unused.length ? unused[0] : pts[step2PointIdx % pts.length];
+  if (p) {
+    usedPoints.add(p.text);
     step2PointIdx += 1;
-    return pt;
+    return p.text;
   }
   return type.stance || STEP2_STANCE_FALLBACK;
+}
+
+function toFullClaim(point, fallback) {
+  const t = String(point || '').trim();
+  if (!t) return fallback;
+  // 已是完整主张句（含谓词/因果词）→ 直接用
+  if (
+    t.length >= 12 &&
+    /(是|能|可以|会|应该|必须|通过|因为|所以|导致|使得|提升|降低|改善|减少|带来|造成|有助于|无法|不能|推动|催生|促进|缓解)/.test(t)
+  ) {
+    return t;
+  }
+  // 主题词 → 包装成完整主张句（过 claim 深度门槛）
+  return `${t}是导致问题持续存在的重要推动因素，需要通过针对性措施加以应对。`;
 }
 
 function studentStep3(p2, session) {
@@ -159,6 +219,9 @@ function studentStep3(p2, session) {
   const pending = payload?.pendingProposal;
   if (pending) return { text: '采纳', decision: { type: 'proposal', action: 'accept', proposalId: pending.proposalId } };
   if (/确认|对吗|可以吗|对不对|同意|确认写入|点击.*确认/.test(p2)) return '对';
+  // 确认 CTA 在 P1（"我按你的逻辑整理如下…请点击【确认】"），P2 为空 → 回「对」。
+  // 否则分论点永远不被确认、P2 反复问同一槽 → 死循环。
+  if (!String(p2 || '').trim()) return '对';
   let role = 'meta';
   if (/分论点|核心观点|论点|主张|观点句/.test(p2)) role = 'claim';
   else if (/原因|为什么|起因|通常意味着|怎么解决|如何解决/.test(p2)) role = 'reason';
@@ -168,9 +231,8 @@ function studentStep3(p2, session) {
   const count = (step3RoleCount[role] = (step3RoleCount[role] || 0) + 1);
   if (role === 'claim') {
     const first = activeSubpointFirstPoint(session);
-    return count >= 2
-      ? `我指的分论点就是：${first}`
-      : first || '这个分论点围绕相关人群从中获得的关键价值来展开。';
+    const claim = toFullClaim(first, '这个分论点围绕相关人群从中获得的关键价值来展开。');
+    return count >= 2 ? `我指的分论点就是：${claim}` : claim;
   }
   if (role === 'meta' && count >= 2) {
     return ['我觉得可以这样展开：先讲原因，再用一个具体场景说明。', '本质上就是：它降低了门槛，让更多人能按自己的节奏参与。'][(count - 2) % 2];
@@ -298,6 +360,7 @@ async function runOneType(type) {
   transcript = [];
   dimIdx = 0;
   step2PointIdx = 0;
+  usedPoints = new Set();
   step3RoleCount = {};
   step4Idx = 0;
   archiveFile = path.join(docsDir, `recorded-session-${type.slug}-full-${stamp}.txt`);
@@ -366,11 +429,14 @@ async function runOneType(type) {
 }
 
 async function main() {
-  for (const type of TYPES) {
+  const only = String(process.env.ONLY_TYPE || '').trim();
+  const list = only ? TYPES.filter((t) => t.slug === only) : TYPES;
+  for (const type of list) {
     try {
       await runOneType(type);
     } catch (e) {
       console.log(`  ❌ ${type.name} 异常: ${e.message}`);
+      console.error(e.stack);
     }
   }
   console.log('\n===== 全部题型旅程结束 =====');
