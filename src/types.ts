@@ -190,6 +190,12 @@ export interface ParagraphPointBlock {
   role: 'major' | 'minor';
   expansionStrategy: 'explanation' | 'example' | 'mechanism' | 'impact' | 'contrast' | 'hybrid';
   steps: LogicStep[];
+  /**
+   * P2a（merge 按 pointBlock id 对齐）：块绑定到的 Step2 mapped point id
+   * （水合时按位置绑定）。稳定身份——label 被 reclass/确认改写后仍可对齐回原
+   * mapped point，框架守卫/merge 优先按 id 匹配，label 文本降为兜底。
+   */
+  mappedPointId?: string;
 }
 
 export interface ParagraphPlan {

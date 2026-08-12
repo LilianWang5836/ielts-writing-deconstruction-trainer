@@ -6784,7 +6784,18 @@ function reviseKickoffPendingDrafts(
   return next;
 }
 
-function blockMatchesMappedPoint(block: any, mappedPoint: string): boolean {
+function blockMatchesMappedPoint(
+  block: any,
+  mappedPoint: string,
+  mappedPointId?: string,
+): boolean {
+  // P2a：块带稳定 mappedPointId 戳（水合时按位置绑定）时，优先按 id 匹配——
+  // label 被 reclass/确认改写后仍能对齐回原 mapped point。
+  if (mappedPointId && block?.mappedPointId) {
+    if (String(block.mappedPointId).trim() === String(mappedPointId).trim()) {
+      return true;
+    }
+  }
   const mapped = String(mappedPoint || "").trim();
   if (!mapped || !block) return false;
   const sub = String(block.subClaim || block.label || "").trim();
@@ -6796,7 +6807,11 @@ function blockMatchesMappedPoint(block: any, mappedPoint: string): boolean {
   );
 }
 
-function pickPrimaryPointBlock(plan: any, framework: Record<string, unknown> | null): any {
+function pickPrimaryPointBlock(
+  plan: any,
+  framework: Record<string, unknown> | null,
+  mappedPointIds?: string[],
+): any {
   const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
   if (blocks.length === 0) return null;
   const roles = Array.isArray(framework?.pointRoles)
@@ -6807,8 +6822,24 @@ function pickPrimaryPointBlock(plan: any, framework: Record<string, unknown> | n
     (Array.isArray(framework?.mappedPoints)
       ? (framework.mappedPoints as string[])[0]
       : "");
+  // P2a id 快路径：major mapped point id（来自 pointRoles.pointId 或 mappedPointIds[0]）
+  // 命中块.mappedPointId 时直接取该块——不依赖 label 文本。
+  const majorId =
+    String(
+      roles.find((r) => String(r?.role || "").trim() === "major")?.pointId ||
+        (Array.isArray(mappedPointIds) ? mappedPointIds[0] : "") ||
+        "",
+    ).trim() || "";
+  if (majorId) {
+    const byId = blocks.find(
+      (b: any) => String(b?.mappedPointId || "").trim() === majorId,
+    );
+    if (byId) return byId;
+  }
   if (majorPoint) {
-    const matched = blocks.find((b: any) => blockMatchesMappedPoint(b, String(majorPoint)));
+    const matched = blocks.find((b: any) =>
+      blockMatchesMappedPoint(b, String(majorPoint), majorId || undefined),
+    );
     if (matched) return matched;
   }
   const majorBlock = blocks.find((b: any) => String(b?.role || "").trim() === "major");
@@ -6880,6 +6911,7 @@ function ensureConcessionStructure(plan: any, framework: Record<string, unknown>
 function enforceFrameworkPointBlockCount(
   plan: any,
   framework: Record<string, unknown> | null,
+  mappedPointIds?: string[],
 ): boolean {
   if (!plan || !Array.isArray(plan.pointBlocks) || !framework) return false;
 
@@ -6890,10 +6922,14 @@ function enforceFrameworkPointBlockCount(
   const roles = Array.isArray(framework.pointRoles)
     ? (framework.pointRoles as any[])
     : [];
+  const minorId = String(
+    roles.find((r) => String(r?.role || "").trim() === "minor")?.pointId ||
+      "",
+  ).trim();
   let changed = false;
 
   if (density === "single_point" && plan.pointBlocks.length > 1) {
-    const keep = pickPrimaryPointBlock(plan, framework);
+    const keep = pickPrimaryPointBlock(plan, framework, mappedPointIds);
     plan.pointBlocks = keep ? [keep] : [plan.pointBlocks[0]];
     plan.mode = "single_point";
     plan.totalClaim = "";
@@ -6907,16 +6943,23 @@ function enforceFrameworkPointBlockCount(
     plan.mode = "direct_points";
     plan.totalClaim = "";
     if (plan.pointBlocks.length > 2) {
-      const major = pickPrimaryPointBlock(plan, framework);
+      const major = pickPrimaryPointBlock(plan, framework, mappedPointIds);
       const rest = plan.pointBlocks.filter((b: any) => b !== major);
       const minor =
         rest.find((b: any) => String(b?.role || "").trim() === "minor") ||
+        // P2a id 快路径：优先按块.mappedPointId 匹配 minor mapped point id。
         rest.find((b: any) =>
-          roles.some(
-            (r) =>
-              String(r?.role || "").trim() === "minor" &&
-              blockMatchesMappedPoint(b, String(r?.point || "")),
-          ),
+          minorId
+            ? String(b?.mappedPointId || "").trim() === minorId
+            : roles.some(
+                (r) =>
+                  String(r?.role || "").trim() === "minor" &&
+                  blockMatchesMappedPoint(
+                    b,
+                    String(r?.point || ""),
+                    String(r?.pointId || "").trim() || undefined,
+                  ),
+              ),
         ) ||
         rest[0];
       plan.pointBlocks = [major, minor].filter(Boolean);
@@ -6961,7 +7004,13 @@ function applyStep3FrameworkGuard(
     plan.totalClaim = "";
   }
 
-  enforceFrameworkPointBlockCount(plan, framework);
+  // P2a：把 planner 账本（bodyPlans.mappedPointIds）接入框架守卫，让
+  // pickPrimaryPointBlock/minor 匹配优先按块.mappedPointId（稳定身份）对齐。
+  const ledger = buildStep3FrameworkLedger(session, activeSp);
+  const mappedPointIds = Array.isArray(ledger)
+    ? ledger.map((e: any) => String(e?.id || "").trim()).filter(Boolean)
+    : [];
+  enforceFrameworkPointBlockCount(plan, framework, mappedPointIds);
   ensureArgumentRelationCoverage(plan, framework);
 }
 
@@ -7515,17 +7564,17 @@ function buildStep3FrameworkLedger(
     ? bp.mappedPointIds.map((x: any) => String(x || '').trim()).filter(Boolean)
     : [];
 
-  const ledger: { label: string; role: string }[] = [];
+  const ledger: { id: string; label: string; role: string }[] = [];
   if (ids.length) {
     ids.forEach((id: string, i: number) => {
       const resolved = resolvePointId(id, redirects);
       const pt = pointsById.get(resolved);
       const label = String(pt?.claim || labels[i] || id || '').trim();
       const role = String(pt?.retentionRole || '').trim();
-      if (label) ledger.push({ label, role });
+      if (label) ledger.push({ id: resolved, label, role });
     });
   } else {
-    for (const label of labels) ledger.push({ label, role: '' });
+    for (const label of labels) ledger.push({ id: '', label, role: '' });
   }
   return ledger.length ? ledger : null;
 }

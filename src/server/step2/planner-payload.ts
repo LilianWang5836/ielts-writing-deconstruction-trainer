@@ -4189,6 +4189,16 @@ export function hydrateBodyPlansFromPayload(
         for (let i = 0; i < plan.pointBlocks.length; i++) {
           const block = plan.pointBlocks[i];
           const claim = String(claims[i] || claims[0] || '').trim();
+          // P2a（merge 按 pointBlock id 对齐）：给块打上绑定到的 mapped point id
+          // （位置绑定：pointBlocks[i] ↔ mappedPointIds[i]，经 redirects 解析）。
+          // mappedPointId 是稳定身份——块 label 被 reclass/确认改写后仍能对齐回
+          // 原 mapped point，供框架守卫/merge 优先按 id 匹配（label 文本降为兜底）。
+          const mappedPointId = String(
+            resolved[i]?.id || ids[i] || '',
+          ).trim();
+          if (mappedPointId) {
+            block.mappedPointId = mappedPointId;
+          }
           if (!claim) continue;
           if (isClaimSentence(claim)) {
             // Full Step2 claim sentence → 论点句
