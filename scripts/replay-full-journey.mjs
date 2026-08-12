@@ -5,8 +5,15 @@
  *
  * 运行前提：本地服务 3000 端口 + .env.local 已配 LLM key。
  * Run: npx tsx scripts/replay-full-journey.mjs
+ *
+ * 存档：对话记录按时间戳写入 docs/recorded-session-<时间戳>.txt（与项目记录
+ * 同路径归档，保留多轮历史）；同时继续写 /tmp/journey-transcript.log 便于
+ * 运行中实时 tail。
  */
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const BASE = process.env.PROBE_BASE_URL || 'http://localhost:3000';
 const QUESTION =
@@ -14,11 +21,22 @@ const QUESTION =
 
 let turnCount = 0;
 const transcript = [];
-const TRANSCRIPT_FILE = '/tmp/journey-transcript.log';
-import fs from 'node:fs';
+// 存档到项目 docs/（部署路径），时间戳精确到秒以便保留多轮历史
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const docsDir = path.join(scriptDir, '..', 'docs');
+const stamp = new Date()
+  .toISOString()
+  .replace(/[-:T]/g, '')
+  .slice(0, 14); // YYYYMMDDHHmmss
+const TRANSCRIPT_FILE =
+  process.env.TRANSCRIPT_FILE || path.join(docsDir, `recorded-session-${stamp}.txt`);
+const LIVE_FILE = '/tmp/journey-transcript.log';
+fs.mkdirSync(docsDir, { recursive: true });
 function logLine(line) {
   try { fs.appendFileSync(TRANSCRIPT_FILE, `${line}\n`); } catch (e) { /* ignore */ }
+  try { fs.appendFileSync(LIVE_FILE, `${line}\n`); } catch (e) { /* ignore */ }
 }
+logLine(`# 模拟教练对话 · ${new Date().toISOString()} · step1→step4 全流程（本地 DeepSeek）`);
 
 async function postCoach({ step, userMessage, session, decision, messages }) {
   turnCount += 1;
@@ -161,6 +179,15 @@ const STEP1_DIMS = [
   '网络普及让更多人能接触到线上课程',
 ];
 let dimIdx = 0;
+// Step2 材料点池：被教练追问"再多展开点"时轮换给出新点，避免复读死循环
+const STEP2_POINTS = [
+  '在职人员可以在下班后的通勤时间用手机看课程回放，省去每天往返线下课堂的通勤成本。',
+  '低龄学生在学校有老师现场盯着，不容易分心、学习效率更高；在家上网课则容易走神。',
+  '网络普及降低了教育资源的获取门槛，偏远地区的学生也能通过线上课程接触到优质师资。',
+  '线上课程可以反复回看，学生能按自己的节奏复习巩固，这对基础薄弱的学习者尤其有利。',
+  '线下课堂的面对面互动是线上难以替代的，老师能即时发现学生的困惑并当面纠正。',
+];
+let step2PointIdx = 0;
 
 function studentStep1(p2) {
   if (/题型|题目类型|属于|分类|哪一种/.test(p2)) {
@@ -190,14 +217,14 @@ function studentStep2(p2, session) {
     // 提案已 arm（side_settle/stance）→ 直接采纳（走按钮语义的 decision 通道）
     return { text: '采纳', decision: { type: 'proposal', action: 'accept', proposalId: pending.proposalId } };
   }
-  if (/展开|补充|具体|场景|机制|例子|人群|详写|略写/.test(p2)) {
-    return '比如在职人员可以晚上下班后在线上学习，省去通勤时间；低龄学生在学校有老师盯着，不容易分心，学习效率更高。';
-  }
-  if (/立场|同意|不同意|态度|观点/.test(p2)) {
+  if (/立场|同意|不同意|态度|观点|完全同意|部分同意/.test(p2)) {
     return '我基本同意线上不应完全取代线下，但线上可以作为补充。';
   }
-  if (/还有|另一个|补充点|新点|角度|维度/.test(p2)) {
-    return '还可以考虑网络普及降低了教育资源的获取门槛，让偏远地区也能上课。';
+  if (/展开|补充|具体|场景|机制|例子|人群|详写|略写|还有|另一个|新点|角度|维度|方面|角度/.test(p2)) {
+    // 被追问时轮换给出"新的"材料点，而不是复读同一句（避免 Step2 死循环）
+    const pt = STEP2_POINTS[step2PointIdx % STEP2_POINTS.length];
+    step2PointIdx += 1;
+    return pt;
   }
   return '这个点可以从灵活性和互动性两个层面来展开。';
 }
@@ -319,6 +346,7 @@ async function main() {
     console.log(`[step${t.step}] 教练 part2: ${p2}`.slice(0, 260));
   }
   console.log(`\n共 ${turnCount} 轮，脚本结束。`);
+  console.log(`对话记录已存档: ${TRANSCRIPT_FILE}`);
 }
 
 main().catch((e) => {
