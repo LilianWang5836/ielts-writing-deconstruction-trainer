@@ -85,13 +85,51 @@ function applyProgress(session, stepKey, pu, userMsg) {
           : Boolean(pu.isCompleted || session.step2.isCompleted),
     };
   } else if (stepKey === 3) {
+    const currentStep3 = session.step3 || {};
+    const subpoints = Array.isArray(currentStep3.subpoints)
+      ? currentStep3.subpoints
+      : [];
+    const activeId =
+      currentStep3.activeSubpointId || (subpoints[0] && subpoints[0].id) || '';
+    const step3Ui = pu.step3Ui;
+    const uiById = new Map(
+      (Array.isArray(step3Ui?.bodies) ? step3Ui.bodies : []).map((b) => [
+        String(b.id),
+        b,
+      ]),
+    );
+    const updatedSubpoints = subpoints.map((sp) => {
+      const uiBody = uiById.get(String(sp.id));
+      const next = { ...sp };
+      if (uiBody) {
+        next.isCompleted = !!uiBody.isCompleted;
+        next.selectable = !!uiBody.selectable;
+      }
+      if (String(sp.id) === String(activeId)) {
+        if (pu.paragraphPlan) next.paragraphPlan = pu.paragraphPlan;
+        if (Array.isArray(pu.step3SubpointSteps) && pu.step3SubpointSteps.length) {
+          next.structureSteps = pu.step3SubpointSteps;
+        }
+        if (pu.step3SlotEval) next.step3SlotEval = pu.step3SlotEval;
+        if (Array.isArray(pu.step3KickoffPendingDrafts)) {
+          next.kickoffPendingDrafts = pu.step3KickoffPendingDrafts;
+        }
+      }
+      return next;
+    });
     session.step3 = {
-      ...session.step3,
+      ...currentStep3,
       ...(pu.step3Data || {}),
+      subpoints: updatedSubpoints,
+      activeSubpointId: step3Ui?.nextActiveSubpointId || activeId,
       isCompleted:
         pu.isCompleted === false
           ? false
-          : Boolean(pu.isCompleted || session.step3.isCompleted),
+          : Boolean(
+              (step3Ui && step3Ui.isStep3Finished === true) ||
+                pu.isCompleted ||
+                currentStep3.isCompleted,
+            ),
     };
   } else if (stepKey === 4 && pu.step4Data) {
     session.step4 = {
