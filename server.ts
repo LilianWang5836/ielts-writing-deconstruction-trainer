@@ -9600,6 +9600,15 @@ async function generateOpenAICompat(params: {
     })
     .filter(Boolean);
 
+  // max_tokens 上限：不同端点上限不同（DeepSeek deepseek-chat=8192，
+  // OpenAI=16384）。调用方常传 32768（Gemini 用），超限会被端点 400 拒绝，
+  // 故用 OPENAI_MAX_TOKENS 收敛（默认 8192）。
+  const maxTokensCap = Number(process.env.OPENAI_MAX_TOKENS || 8192);
+  const requested = params.config?.maxOutputTokens ?? maxTokensCap;
+  const maxTokens =
+    Number.isFinite(maxTokensCap) && maxTokensCap > 0
+      ? Math.min(requested, maxTokensCap)
+      : requested;
   const body: Record<string, any> = {
     model,
     messages,
@@ -9607,7 +9616,7 @@ async function generateOpenAICompat(params: {
       typeof params.config?.temperature === "number"
         ? params.config.temperature
         : 0.7,
-    max_tokens: params.config?.maxOutputTokens ?? 32768,
+    max_tokens: maxTokens,
   };
   if (params.config?.responseMimeType === "application/json") {
     body.response_format = { type: "json_object" };
