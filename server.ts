@@ -24,6 +24,7 @@ import {
   promoteAcknowledgedFlatStep3Target,
   ensureParagraphPlanCoversFrameworkPoints,
   enforceStep3SkeletonLock,
+  step3TextAsksConfirmedSlot,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 import {
@@ -4600,6 +4601,12 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
 
   if (confirmed === 0 && step3TextClaimsPrematureProgress(t)) {
     return "illegal_dump";
+  }
+
+  // P0（真实旅程发现 A）：模型下一问回退到【已确认】的槽（如「请先把「分论点」说
+  // 具体一点」当分论点已确认）。看板知道真实 firstEmpty，钳制到规范问句。
+  if (confirmed > 0 && step3TextAsksConfirmedSlot(t, plan)) {
+    return "ask_confirmed_slot";
   }
   return "";
 }

@@ -788,6 +788,38 @@ function frameworkLabelsMatch(a: string, b: string): boolean {
   );
 }
 
+function escRe(s: string): string {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * P0（真实旅程发现 A）：模型下一问是否在让学生填一个【已确认】的槽（回退到
+ * 已完成的步骤，如「请先把「分论点」说具体一点」当分论点已确认）。服务端据此
+ * 钳制——veto 到真实 firstEmpty 的规范问句，避免"反复问已填好的槽"。
+ */
+export function step3TextAsksConfirmedSlot(text: string, plan: any): boolean {
+  const t = String(text || '');
+  if (!t.trim() || !plan || !Array.isArray(plan.pointBlocks)) return false;
+  for (const block of plan.pointBlocks) {
+    for (const step of block?.steps || []) {
+      if (!isStep3Confirmed(step)) continue;
+      const lab = String(step?.label || '').trim();
+      if (lab.length < 2) continue;
+      const esc = escRe(lab);
+      if (
+        new RegExp(`请先把?「?${esc}」?说具体一点`).test(t) ||
+        new RegExp(
+          `请(?:回答|补充|再说一下|具体说说|写一下|确认)「?${esc}」?`,
+        ).test(t) ||
+        new RegExp(`「${esc}」的具体内容`).test(t)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * The paragraph's framework (subpoint.points + pointRoles, planner-derived
  * ledger) is the block authority — the coach LLM may narrate a paragraph with
