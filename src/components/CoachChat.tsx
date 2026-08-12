@@ -226,10 +226,15 @@ export default function CoachChat({
         const isPendingHost =
           hasPendingConfirm && historyIndex === lastAiHistoryIndex;
         // Phase1: trust pendingProposal on latest AI turn (text is display-only).
+        // 产品约束：Step2 强制按钮白名单 = side_settle（每侧详略）+ stance（立场）。
+        // slot_add / slot_merge 走对话内确认（无按钮）——学生可直接打字「可以/采纳」
+        // 或说出自己的方案，由 resolvePendingProposalDecision 的文本路径处理。
         const isProposalHost =
           hasPendingProposal &&
           !hasPendingConfirm &&
-          historyIndex === lastAiHistoryIndex;
+          historyIndex === lastAiHistoryIndex &&
+          (pendingProposalKind === 'side_settle' ||
+            pendingProposalKind === 'stance');
         const isSlotAddHost =
           !isProposalHost &&
           hasPendingSlotAdd &&
