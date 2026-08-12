@@ -251,12 +251,18 @@ async function main() {
   check('Step3 骨架覆盖 active body 全部 mapped 点（① 端到端生效）', () => {
     for (const mp of activeMapped) {
       const covered = (plan.pointBlocks || []).some((b) => {
-        const label = core(String(b.label || b.subClaim || ''));
+        // 模型常把块 label 浓缩为主题词、把完整 claim 放 subClaim——必须两者都查，
+        // 并用守卫同款模糊匹配（label/subClaim 任一处命中即视为覆盖）。
+        const label = core(String(b.label || ''));
+        const sub = core(String(b.subClaim || ''));
         const mpc = core(mp);
+        const hits = (t) =>
+          !!t && t.length >= 2 && (t === mpc || t.includes(mpc) || mpc.includes(t));
         return (
-          label &&
-          mpc &&
-          (label === mpc || label.includes(mpc) || mpc.includes(label))
+          hits(label) ||
+          hits(sub) ||
+          (label.length >= 4 && mpc.includes(label.slice(0, 4))) ||
+          (sub.length >= 4 && mpc.includes(sub.slice(0, 4)))
         );
       });
       assert.ok(covered, `active body mapped 点被丢：${mp}；blocks=${blockLabels}`);
