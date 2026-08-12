@@ -187,7 +187,25 @@
   - **P2a ✅ 已实施**：③ merge 按 pointBlock id 对齐——水合给 pointBlock 打 `mappedPointId` 稳定身份戳（位置绑定 + redirects 解析），`blockMatchesMappedPoint`/`pickPrimaryPointBlock`/`enforceFrameworkPointBlockCount` 优先按 id 匹配，label 文本降为兜底；`buildStep3FrameworkLedger` 携带解析后 id。单测 `scripts/replay-merge-by-id.mjs`（5 断言）。提交 `84b007f`。
   - **P2b / P2c ⏳ 延后（明确理由）**：② userPoints 完全只读投影（停用反向同步 `applyRetentionRolesFromUserPoints`）与 flag 状态机集中化——这两项是**低 ROI 的大重构**：② 已让结构化 retentionRole 权威（文本只对未标注点补缺），实际"双写分叉"已消除，反向同步只服务于旧会话兼容；flag 状态机集中化是纯重构、无行为变化，回归风险高、收益不显。建议在有完整回归套件的新会话推进，且需迁移 `replay-checklist-walk-gate`/`replay-single-truth` 断言。
 
+### ✅ 多题型验证（2026-08-12，`replay-typen-e2e.mjs`，真实 planner + Step3 kickoff）
+
+对 3 种 IELTS Task 2 题型各跑一遍真实链路（Step2 结构化 → Planner(DeepSeek) → 建 Step3 subpoints → kickoff）：
+- **Agree / Disagree（在线学习）**：✅ planner bodies=3；paragraphPlan 存在、active mapped 点被覆盖、chat 无内部术语。
+- **Discuss both views（AI）**：✅ planner bodies=2；同上全通过。
+- **Problem / Solution（高糖食品，requiresStance=false）**：✅ planner bodies=2；同上全通过。
+
+**结论**：三题型在真实流程下均正常产出 paragraphPlan 并覆盖 mapped 点。`verify-step3-schemes.mjs`（裸 session 直发）里 Symmetric Two-Benefit / Concession 两例 `paragraphPlan: <missing>` 是**探测假象**（无 planner bodyPlans / step2_5 上下文），非真实 bug。
+另修复 `replay-e2e-step3-coverage.mjs` 断言脆弱性（模型把块 label 浓缩为主题词、完整 claim 放 subClaim，原断言只取 label 且严格包含 → 偶发误报；现 label+subClaim 同查 + 守卫同款模糊匹配，连续 3 次 ALL PASS）。提交 `a170254`。
+
+### 📋 本次修改评估（2026-08-12）
+
+- **Step2 重复问答根因已修**：提案决策不再因 step2Data 缺失被丢弃（修复重试丢 step2Data 的连带问题），立场提案现只确认一次即进下一步（此前重复 3 次）。
+- **AI 味显著下降**：HUMAN TUTOR TONE RULE 后，教练反馈更简洁自然（复验记录 `recorded-session-20260812112958.txt`），Step3 逐槽确认推进。
+- **P0/P1/P2a 全部落地并有确定性单测**：P0 下一问钳制（`replay-step3-next-ask-clamp`）、P1 跳修复重试、P2a merge 按 id 对齐（`replay-merge-by-id`）。
+- **验证面**：tsc 0 错误；纯函数 replay 11/11；Step3 e2e 断言修复后 3/3；多题型 e2e 3/3；真实旅程 Step1/Step2 完成、Step3 逐槽推进。
+- **剩余**：P2b/P2c（低 ROI 重构，延后）；Step3 模型偶发跳过确认（DECLARE-OR-EXPAND 遵循度，可加服务端启发式——留待后续）。
+
 ### ⚠️ 说明
 
-- 本环境无法运行完整 e2e（`replay-new-cases.mjs` 需要运行中的服务与 LLM key；3 个 `verify-*.mjs` 因工作区路径含空格读不到文件）。
-- 分支 `work-step2-review` 已改写历史（ahead 10 / behind 1），**勿对其 force-push 覆盖远端**；若需同步，用新分支或 PR。
+- 本环境无法运行完整 e2e（`replay-new-cases.mjs` 需要运行中的服务与 LLM key；部分 `verify-*.mjs` 因工作区路径含空格读不到文件）。
+- 分支 `work-step2-review` 已改写历史（ahead 30 / behind 1），**勿对其 force-push 覆盖远端**；若需同步，用新分支或 PR。
