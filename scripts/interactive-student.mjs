@@ -220,7 +220,7 @@ async function main() {
       targetBody: bp.targetBody,
       theme: bp.theme || bp.role,
       paragraphPlan: bp.paragraphPlan,
-      frameworkSignature: `${bp.id}-${bp.argumentRelation || ''}`,
+      // 注意：不设置 frameworkSignature（错误格式会触发 frameworkDrifted → 死锁）。
       isCompleted: false,
       chatHistory: [],
     }));

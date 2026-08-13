@@ -4061,6 +4061,25 @@ function absorbStep3ConfirmReclass(
     return null;
   }
 
+  // CRITICAL GUARD (deadlock root cause): never reclass the claim slot
+  // (分论点/核心观点) into a non-claim role. If firstEmpty IS the claim slot
+  // and the model is staging a different argument role (mechanism/reason/…),
+  // absorbing it here would destroy the 分论点 slot — ensureLeadingClaimSlot then
+  // re-injects a phantom `pb1_claim` empty slot the model never confirms,
+  // locking activeKey to pb1_claim forever.
+  const emptyLabel = String(emptyStep?.label || "").trim();
+  const targetLabel = String(
+    targetLoc.step?.label || targetLoc.label || "",
+  ).trim();
+  const firstEmptyIsClaim = CLAIM_SLOT_LABEL_RE.test(emptyLabel);
+  const targetIsClaim = CLAIM_SLOT_LABEL_RE.test(targetLabel);
+  if (firstEmptyIsClaim && !targetIsClaim) {
+    console.warn(
+      `[Step3Guard] Reclass blocked: firstEmpty「${emptyLabel}」is claim slot; refusing to relabel to non-claim「${targetLabel}」.`,
+    );
+    return null;
+  }
+
   const sameBlock = targetLoc.blockIndex === empty.blockIndex;
   const immediateNext = isImmediateNextEmptyAfterFirst(
     plan,
@@ -8363,7 +8382,55 @@ function enforceStep3LogicCompletionInner(
     }
   } else if (slotEval?.mode === "expand") {
     // Model says still expanding — do not stage new pending from heuristics.
+    // EXCEPT: if the student gave a substantive answer this turn while the
+    // firstEmpty slot is still empty, backfill it as a draft pending so the
+    // flow cannot deadlock on「请先把 X 说具体一点」when the model keeps asking
+    // but never declares mode=confirm. (Deadlock root cause B: model output
+    // instability — expand-only turns leave student content un-staged.)
     pending = [];
+    if (
+      isSubstantiveStep3Answer(userMessage) &&
+      !isStep3AffirmativeConfirmation(userMessage)
+    ) {
+      const empty = findFirstEmptyPlanStep(plan);
+      if (empty) {
+        const emptyStep =
+          plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+        if (emptyStep && !isStep3Confirmed(emptyStep)) {
+          const didFill = applyStudentAnswerToTargetStep(
+            plan,
+            prevPlan,
+            userMessage,
+          );
+          if (didFill) {
+            const filledStep =
+              plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+            const filledText = String(filledStep?.value || "").trim();
+            if (filledText) {
+              pending = [
+                {
+                  key: String(
+                    filledStep?.key ||
+                      `${empty.blockIndex}:${empty.stepIndex}`,
+                  ),
+                  label: empty.cleanStepLabel || "当前这一环",
+                  text: filledText,
+                  blockIndex: empty.blockIndex,
+                  stepIndex: empty.stepIndex,
+                },
+              ];
+              syncPlanProgressFields(data, plan, pending);
+              setReject("");
+              applyConfirmTurnText(data, pending);
+              console.warn(
+                `[Step3Guard] Expand-but-substantive — backfilled student answer as draft pending for「${empty.cleanStepLabel}」 (model kept asking but staged nothing).`,
+              );
+              return;
+            }
+          }
+        }
+      }
+    }
     syncPlanProgressFields(data, plan, []);
     const vetoed = enforceStep3TextBoardConsistency(
       data,
