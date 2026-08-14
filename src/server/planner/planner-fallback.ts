@@ -58,6 +58,8 @@ function makeBody(
     subClaim: claim,
     role: 'major',
     expansionStrategy: expansion,
+    // P2a：稳定身份——绑定到 primary point id（label 变化后仍可按 id 对齐）
+    mappedPointId: point?.id || '',
     steps:
       index === 1
         ? [
@@ -126,6 +128,8 @@ function makeBody(
       subClaim: bc,
       role: 'minor',
       expansionStrategy: 'explanation',
+      // P2a：绑定到对应 brief point id（稳定身份）
+      mappedPointId: extraBriefs[i]?.id || '',
       steps: [
         {
           key: `${bid}_s1`,

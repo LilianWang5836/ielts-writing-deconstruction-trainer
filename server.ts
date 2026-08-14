@@ -23,6 +23,8 @@ import {
   promoteAcknowledgedStep3DraftTarget,
   promoteAcknowledgedFlatStep3Target,
   ensureParagraphPlanCoversFrameworkPoints,
+  enforceStep3SkeletonLock,
+  step3TextAsksConfirmedSlot,
 } from "./src/utils/step3Quality.ts";
 import { buildFallbackBodyPlans } from "./src/server/planner/planner-fallback";
 import {
@@ -62,6 +64,7 @@ import {
   preserveLockedRetentionInUserPoints,
   stripForgedRetentionLocks,
   resolveNextSideWalkStep,
+  resolvePointId,
   resolveProposedClaimAgainstBoard,
   resolveSlotAddDecision,
   settleSideRetentionAfterAccept,
@@ -165,6 +168,15 @@ function parseAIResponse(text: string | undefined, defaultData: any = {}): any {
           ...defaultData,
           text: textMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'),
         };
+      }
+      // 纯文本兜底：DeepSeek 等 OpenAI 兼容端点偶发直接输出非 JSON 的教练文本。
+      // 仅当调用方默认数据带 text 字段（面向文本的调用，如 coach）时，
+      // 才把内容充实的原文作为教练消息，避免暴露 "Error parsing AI response."。
+      if (defaultData && typeof defaultData.text === "string") {
+        const prose = responseText.replace(/```/g, "").trim();
+        if (prose.length >= 20) {
+          return { ...defaultData, text: prose };
+        }
       }
       return defaultData;
     }
@@ -472,7 +484,16 @@ function applyStep2ProposalChannelEarly(
   committedUserPoints?: string;
   kind?: string;
 } {
-  if (!data?.progressUpdate?.step2Data) return { handled: false };
+  // 采纳/拒绝决策的状态在 session（prevPayload）里，与模型是否输出 step2Data 无关。
+  // 模型回复（尤其 text_missing_delimiter 修复重试后）偶发缺失 step2Data——此时仍要
+  // 处理决策，否则 pendingProposal 残留、下一轮重复武装同一提案（重复问答根因）。
+  // 缺 step2Data 时创建一个空壳，让提交结果能写回并随 progressUpdate 下发。
+  if (!data?.progressUpdate) {
+    data.progressUpdate = { isCompleted: false };
+  }
+  if (!data.progressUpdate.step2Data) {
+    data.progressUpdate.step2Data = {};
+  }
   const prevPayload =
     session?.step2?.coachEvaluation?.plannerPayload ||
     session?.step2?.plannerPayload ||
@@ -4040,6 +4061,25 @@ function absorbStep3ConfirmReclass(
     return null;
   }
 
+  // CRITICAL GUARD (deadlock root cause): never reclass the claim slot
+  // (分论点/核心观点) into a non-claim role. If firstEmpty IS the claim slot
+  // and the model is staging a different argument role (mechanism/reason/…),
+  // absorbing it here would destroy the 分论点 slot — ensureLeadingClaimSlot then
+  // re-injects a phantom `pb1_claim` empty slot the model never confirms,
+  // locking activeKey to pb1_claim forever.
+  const emptyLabel = String(emptyStep?.label || "").trim();
+  const targetLabel = String(
+    targetLoc.step?.label || targetLoc.label || "",
+  ).trim();
+  const firstEmptyIsClaim = CLAIM_SLOT_LABEL_RE.test(emptyLabel);
+  const targetIsClaim = CLAIM_SLOT_LABEL_RE.test(targetLabel);
+  if (firstEmptyIsClaim && !targetIsClaim) {
+    console.warn(
+      `[Step3Guard] Reclass blocked: firstEmpty「${emptyLabel}」is claim slot; refusing to relabel to non-claim「${targetLabel}」.`,
+    );
+    return null;
+  }
+
   const sameBlock = targetLoc.blockIndex === empty.blockIndex;
   const immediateNext = isImmediateNextEmptyAfterFirst(
     plan,
@@ -4589,6 +4629,12 @@ function detectStep3IllegalCoachText(text: string, plan: any): string {
 
   if (confirmed === 0 && step3TextClaimsPrematureProgress(t)) {
     return "illegal_dump";
+  }
+
+  // P0（真实旅程发现 A）：模型下一问回退到【已确认】的槽（如「请先把「分论点」说
+  // 具体一点」当分论点已确认）。看板知道真实 firstEmpty，钳制到规范问句。
+  if (confirmed > 0 && step3TextAsksConfirmedSlot(t, plan)) {
+    return "ask_confirmed_slot";
   }
   return "";
 }
@@ -6757,7 +6803,18 @@ function reviseKickoffPendingDrafts(
   return next;
 }
 
-function blockMatchesMappedPoint(block: any, mappedPoint: string): boolean {
+function blockMatchesMappedPoint(
+  block: any,
+  mappedPoint: string,
+  mappedPointId?: string,
+): boolean {
+  // P2a：块带稳定 mappedPointId 戳（水合时按位置绑定）时，优先按 id 匹配——
+  // label 被 reclass/确认改写后仍能对齐回原 mapped point。
+  if (mappedPointId && block?.mappedPointId) {
+    if (String(block.mappedPointId).trim() === String(mappedPointId).trim()) {
+      return true;
+    }
+  }
   const mapped = String(mappedPoint || "").trim();
   if (!mapped || !block) return false;
   const sub = String(block.subClaim || block.label || "").trim();
@@ -6769,7 +6826,11 @@ function blockMatchesMappedPoint(block: any, mappedPoint: string): boolean {
   );
 }
 
-function pickPrimaryPointBlock(plan: any, framework: Record<string, unknown> | null): any {
+function pickPrimaryPointBlock(
+  plan: any,
+  framework: Record<string, unknown> | null,
+  mappedPointIds?: string[],
+): any {
   const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
   if (blocks.length === 0) return null;
   const roles = Array.isArray(framework?.pointRoles)
@@ -6780,8 +6841,24 @@ function pickPrimaryPointBlock(plan: any, framework: Record<string, unknown> | n
     (Array.isArray(framework?.mappedPoints)
       ? (framework.mappedPoints as string[])[0]
       : "");
+  // P2a id 快路径：major mapped point id（来自 pointRoles.pointId 或 mappedPointIds[0]）
+  // 命中块.mappedPointId 时直接取该块——不依赖 label 文本。
+  const majorId =
+    String(
+      roles.find((r) => String(r?.role || "").trim() === "major")?.pointId ||
+        (Array.isArray(mappedPointIds) ? mappedPointIds[0] : "") ||
+        "",
+    ).trim() || "";
+  if (majorId) {
+    const byId = blocks.find(
+      (b: any) => String(b?.mappedPointId || "").trim() === majorId,
+    );
+    if (byId) return byId;
+  }
   if (majorPoint) {
-    const matched = blocks.find((b: any) => blockMatchesMappedPoint(b, String(majorPoint)));
+    const matched = blocks.find((b: any) =>
+      blockMatchesMappedPoint(b, String(majorPoint), majorId || undefined),
+    );
     if (matched) return matched;
   }
   const majorBlock = blocks.find((b: any) => String(b?.role || "").trim() === "major");
@@ -6853,6 +6930,7 @@ function ensureConcessionStructure(plan: any, framework: Record<string, unknown>
 function enforceFrameworkPointBlockCount(
   plan: any,
   framework: Record<string, unknown> | null,
+  mappedPointIds?: string[],
 ): boolean {
   if (!plan || !Array.isArray(plan.pointBlocks) || !framework) return false;
 
@@ -6863,10 +6941,14 @@ function enforceFrameworkPointBlockCount(
   const roles = Array.isArray(framework.pointRoles)
     ? (framework.pointRoles as any[])
     : [];
+  const minorId = String(
+    roles.find((r) => String(r?.role || "").trim() === "minor")?.pointId ||
+      "",
+  ).trim();
   let changed = false;
 
   if (density === "single_point" && plan.pointBlocks.length > 1) {
-    const keep = pickPrimaryPointBlock(plan, framework);
+    const keep = pickPrimaryPointBlock(plan, framework, mappedPointIds);
     plan.pointBlocks = keep ? [keep] : [plan.pointBlocks[0]];
     plan.mode = "single_point";
     plan.totalClaim = "";
@@ -6880,16 +6962,23 @@ function enforceFrameworkPointBlockCount(
     plan.mode = "direct_points";
     plan.totalClaim = "";
     if (plan.pointBlocks.length > 2) {
-      const major = pickPrimaryPointBlock(plan, framework);
+      const major = pickPrimaryPointBlock(plan, framework, mappedPointIds);
       const rest = plan.pointBlocks.filter((b: any) => b !== major);
       const minor =
         rest.find((b: any) => String(b?.role || "").trim() === "minor") ||
+        // P2a id 快路径：优先按块.mappedPointId 匹配 minor mapped point id。
         rest.find((b: any) =>
-          roles.some(
-            (r) =>
-              String(r?.role || "").trim() === "minor" &&
-              blockMatchesMappedPoint(b, String(r?.point || "")),
-          ),
+          minorId
+            ? String(b?.mappedPointId || "").trim() === minorId
+            : roles.some(
+                (r) =>
+                  String(r?.role || "").trim() === "minor" &&
+                  blockMatchesMappedPoint(
+                    b,
+                    String(r?.point || ""),
+                    String(r?.pointId || "").trim() || undefined,
+                  ),
+              ),
         ) ||
         rest[0];
       plan.pointBlocks = [major, minor].filter(Boolean);
@@ -6934,7 +7023,13 @@ function applyStep3FrameworkGuard(
     plan.totalClaim = "";
   }
 
-  enforceFrameworkPointBlockCount(plan, framework);
+  // P2a：把 planner 账本（bodyPlans.mappedPointIds）接入框架守卫，让
+  // pickPrimaryPointBlock/minor 匹配优先按块.mappedPointId（稳定身份）对齐。
+  const ledger = buildStep3FrameworkLedger(session, activeSp);
+  const mappedPointIds = Array.isArray(ledger)
+    ? ledger.map((e: any) => String(e?.id || "").trim()).filter(Boolean)
+    : [];
+  enforceFrameworkPointBlockCount(plan, framework, mappedPointIds);
   ensureArgumentRelationCoverage(plan, framework);
 }
 
@@ -7453,6 +7548,77 @@ function enforceStep3LogicCompletion(
 }
 
 /**
+ * Planner-ledger (bodyPlans.mappedPointIds + plannerPayload.points[].retentionRole)
+ * for the active body — the authoritative framework source for Step3 coverage.
+ * Returns null when the planner ledger is unavailable (fall back to subpoint.points).
+ */
+function buildStep3FrameworkLedger(
+  session: any,
+  activeSp: any,
+): { label: string; role: string }[] | null {
+  const bodyPlans = session?.step2_5?.bodyPlans;
+  const plannerPayload =
+    session?.step2?.coachEvaluation?.plannerPayload ||
+    session?.step2?.plannerPayload;
+  if (!Array.isArray(bodyPlans) || !Array.isArray(plannerPayload?.points)) {
+    return null;
+  }
+  const rawId = String(activeSp?.id || '').trim();
+  const idxMatch = rawId.match(/^body-?(\d+)$/i);
+  const bp =
+    bodyPlans.find((b: any) => String(b?.id || '') === rawId) ||
+    (idxMatch ? bodyPlans[Number(idxMatch[1]) - 1] : undefined) ||
+    bodyPlans[0];
+  if (!bp) return null;
+
+  const pointsById = new Map<string, any>();
+  for (const p of plannerPayload.points || []) {
+    pointsById.set(String(p?.id || ''), p);
+  }
+  const redirects = plannerPayload.redirects || {};
+  const labels = Array.isArray(bp?.mappedPoints)
+    ? bp.mappedPoints.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+  const ids = Array.isArray(bp?.mappedPointIds)
+    ? bp.mappedPointIds.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+  const ledger: { id: string; label: string; role: string }[] = [];
+  if (ids.length) {
+    ids.forEach((id: string, i: number) => {
+      const resolved = resolvePointId(id, redirects);
+      const pt = pointsById.get(resolved);
+      const label = String(pt?.claim || labels[i] || id || '').trim();
+      const role = String(pt?.retentionRole || '').trim();
+      if (label) ledger.push({ id: resolved, label, role });
+    });
+  } else {
+    for (const label of labels) ledger.push({ id: '', label, role: '' });
+  }
+  return ledger.length ? ledger : null;
+}
+
+/**
+ * ③ 权威骨架：当前 active body 对应的 planner bodyPlans.paragraphPlan
+ * （含 pointBlocks）。用于把教练回合返回的 plan 对齐到 planner 骨架。
+ */
+function buildStep3Skeleton(session: any, activeSp: any): any | null {
+  const bodyPlans = session?.step2_5?.bodyPlans;
+  if (!Array.isArray(bodyPlans)) return null;
+  const rawId = String(activeSp?.id || '').trim();
+  const idxMatch = rawId.match(/^body-?(\d+)$/i);
+  const bp =
+    bodyPlans.find((b: any) => String(b?.id || '') === rawId) ||
+    (idxMatch ? bodyPlans[Number(idxMatch[1]) - 1] : undefined) ||
+    bodyPlans[0];
+  const plan = bp?.paragraphPlan;
+  if (plan && Array.isArray(plan.pointBlocks) && plan.pointBlocks.length) {
+    return plan;
+  }
+  return null;
+}
+
+/**
  * Step 3 confirm-then-write state machine (LLM ask+eval / server write+flow):
  * 1) Freeze confirmed slots; clear all unconfirmed (ignore model prefill).
  * 2) Pending from validated step3SlotEval.pendingText (1 slot) or pendingDrafts
@@ -7516,12 +7682,28 @@ function enforceStep3LogicCompletionInner(
   }
 
   if (plan) {
-    // Framework coverage: the planner ledger (subpoint.points/pointRoles) is
-    // block authority — append a block for any mapped point the coach's plan
-    // silently dropped (e.g. narrating an old "不独立成段" story from Step2).
+    // ③ 骨架硬传承：把模型回合返回的 plan 对齐到 planner 骨架（bodyPlans pointBlocks）。
+    // 块级结构性 diff（增删块/改序/改角色）一律拒收；仅允许 value 级修改。
+    const skeleton = buildStep3Skeleton(session, activeSp);
+    if (skeleton) {
+      const rejectedBlocks = enforceStep3SkeletonLock(plan, skeleton);
+      if (rejectedBlocks > 0) {
+        console.warn(
+          `[Step3SkeletonLock] Rejected ${rejectedBlocks} structural-diff pointBlock(s) from coach turn (planner skeleton is frozen).`,
+        );
+      }
+      data.progressUpdate.paragraphPlan = plan;
+    }
+    // Framework coverage: the planner ledger (bodyPlans.mappedPointIds +
+    // plannerPayload.points[].retentionRole) is block authority — append a block
+    // for any mapped point the coach's plan silently dropped (e.g. narrating an
+    // old "不独立成段" story from Step2). subpoint.points is client-filtered by
+    // isClaimSentence (dimension phrases dropped), so it is only a fallback.
+    const frameworkLedger = buildStep3FrameworkLedger(session, activeSp);
     const appendedLabels = ensureParagraphPlanCoversFrameworkPoints(
       plan,
       activeSp,
+      frameworkLedger,
     );
     if (appendedLabels.length) {
       console.warn(
@@ -7583,6 +7765,77 @@ function enforceStep3LogicCompletionInner(
 
   const setReject = (code: string) => {
     data.progressUpdate.step3LastRejectCode = code;
+  };
+
+  /**
+   * Server-side「meeting-minutes」backfill (deadlock root cause B, completed):
+   * When the student gave a substantive answer this turn but the model did NOT
+   * declare a valid mode=confirm (it kept asking / staged nothing / omitted
+   * step3SlotEval), the server records the student's own words onto the
+   * firstEmpty slot as a DRAFT pending — not confirmed, still gated by the
+   * student's affirm. This makes the server the record-keeper instead of
+   * waiting on the model's structured fields, eliminating the「请先把 X 说具体一
+   * 点」/ affirm_no_pending deadlock regardless of whether the model emitted
+   * mode=expand or no slotEval at all.
+   * Returns true when a draft pending was staged (caller should return).
+   */
+  const tryBackfillSubstantiveAnswer = (): boolean => {
+    if (!isSubstantiveStep3Answer(userMessage)) return false;
+    if (isStep3AffirmativeConfirmation(userMessage)) return false;
+    if (isStep3RejectMessage(userMessage)) return false;
+    const empty = findFirstEmptyPlanStep(plan);
+    if (!empty) return false;
+    const emptyStep =
+      plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+    if (!emptyStep || isStep3Confirmed(emptyStep)) return false;
+    // Pre-check hard-reject BEFORE staging: if the student's words would be
+    // rejected as a near-duplicate of an already-confirmed sibling (or any
+    // other hard-reject), staging it now only to have the affirm hard-rejected
+    // would loop forever (backfill → duplicate_sibling reject → backfill…).
+    // Skip the backfill and let the model/student re-express instead.
+    const emptyKey = String(
+      emptyStep?.key || `${empty.blockIndex}:${empty.stepIndex}`,
+    );
+    const preHard = hardRejectSlotText(
+      String(userMessage).trim(),
+      plan,
+      emptyKey,
+      empty.blockIndex,
+    );
+    if (!preHard.ok) {
+      console.warn(
+        `[Step3Guard] Backfill pre-check rejected (${preHard.code}) for「${empty.cleanStepLabel}」 — not staging; awaiting re-expression.`,
+      );
+      return false;
+    }
+    const didFill = applyStudentAnswerToTargetStep(
+      plan,
+      prevPlan,
+      userMessage,
+    );
+    if (!didFill) return false;
+    const filledStep =
+      plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+    const filledText = String(filledStep?.value || "").trim();
+    if (!filledText) return false;
+    pending = [
+      {
+        key: String(
+          filledStep?.key || `${empty.blockIndex}:${empty.stepIndex}`,
+        ),
+        label: empty.cleanStepLabel || "当前这一环",
+        text: filledText,
+        blockIndex: empty.blockIndex,
+        stepIndex: empty.stepIndex,
+      },
+    ];
+    syncPlanProgressFields(data, plan, pending);
+    setReject("");
+    applyConfirmTurnText(data, pending);
+    console.warn(
+      `[Step3Guard] Server-recorded student answer as draft pending for「${empty.cleanStepLabel}」 (model did not declare confirm; awaiting student affirm).`,
+    );
+    return true;
   };
 
   // Trust model text; strip forbidden meta / mid-flow English show-off; never long template overwrite.
@@ -8200,7 +8453,18 @@ function enforceStep3LogicCompletionInner(
     }
   } else if (slotEval?.mode === "expand") {
     // Model says still expanding — do not stage new pending from heuristics.
+    // EXCEPT: if the student gave a substantive answer this turn while the
+    // firstEmpty slot is still empty, backfill it as a draft pending so the
+    // flow cannot deadlock on「请先把 X 说具体一点」when the model keeps asking
+    // but never declares mode=confirm. (Deadlock root cause B: model output
+    // instability — expand-only turns leave student content un-staged.)
     pending = [];
+    if (tryBackfillSubstantiveAnswer()) {
+      console.warn(
+        "[Step3Guard] Expand path — backfilled student answer as draft pending.",
+      );
+      return;
+    }
     syncPlanProgressFields(data, plan, []);
     const vetoed = enforceStep3TextBoardConsistency(
       data,
@@ -8226,6 +8490,18 @@ function enforceStep3LogicCompletionInner(
   }
 
   // No new confirm eval: keep existing pending (if any) or finish/continue.
+  // If the model emitted NO valid slotEval at all (mode empty / missing), we
+  // must NOT fall back to "wait for the model" — the server records the
+  // student's substantive answer itself (meeting-minutes), otherwise the flow
+  // deadlocks on「请先把 X 说具体一点」whenever the model's structured field is
+  // truncated/absent. This is the completion of deadlock root cause B.
+  if (pending.length === 0 && tryBackfillSubstantiveAnswer()) {
+    console.warn(
+      "[Step3Guard] No slotEval — backfilled student answer as draft pending (server-recorded).",
+    );
+    return;
+  }
+
   if (pending.length > 0) {
     // Single-slot revision without declared confirm: if coach text already
     // contains a reorganized sentence, upgrade pending so board/CTA match it.
@@ -9531,19 +9807,50 @@ async function generateOpenAICompat(params: {
     .replace(/\/+$/, "");
   const model = String(process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 
-  const messages = (Array.isArray(params.contents) ? params.contents : [])
-    .map((c: any) => {
+  // Normalize Gemini-style contents → OpenAI messages.
+  // contents 可能是字符串（多数 chat 路径直接传 prompt）或
+  // [{ role, parts:[{text}] }]（buildCoachRequest/buildIntentRequest/buildPlannerRequest）。
+  // 旧实现只处理数组，字符串会得到空 messages → DeepSeek 400 "Empty input messages"。
+  const rawContents = params.contents;
+  const messages: Array<{ role: string; content: string }> = [];
+  if (typeof rawContents === "string") {
+    const t = String(rawContents).trim();
+    if (t) messages.push({ role: "user", content: t });
+  } else if (Array.isArray(rawContents)) {
+    for (const c of rawContents) {
       const parts = Array.isArray(c?.parts) ? c.parts : [];
       const text = parts
         .map((p: any) => String(p?.text || ""))
         .join("")
         .trim();
-      if (!text) return null;
-      const role = c?.role === "assistant" ? "assistant" : "user";
-      return { role, content: text };
-    })
-    .filter(Boolean);
+      if (!text) continue;
+      const role =
+        c?.role === "assistant" || c?.role === "model"
+          ? "assistant"
+          : "user";
+      messages.push({ role, content: text });
+    }
+  }
+  // Gemini-style systemInstruction → OpenAI system message（放最前）。
+  const sys = String(params.config?.systemInstruction || "").trim();
+  if (sys) {
+    messages.unshift({ role: "system", content: sys });
+  }
+  if (!messages.length) {
+    throw new Error(
+      "OpenAI-compatible: empty contents — no message to send to LLM.",
+    );
+  }
 
+  // max_tokens 上限：不同端点上限不同（DeepSeek deepseek-chat=8192，
+  // OpenAI=16384）。调用方常传 32768（Gemini 用），超限会被端点 400 拒绝，
+  // 故用 OPENAI_MAX_TOKENS 收敛（默认 8192）。
+  const maxTokensCap = Number(process.env.OPENAI_MAX_TOKENS || 8192);
+  const requested = params.config?.maxOutputTokens ?? maxTokensCap;
+  const maxTokens =
+    Number.isFinite(maxTokensCap) && maxTokensCap > 0
+      ? Math.min(requested, maxTokensCap)
+      : requested;
   const body: Record<string, any> = {
     model,
     messages,
@@ -9551,7 +9858,7 @@ async function generateOpenAICompat(params: {
       typeof params.config?.temperature === "number"
         ? params.config.temperature
         : 0.7,
-    max_tokens: params.config?.maxOutputTokens ?? 32768,
+    max_tokens: maxTokens,
   };
   if (params.config?.responseMimeType === "application/json") {
     body.response_format = { type: "json_object" };
@@ -9580,6 +9887,9 @@ async function generateOpenAICompat(params: {
     data?.choices?.[0]?.message?.content || "",
   );
   return {
+    // 顶层 text：多数调用方用 response.text（Gemini GenerateContentResponse
+    // 自带 .text getter，OpenAI 兼容路径必须补上，否则 undefined）。
+    text: content,
     candidates: [{ content: { parts: [{ text: content }] } }],
   };
 }
@@ -12391,6 +12701,7 @@ ${memoryDigestStr}
   - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
   - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`subClaim\` is planning only — does NOT write the board. First pointBlock step must be a claim slot (分论点/核心观点).
   - CRITICAL — KICKOFF / FIRST PLANNING TURN: ALL \`steps[].value\` empty. firstEmpty MUST be the claim slot when it is empty — never skip to 展开原因. Theme heads (人际关系) are labels only. DEFAULT: mode=expand — seed a question from Step2 toward a full 论点句 (NOT「为什么」as a reason ask; NOT「分论点已确立」). Only if a full claim sentence is already especially complete may you mode=confirm on the claim slot. FORBIDDEN: rubber-stamp whole chain; FORBIDDEN: confirm 原因/机制 on kickoff while claim empty.
+  - CRITICAL — FROZEN SKELETON (③ 骨架硬传承): When a \`paragraphPlan\` is already present (seeded from the Step2 Planner's bodyPlans), its \`pointBlocks\` are the AUTHORITATIVE skeleton. You MUST NOT add, remove, rename, or reorder pointBlocks, and MUST NOT change a block's \`role\` (major/minor) or \`expansionStrategy\`. You may only fill \`steps[].value\` (and do a single per-slot label reclass within a block when allowed). If the student wants a different body/point structure, do NOT edit the blocks yourself — the server handles re-planning via the structure-change flow; you only acknowledge and let them request it.
   - CRITICAL — ANTI-REDUNDANT CONFIRMS: Do not slice one Step2 idea into multiple near-duplicate confirm sentences. Each confirm must add a new argument layer (e.g. claim = conclusion; reason = why; mechanism = how).
   - CRITICAL — STUCK / 「不知道」: One short Step2 clue or narrower follow-up; then let them speak before confirm.
   - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, guide【确认】button (do NOT ask them to reply「对」in text); micro-edits go in the input. After they confirm, NEXT reply asks the next empty beat (expand or confirm based on remaining material).
@@ -12468,6 +12779,14 @@ ${stepGuidelines}
 - CRITICAL COMPACTNESS RULE: Every single AI response MUST be extremely brief, concise, and punchy. Bold important content. Do NOT write massive essays. Ask ONLY ONE question at a time. In explore stages, do NOT renumber or paraphrase the student's answer into a long structured summary.
 - INTERNAL-ONLY RULE (CRITICAL, applies to all steps): Internal brief / pre-analysis fields (questionBrief, writingDestination, taskMap, hasHardQualifiers, requiresStance, candidateDirectionSeeds, evalNote) may ONLY decide what to ask, whether to ask, and whether content is sufficient. They MUST NEVER appear in student-facing text as the Coach's preferred answers, recommended stance, preferred causes, or ready-made conclusions. Coach core value = guided practice; do NOT force the Coach's opinions onto the student.
 - NATURAL LANGUAGE & CONTINUITY RULE (CRITICAL, applies to all steps): Every question you ask (except the very first question of a brand-new step) MUST read as a natural continuation of the conversation, not an isolated template. Any example wording given in these guidelines (e.g. "ask something like: '...'") is illustrative ONLY — rephrase it in your own natural words, referencing what the student just said/the topic just discussed, rather than reproducing the example sentence structure verbatim. NEVER turn an internal bookkeeping check (e.g. "is this dimension reusable", "does this cover both tasks", "is there a hard qualifier") into the literal question you ask the student — that logic must stay silent in progressUpdate; the student-facing question must be about the essay CONTENT itself, phrased the way a real human tutor would continue the dialogue.
+- HUMAN TUTOR TONE RULE (CRITICAL, applies to all steps): Read like a specific, experienced IELTS tutor in a live conversation — NOT like an AI assistant producing a polished report. Concretely:
+  1) VARY your openers. Do NOT open most turns with the same praise pattern ("好的/很好/你这句话…很到位/点出了…的优势/你举的例子很生动"). One short, plain acknowledgment is enough, and vary its wording from turn to turn.
+  2) Do NOT restate the student's whole answer back verbatim. If you must reference it, compress it to a 5–10 word paraphrase or just name the slot (e.g. "这一步（展开原因）") and move on.
+  3) Cut filler superlatives ("非常到位", "极其生动", "太好了", "很完整"). "嗯，可以。" or "对，这就是通勤回放那个点。" reads far more human.
+  4) No meta-commentary about your own process ("我按你的逻辑整理", "我根据你刚说的整理", "我决定采用…"). Just do the thing silently.
+  5) Vary sentence rhythm: mix short and medium sentences; a robotic reply has every sentence the same length and shape.
+  6) If the student repeats the same content, name it once briefly ("这句和刚才那句是同一个意思") and push for the missing part — do not re-praise and re-restate it.
+  7) Above all: sound like you are LISTENING and reacting, not executing a checklist. Reference what the student just said, in your own words, and keep moving.
 - INTENT CLASSIFICATION BEFORE FORMAT (CRITICAL, applies to all steps — read this BEFORE any stage-specific "feedback format" instruction below): Before writing Part 1, first classify the SEMANTIC INTENT of the student's last message. Any "feedback format" / "confirmation shape" instruction elsewhere in this prompt describes a CONSTRAINT (be concise; do not renumber or bullet-restate; do not invent empty list items), NOT a literal sentence you must reproduce — pick whichever intent below actually matches, and let your wording follow from it:
   1) NEW CONTENT (brainstorm answer, new fact, new example): briefly acknowledge what they gave, in your own words, one natural sentence. No fixed opening phrase is required — "很好，目前我们记录到：..." is only ONE possible way to phrase this, not a mandatory template.
   2) ASKING FOR YOUR JUDGMENT/OPINION (e.g. "你觉得哪个更容易展开", "你选", "哪个更好写", "你觉得呢"): this is NOT new content to log and NOT a vague agreement — answer it directly as a recommendation. State your pick and the reason together in ONE natural flowing statement (do not open with a "已确定为..." announcement and then separately justify it in a second block).
@@ -13135,7 +13454,32 @@ Student says:
         console.warn(
           `[CoachGuard] Response requires repair. reason=${firstCheck.reason}`,
         );
-        const correctionSuffix = `
+
+        // P1（发现 C）：`---` 分隔符缺失（text_missing_delimiter）但文本本身充实
+        // （真实教练消息，非空/非解析失败兜底）时，跳过修复重试——用单段文本作为
+        // part1、服务端 fallbackNextStep 生成 part2，省一次 LLM 调用，且保留首轮
+        // progressUpdate（避免 step2Data 丢失）。仅限"缺分隔符"这一种纯格式缺陷；
+        // 空文本/part2 过短等仍需重试。
+        const rawTextForP1 = String(data?.text || "").trim();
+        const p1SingleBlockSubstantive =
+          firstCheck.reason === "text_missing_delimiter" &&
+          rawTextForP1.length >= 12 &&
+          !/^Error parsing AI response\./.test(rawTextForP1);
+        if (p1SingleBlockSubstantive) {
+          const p1Part2 = fallbackNextStep(
+            currentStepNum,
+            session,
+            data?.progressUpdate?.step2Data,
+          );
+          data.text = `${rawTextForP1}\n\n---\n\n${p1Part2}`;
+          if (!data.progressUpdate) {
+            data.progressUpdate = { isCompleted: false };
+          }
+          console.warn(
+            "[CoachGuard] P1: text_missing_delimiter but substantive — skipped repair retry; server part2 attached.",
+          );
+        } else {
+          const correctionSuffix = `
 
 [SYSTEM CORRECTION]
 你的上一次输出存在格式或推进缺陷（reason=${firstCheck.reason}）。
@@ -13181,7 +13525,23 @@ Student says:
             `[CoachGuard] Retry still invalid. Applied content-aware fallback next-step. reason=${retryCheck.reason}`,
           );
         }
+        // 修复重试不得破坏首轮已产出的状态：重试轮若整体缺失 progressUpdate.step2Data
+        //（模型偶发只回 text），把首轮 step2Data 带回来，避免 userPoints/plannerPayload
+        // 丢失导致采纳/拒绝决策静默失效或重复武装（重复问答根因之一）。
+        const firstStep2 = data?.progressUpdate?.step2Data;
         data = retryData;
+        if (
+          firstStep2 &&
+          typeof firstStep2 === "object" &&
+          (!data?.progressUpdate?.step2Data ||
+            typeof data.progressUpdate.step2Data !== "object")
+        ) {
+          if (!data.progressUpdate) {
+            data.progressUpdate = { isCompleted: false };
+          }
+          data.progressUpdate.step2Data = firstStep2;
+        }
+        }
       }
 
       if (data?.progressUpdate) {

@@ -15,7 +15,9 @@ View your app in AI Studio: https://ai.studio/apps/8997f192-d0c0-42c6-a864-d4af1
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Copy [.env.example](.env.example) to `.env.local` and fill your LLM provider key:
+   - 默认 Gemini：填 `GEMINI_API_KEY`
+   - 或 DeepSeek：`LLM_PROVIDER=openai-compatible` + `OPENAI_API_KEY`（见下方示例）
 3. Run the app:
    `npm run dev`
 
@@ -33,15 +35,17 @@ View your app in AI Studio: https://ai.studio/apps/8997f192-d0c0-42c6-a864-d4af1
 | `OPENAI_API_KEY` | — | openai-compatible 必填 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 兼容端点（DeepSeek/Kimi/Ollama 等） |
 | `OPENAI_MODEL` | `gpt-4o-mini` | 使用的模型名 |
+| `OPENAI_MAX_TOKENS` | `8192` | openai-compatible 的 max_tokens 上限（DeepSeek=8192，超限会被 400 拒绝） |
 
 ### 示例：改用 DeepSeek
 
 ```bash
-# .env
+# .env.local
 LLM_PROVIDER=openai-compatible
 OPENAI_API_KEY=sk-xxxx
 OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_MODEL=deepseek-chat
+OPENAI_MAX_TOKENS=8192   # deepseek-chat 上限 8192
 ```
 
 ### 示例：本地 Ollama（无需云 API Key）
