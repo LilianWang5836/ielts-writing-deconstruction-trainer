@@ -53,7 +53,14 @@ const TYPES = [
       reason: (th) => `因为在职人员平时工作繁忙、通勤耗时，很难按固定时间到线下教室上课；零散时间在线学习正好能把被浪费的通勤和午休利用起来，这正是它对在职人员特别重要的原因。`,
       mechanism: (th) => `具体机制是：平台把课程切成短课时，配合自动记录进度与提醒复习，学习者利用零散时间逐段完成，系统持续追踪。`,
       scenario: (th) => `比如一位在职的家长，通勤路上用手机完成一小节，午休再学一段，周末集中补齐，完全绕开往返教室的硬性时间。`,
-      impact: (th) => `这样一来，原本受时空约束无法学习的人也能持续投入，教育资源向更广人群开放，这是替代线下不可得的增量价值。`,
+      impact: (th) => `最终结果是：原本因工作繁忙没时间学的人也能长期坚持提升技能，个人职业竞争力增强、晋升机会增多，整个社会的人力素质也整体提高。`,
+    },
+    // stall 时的"换个角度"替代答案（保持 on-topic，避免答非所问）
+    step3b: {
+      reason: `在职人员没法保证固定的上课时间，通勤和午休这种碎片时间如果不用来学习就白白浪费了；在线学习恰好把这些碎片时间变成学习机会，这是最贴合他们处境的原因。`,
+      mechanism: `平台把内容拆成小段，学完自动标记进度并提醒复习；用户可以在手机上随时接着上次的地方学，系统把每一小段的完成情况都记录在案。`,
+      scenario: `拿一个常加班的白领举例：早高峰地铁上听一节音频课，午休做一组练习，晚上加班后睡前再看一段讲解，全程不用请假、不用赶路。`,
+      impact: `时间上的灵活让过去根本没条件上课的人也能稳定学下去，技能提升后竞争力变强、晋升空间变大，全社会的人力资本也随之抬升。`,
     },
   },
   {
@@ -78,6 +85,12 @@ const TYPES = [
       scenario: (th) => `比如客服岗位的工人转型做数据标注与算法训练的质量审核，流水线质检员转岗到设备维护，这些都是可落地的真实路径。`,
       impact: (th) => `最终效果是岗位结构从低技能重复劳动转向高技能协作，整体生产率与就业质量同时提升，这正是支持面主张成立的关键。`,
     },
+    step3b: {
+      reason: `AI 天生擅长规则清晰、重复度高的任务，这类工作被自动化后，原先做这些的人只能向需要更高技能的方向走，这就是这条路径的成因。`,
+      mechanism: `企业发现 AI 又快又便宜就会持续加码自动化，被替换的岗位工人通过政府和企业合办的培训转到数据标注、算法质检这类新岗位上去。`,
+      scenario: `例如制造业流水线上的工人，经过数月再培训后转去做设备运维或 AI 训练数据的审核，岗位从重复劳动变成需要判断力的工作。`,
+      impact: `长期看岗位从低技能重复劳动整体转向高技能协作，生产率与就业质量一起上升，AI 带来的净收益由此得以兑现。`,
+    },
   },
   {
     slug: 'problem-solution',
@@ -99,7 +112,13 @@ const TYPES = [
       reason: (th) => `因为${th || '高糖问题的根源'}在于便宜易得与广告诱导共同抬高了含糖食品的消费，糖分摄入远超身体所需。`,
       mechanism: (th) => `具体机制是：便利店与自动售货机让高糖饮品随手可得，营销强化了“快乐/解渴”联想，价格优势又压过健康选项，形成惯性。`,
       scenario: (th) => `比如青少年每天在便利店购买含糖饮料且几乎不受约束，家长与学校干预有限，长期积累导致肥胖和糖尿病高发。`,
-      impact: (th) => `通过糖税提高含糖食品价格、强制营养标签与校园健康教育，可改变消费决策环境，从源头抑制高糖摄入。`,
+      impact: (th) => `结果是长期高糖摄入会直接推高肥胖、2型糖尿病和心血管疾病的发病率，青少年牙齿腐蚀也明显增多，公共医疗负担随之加重。`,
+    },
+    step3b: {
+      reason: `高糖食品便宜、随处可得，再加上广告不断强化“解渴又快乐”的印象，消费者很容易在不知不觉中摄入远超身体需要的糖分。`,
+      mechanism: `超市和自动售货机把含糖饮料摆在最显眼的位置，营销把甜味和幸福感绑定，价格又比健康选项更有优势，这种组合让高糖消费成为习惯。`,
+      scenario: `青少年放学后顺路在便利店买一大瓶含糖饮料，学校周边这样的店到处都是，家长和学校又很难每时每刻约束，日积月累肥胖和糖尿病就找上门了。`,
+      impact: `长期过量摄入糖分，直接后果就是肥胖率、2型糖尿病和心血管疾病发病率上升，青少年牙齿腐蚀明显增多，公共医疗开支也被大幅推高。`,
     },
   },
 ];
@@ -134,8 +153,9 @@ let archiveFile = '';
 let logLine = () => {};
 let step2Idx = 0;
 let usedPoints = new Set();
+let stanceSaid = false;
 let step3RoleCount = {};
-let step3Stalls = 0;
+let step3Stalls = {};
 let lastStep3P2 = '';
 let step4Idx = 0;
 let step4PasteCount = 0;
@@ -190,20 +210,54 @@ function studentStep1(p2, type, session) {
 }
 
 // ---- 我扮演学生：Step2 ----
-function studentStep2(p2, type, session) {
+function studentStep2(p2, type, session, p1) {
   if (pendingDecision) return { text: '采纳', decision: pendingDecision };
   const payload = CURRENT_TYPE ? {} : {};
+  // P1 要求补反对面/具体场景时（可能 P2 同时问立场）→ 优先补点。
+  // 仅当 P1 是"疑问/追问"（含"？/哪个/怎么/能否/你刚才提到"）时触发；
+  // P1 若为陈述（"已经记到""建议详写"）则交给下方详略/立场分支处理。
+  const p1Text = String(p1 || '');
+  if (
+    p1Text &&
+    /[？?]/.test(p1Text) &&
+    /补|还缺|缺少|反对面|再给|不够|具体场景|哪个场景|说具体|提到.*场景/.test(p1Text)
+  ) {
+    const pool = Array.isArray(type.points) ? type.points : [];
+    const next = pool.find((pt) => !usedPoints.has(pt.text));
+    if (next) {
+      usedPoints.add(next.text);
+      return `具体到线下不可替代的场景，比如：${next.text}`;
+    }
+    // 所有点都提过了：补一个贴合题型的线下场景（针对 A/D 反对面）
+    if (type.slug === 'agree-disagree') {
+      return '具体到线下场景：小组讨论和实验操作必须有老师现场组织与反馈，这是线上无法复制的互动质量，也是反对面最有力的支撑。';
+    }
+    return '具体场景是：这类过程需要面对面协作和即时反馈，正是线上课堂最薄弱的环节。';
+  }
   // 确认进入下一步（优先判断，避免被"立场"字样误命中）
   if (/材料池和立场已经齐了|确认进入下一步|请确认进入|没有要改|全部齐了/.test(p2)) {
     return '确认进入下一步';
   }
   // 立场推荐 → 采纳（或用题型立场句，若教练在询问）
   if (/推荐立场|采纳.*立场|锁定.*立场|你更倾向|同意还是不同意|利大于弊|弊大于利/.test(p2)) {
-    if (type.stance && /你更倾向|同意还是不同意|写一下|说出|用一句话/.test(p2)) return type.stance;
+    // 推荐立场 + 明确"采纳锁定"提示 → 发送 stance accept decision（等价于前端「采纳」按钮），
+    // 置位 stanceConfirmResolved 才能解锁 Step2 完成
+    if (/推荐立场|采纳.*锁定|点击.*采纳/.test(p2)) {
+      return { text: '采纳', decision: { type: 'stance', action: 'accept' } };
+    }
+    // 已答过立场仍被反复追问 → 材料已齐，改确认进入下一步，避免无限循环
+    if (stanceSaid) return '确认进入下一步';
+    if (type.stance && /你更倾向|同意还是不同意|写一下|说出|用一句话/.test(p2)) {
+      stanceSaid = true;
+      return type.stance;
+    }
     return '采纳';
   }
-  // 详略方案采纳
+  // 详略方案采纳（发送 retention accept decision，等价于前端「采纳」按钮）
   if (/采纳|详写|略写|方案|锁定/.test(p2) && !/推荐立场/.test(p2)) {
+    if (/详写|略写|详略|方案|锁定/.test(p2)) {
+      return { text: '采纳', decision: { type: 'retention', action: 'accept' } };
+    }
     return '采纳';
   }
   // seedOnly 展开提示："「某点」目前还偏薄：请补 1–2 句具体场景、机制或受影响对象"
@@ -314,11 +368,30 @@ function studentStep3(p2, type, session) {
     // 紧扣槽主题（slotLabel）与 body 主题，避免答非所问被模型拒绝。
     let ans = tpl(theme, slotLabel);
     if (String(p2) === lastStep3P2) {
-      step3Stalls += 1;
-      if (step3Stalls >= 3) {
-        issue(CURRENT_TYPE?.slug, 3, `Step3 同一追问 ${step3Stalls} 次未推进（role=${role} slot=${slotLabel}）`);
+      step3Stalls[role] = (step3Stalls[role] || 0) + 1;
+      if (step3Stalls[role] >= 3) {
+        issue(CURRENT_TYPE?.slug, 3, `Step3 同一追问 ${step3Stalls[role]} 次未推进（role=${role} slot=${slotLabel}）`);
       }
-      ans = `${ans} 具体到这条分论点，核心就是围绕「${theme}」展开。`;
+      // 换角度重答（更贴近真人顺着教练的具体提问作答）：优先用该题型的 on-topic 替代素材轮换，
+      // 避免答非所问（旧逻辑硬编码的泛化 impact 素材对 problem-solution 是错题素材，导致死循环）。
+      if (step3Stalls[role] >= 2) {
+        const alt = (type.step3b || {})[role];
+        if (typeof alt === 'string') {
+          ans = alt;
+        } else {
+          const themed = String(theme || '').trim();
+          const slot = String(slotLabel || '');
+          if (role === 'reason') {
+            ans = `我再换一个角度说${slot}：最直接的原因是${themed}本身的特性决定了它会这样发生，这是最根本的驱动力。`;
+          } else if (role === 'mechanism') {
+            ans = `具体到${slot}的机制：它是一个可操作的链条——先发生第一步，再触发第二步，最后自然落到${themed}上，每一步都有明确环节。`;
+          } else if (role === 'scenario') {
+            ans = `再说一个更贴近的${slot}：在常见的生活场景里，${themed}会以最典型的方式呈现出来，让人能直接看到它的作用过程。`;
+          } else {
+            ans = `${themed}在这一个环节的具体内容是：围绕它展开一层更细的说明，落到可观察的具体表现上。`;
+          }
+        }
+      }
     }
     return ans;
   }
@@ -465,7 +538,7 @@ async function runStep(session, step, opening, responder, type, maxTurns) {
     const lastUser = msgs[msgs.length - 1].text;
     const resp = await postCoach({ step, userMessage: lastUser, session, messages: msgs, ...(pendingDecision ? { decision: pendingDecision } : {}) });
     pendingDecision = null;
-    const { p2 } = splitText(resp.text);
+    const { p1, p2 } = splitText(resp.text);
     applyProgress(session, step, resp.progressUpdate);
     const st = session[`step${step}`];
     if (st?.isCompleted) {
@@ -478,9 +551,30 @@ async function runStep(session, step, opening, responder, type, maxTurns) {
       return;
     }
     lastStep3P2 = step === 3 ? p2 : '';
-    const ans = responder(p2, type, session);
+    const ans = responder(p2, type, session, p1);
     const replyText = typeof ans === 'string' ? ans : ans.text;
     if (ans && typeof ans === 'object' && ans.decision) pendingDecision = ans.decision;
+    // 模拟真实前端：把学生消息同步进 active subpoint 的 chatHistory。
+    // 服务器 finalizeStep3WholeStepCompletion 用 subpointHasStudentDialogue(sp)
+    // 判定 sibling body 是否 genuinely complete；脚本若不维护 chatHistory，
+    // sibling 永远判未完成 → 服务器误判引导重写旧 body（达轮次上限假象）。
+    if (step === 3 && replyText) {
+      const step3 = session.step3 || {};
+      const sps = Array.isArray(step3.subpoints) ? step3.subpoints : [];
+      const activeId = step3.activeSubpointId || (sps[0] && sps[0].id) || '';
+      session.step3 = {
+        ...step3,
+        subpoints: sps.map((sp) => {
+          if (String(sp.id) !== String(activeId)) return sp;
+          const hist = Array.isArray(sp.chatHistory) ? sp.chatHistory : [];
+          if (hist.some((m) => m?.text === replyText)) return sp;
+          return {
+            ...sp,
+            chatHistory: [...hist, { sender: 'user', text: replyText }],
+          };
+        }),
+      };
+    }
     msgs = [...msgs, { sender: 'ai', text: resp.text }, { sender: 'user', text: replyText }];
   }
 }
@@ -489,8 +583,9 @@ async function runOneType(type) {
   turnCount = 0;
   step2Idx = 0;
   usedPoints = new Set();
+  stanceSaid = false;
   step3RoleCount = {};
-  step3Stalls = 0;
+  step3Stalls = {};
   lastStep3P2 = '';
   step4Idx = 0;
   step4PasteCount = 0;

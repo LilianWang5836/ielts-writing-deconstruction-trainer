@@ -7767,6 +7767,77 @@ function enforceStep3LogicCompletionInner(
     data.progressUpdate.step3LastRejectCode = code;
   };
 
+  /**
+   * Server-side「meeting-minutes」backfill (deadlock root cause B, completed):
+   * When the student gave a substantive answer this turn but the model did NOT
+   * declare a valid mode=confirm (it kept asking / staged nothing / omitted
+   * step3SlotEval), the server records the student's own words onto the
+   * firstEmpty slot as a DRAFT pending — not confirmed, still gated by the
+   * student's affirm. This makes the server the record-keeper instead of
+   * waiting on the model's structured fields, eliminating the「请先把 X 说具体一
+   * 点」/ affirm_no_pending deadlock regardless of whether the model emitted
+   * mode=expand or no slotEval at all.
+   * Returns true when a draft pending was staged (caller should return).
+   */
+  const tryBackfillSubstantiveAnswer = (): boolean => {
+    if (!isSubstantiveStep3Answer(userMessage)) return false;
+    if (isStep3AffirmativeConfirmation(userMessage)) return false;
+    if (isStep3RejectMessage(userMessage)) return false;
+    const empty = findFirstEmptyPlanStep(plan);
+    if (!empty) return false;
+    const emptyStep =
+      plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+    if (!emptyStep || isStep3Confirmed(emptyStep)) return false;
+    // Pre-check hard-reject BEFORE staging: if the student's words would be
+    // rejected as a near-duplicate of an already-confirmed sibling (or any
+    // other hard-reject), staging it now only to have the affirm hard-rejected
+    // would loop forever (backfill → duplicate_sibling reject → backfill…).
+    // Skip the backfill and let the model/student re-express instead.
+    const emptyKey = String(
+      emptyStep?.key || `${empty.blockIndex}:${empty.stepIndex}`,
+    );
+    const preHard = hardRejectSlotText(
+      String(userMessage).trim(),
+      plan,
+      emptyKey,
+      empty.blockIndex,
+    );
+    if (!preHard.ok) {
+      console.warn(
+        `[Step3Guard] Backfill pre-check rejected (${preHard.code}) for「${empty.cleanStepLabel}」 — not staging; awaiting re-expression.`,
+      );
+      return false;
+    }
+    const didFill = applyStudentAnswerToTargetStep(
+      plan,
+      prevPlan,
+      userMessage,
+    );
+    if (!didFill) return false;
+    const filledStep =
+      plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
+    const filledText = String(filledStep?.value || "").trim();
+    if (!filledText) return false;
+    pending = [
+      {
+        key: String(
+          filledStep?.key || `${empty.blockIndex}:${empty.stepIndex}`,
+        ),
+        label: empty.cleanStepLabel || "当前这一环",
+        text: filledText,
+        blockIndex: empty.blockIndex,
+        stepIndex: empty.stepIndex,
+      },
+    ];
+    syncPlanProgressFields(data, plan, pending);
+    setReject("");
+    applyConfirmTurnText(data, pending);
+    console.warn(
+      `[Step3Guard] Server-recorded student answer as draft pending for「${empty.cleanStepLabel}」 (model did not declare confirm; awaiting student affirm).`,
+    );
+    return true;
+  };
+
   // Trust model text; strip forbidden meta / mid-flow English show-off; never long template overwrite.
   if (typeof data.text === "string") {
     data.text = stripStep3EnglishTranslationShow(
@@ -8388,48 +8459,11 @@ function enforceStep3LogicCompletionInner(
     // but never declares mode=confirm. (Deadlock root cause B: model output
     // instability — expand-only turns leave student content un-staged.)
     pending = [];
-    if (
-      isSubstantiveStep3Answer(userMessage) &&
-      !isStep3AffirmativeConfirmation(userMessage)
-    ) {
-      const empty = findFirstEmptyPlanStep(plan);
-      if (empty) {
-        const emptyStep =
-          plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
-        if (emptyStep && !isStep3Confirmed(emptyStep)) {
-          const didFill = applyStudentAnswerToTargetStep(
-            plan,
-            prevPlan,
-            userMessage,
-          );
-          if (didFill) {
-            const filledStep =
-              plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
-            const filledText = String(filledStep?.value || "").trim();
-            if (filledText) {
-              pending = [
-                {
-                  key: String(
-                    filledStep?.key ||
-                      `${empty.blockIndex}:${empty.stepIndex}`,
-                  ),
-                  label: empty.cleanStepLabel || "当前这一环",
-                  text: filledText,
-                  blockIndex: empty.blockIndex,
-                  stepIndex: empty.stepIndex,
-                },
-              ];
-              syncPlanProgressFields(data, plan, pending);
-              setReject("");
-              applyConfirmTurnText(data, pending);
-              console.warn(
-                `[Step3Guard] Expand-but-substantive — backfilled student answer as draft pending for「${empty.cleanStepLabel}」 (model kept asking but staged nothing).`,
-              );
-              return;
-            }
-          }
-        }
-      }
+    if (tryBackfillSubstantiveAnswer()) {
+      console.warn(
+        "[Step3Guard] Expand path — backfilled student answer as draft pending.",
+      );
+      return;
     }
     syncPlanProgressFields(data, plan, []);
     const vetoed = enforceStep3TextBoardConsistency(
@@ -8456,6 +8490,18 @@ function enforceStep3LogicCompletionInner(
   }
 
   // No new confirm eval: keep existing pending (if any) or finish/continue.
+  // If the model emitted NO valid slotEval at all (mode empty / missing), we
+  // must NOT fall back to "wait for the model" — the server records the
+  // student's substantive answer itself (meeting-minutes), otherwise the flow
+  // deadlocks on「请先把 X 说具体一点」whenever the model's structured field is
+  // truncated/absent. This is the completion of deadlock root cause B.
+  if (pending.length === 0 && tryBackfillSubstantiveAnswer()) {
+    console.warn(
+      "[Step3Guard] No slotEval — backfilled student answer as draft pending (server-recorded).",
+    );
+    return;
+  }
+
   if (pending.length > 0) {
     // Single-slot revision without declared confirm: if coach text already
     // contains a reorganized sentence, upgrade pending so board/CTA match it.
