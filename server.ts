@@ -106,6 +106,12 @@ import {
   activeSlotLabel,
   isSkeletonComplete,
 } from "./src/server/step3/secretary";
+import {
+  evaluateMinute,
+  findSlotDef,
+  confirmedMinutes,
+  formatLensAnchor,
+} from "./src/server/step3/lens";
 import { toSkeleton, planToSkeleton, skeletonFlatSlots } from "./src/utils/step3Skeleton";
 import { log } from "./src/server/logger";
 
@@ -3864,6 +3870,42 @@ function formatStep3SlotCursorForPrompt(activeSp: any): string {
   return lines.join("\n");
 }
 
+/** P2 教练上下文瘦身：把整个 subpoints 数组压缩为每个 body 一行摘要
+ *  （body 主题 + 已确认槽数 + 是否完成），不再把 minutes/旧字段全量塞给 LLM。 */
+function formatStep3SubpointsBrief(subpoints: any[]): string {
+  if (!Array.isArray(subpoints) || subpoints.length === 0) {
+    return "Not provided";
+  }
+  const lines = subpoints.map((sp: any, i: number) => {
+    const id = String(sp?.id || `body-${i + 1}`);
+    const claim = String(sp?.content || sp?.theme || "").trim().slice(0, 40) || "未命名";
+    const minutes = Array.isArray(sp?.minutes) ? sp.minutes : [];
+    const confirmed = minutes.filter(
+      (m: any) => m.status === "confirmed" && m.slotKey,
+    ).length;
+    const isDone = confirmed > 0 && sp?.isCompleted === true;
+    return `  - Body ${id}: 「${claim}」 已确认 ${confirmed} 槽${isDone ? " ✅ 已完成" : ""}`;
+  });
+  return lines.join("\n");
+}
+
+/** P2 判断透镜：为当前 active subpoint 生成"当前槽期望"锚点（注入教练上下文）。 */
+function formatLensAnchorForActiveSubpoint(activeSp: any): string {
+  if (!activeSp || !Array.isArray(activeSp.skeleton?.blocks)) {
+    return "Not provided (no active subpoint).";
+  }
+  const flat = skeletonFlatSlots(activeSp.skeleton);
+  const minutes = Array.isArray(activeSp.minutes) ? activeSp.minutes : [];
+  const confirmedKeys = new Set(
+    minutes
+      .filter((m: any) => m.status === "confirmed" && m.slotKey)
+      .map((m: any) => m.slotKey as string),
+  );
+  const firstEmpty = flat.find((f) => !confirmedKeys.has(f.slot.key));
+  if (!firstEmpty) return "(本主体段已完整，无待填槽)";
+  return formatLensAnchor(firstEmpty.slot, activeSp.skeleton.chainType);
+}
+
 /** Body 1 ≈ A面 / supports; Body 2 ≈ B面 / concedes for side_by_side essays. */
 
 /**
@@ -4534,6 +4576,35 @@ function enforceStep3SecretaryPath(
       );
     }
   }
+
+  // P2 判断透镜：对本次实质回答做确定性质量评估（审计 + 记录 LLM 评估）。
+  try {
+    const landedSlotKey = land.ok ? land.slotKey : minute.slotKey;
+    const slotDef = findSlotDef(sp.skeleton, String(landedSlotKey || ""));
+    if (slotDef) {
+      const lens = evaluateMinute(
+        msg,
+        slotDef,
+        confirmedMinutes(sp),
+        sp.skeleton?.chainType,
+      );
+      const llmAssessment = data.step3Assessment &&
+        typeof data.step3Assessment === "object" &&
+        data.step3Assessment.slotKey === landedSlotKey
+        ? data.step3Assessment
+        : null;
+      console.warn(
+        `[Lens] minute=${minute.id} slotKey=${landedSlotKey} verdict=${lens.verdict} reason=${lens.reason}${llmAssessment ? ` | llm=${llmAssessment.verdict} (${String(llmAssessment.reason || '').slice(0, 30)})` : ""}`,
+      );
+      // 太薄 / 跑题：给教练一个可选的追问提示（不作为模板，由教练自由措辞）。
+      if (lens.verdict === "thin" || lens.verdict === "off_target") {
+        data.progressUpdate.secretaryLensHint = lens.hint || "";
+      }
+    }
+  } catch (e: any) {
+    console.warn(`[Lens] error: ${e?.message || e}`);
+  }
+
   data.progressUpdate.secretaryBoard = renderBoard(sp);
   data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
 }
@@ -8082,13 +8153,16 @@ ${step2Summary}
 
 [Step 3 (Drafting) Ideas]:
 - Paragraph Drafts: ${step3Draft || "Not provided"}
-- Subpoint logic chains: ${JSON.stringify(step3Subpoints)}
+- Body 摘要（各主体段主题 + 已确认槽数；不展开 minutes）:
+${formatStep3SubpointsBrief(step3Subpoints)}
 - Active Subpoint (= starting claim for this turn): ${activeStep3Claim || "Not selected / not provided"}
 - Active Subpoint belongs to: ${activeStep3Subpoint?.targetBody || "Unknown"}
 - Step 2 Body Framework for Active Subpoint (INTERNAL — the frozen skeleton for this body; do not echo field names to student):
 ${activeFrameworkStr}
 - Step 3 slot cursor (INTERNAL — firstEmpty / confirmed siblings / pending; do not echo to student):
 ${step3SlotCursorStr}
+- Step 3 judgment lens (INTERNAL — what "good enough" means for the current slot; use it to decide thin/off_target/duplicate, but phrase your question naturally, never read the lens to the student):
+${formatLensAnchorForActiveSubpoint(activeStep3Subpoint)}
 - Step 2 mapped brainstorm points are QUESTION CUES only for this body's coaching: use them to shape the firstEmpty Socratic ask. FORBIDDEN: organizing them into multi-slot draft values / a confirm bundle / mode=confirm on kickoff or before the student has spoken this beat in Step 3.
 - Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. The server (meeting secretary) owns the skeleton and slot landing — you only produce dialogue. Start by asking the first still-missing slot (see slot cursor). Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
 - Mode hint: structure is already frozen by the server; do NOT propose paragraph modes / paragraphPlan / direct_points in Step 3. Just coach the current slot conversationally.
@@ -8493,6 +8567,12 @@ ${memoryDigestStr}
   ## STEP 3 DIALOGUE FOCUS (what actually matters now):
   - Never invent from zero. Expand the student's Step 2 material as a seed: "你提到超长时间工作——这对家人陪伴具体会怎样？"
   - One micro-step per turn: ask ONLY the first still-missing slot (per slot cursor). When the student answers, either acknowledge and guide to confirm (if their answer fills the slot), or ask one deeper follow-up (if shallow). At most ONE depth follow-up per slot.
+  - JUDGMENT LENS (P2 — let the follow-up depend on the answer, not a template): the "Step 3 judgment lens" in ContextSummary tells you what "good enough" means for the current slot. After the student answers, classify it:
+    - thin / abstract (short slogan, no concrete scene/object/mechanism) → ask ONE follow-up scoped to THIS slot, offering 1–2 concrete directions tied to their own words. Never hand them a finished sentence.
+    - off_target (they answered a different argument beat) → name the mismatch in one short sentence and guide back to THIS slot. Do NOT open with empty praise.
+    - duplicate (repeats a confirmed sibling) → say briefly it's already recorded, ask for a NEW angle.
+    - ok (fills the slot) → acknowledge briefly, then guide confirm / next slot.
+    Use the lens to DECIDE the follow-up type, but phrase every question naturally and reference what the student actually said — never read the lens verbatim.
   - If the student's answer is off-target for the current slot, name the mismatch in one short sentence, then guide back — do NOT open with empty praise.
   - Anti-loop: never re-ask the same question 3+ times; after one depth follow-up, accept concise content and move on.
   - Do NOT propose paragraph modes, pointBlock splits, direct_points / total_then_points, or any structural scheme — the skeleton is already frozen.
@@ -8619,6 +8699,7 @@ JSON Output Schema rules:
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
   - For Step 3: STRUCTURE IS FULLY SERVER-OWNED (meeting secretary). The server owns the frozen skeleton, lands the student's words into slots, and writes the board after confirm. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / any structure JSON in Step 3. Your ONLY job in Step 3 is a high-quality Socratic dialogue "text": read the Step 3 slot cursor in ContextSummary (firstEmpty label / confirmed siblings / pending), ask the first still-missing slot in natural Chinese, briefly acknowledge the student's answer, and guide them to confirm. Do not waste output tokens fabricating structure that the server already manages deterministically.
+  - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. This is INTERNAL (server uses it for audit + hints) — never echo it in "text". Keep it optional; "text" remains your priority.
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
@@ -8646,6 +8727,33 @@ Student says:
                 type: Type.STRING,
                 description:
                   "The AI Coach's message to the student. This string MUST consist of exactly two sections separated by a line containing ONLY '---'. Part 1 (above '---') is the validation/feedback of the student's answer. Part 2 (below '---') is the NEXT Socratic guiding question in the sequence (e.g. asking about Core Issue, Key Constraints, or Contradiction) or Next-Step Call-to-Action. YOU MUST NEVER OMIT PART 2 AND MUST NEVER OMIT THE '---' SEPARATOR.",
+              },
+              step3Assessment: {
+                type: Type.OBJECT,
+                description:
+                  "Step 3 ONLY. Optional structured quality assessment of the student's latest answer against the current slot (judgment lens). Server uses it for audit + next-turn lens hints. Omit or emit minimal when not Step 3.",
+                properties: {
+                  slotKey: {
+                    type: Type.STRING,
+                    description: "The slot key this answer was assessed against (must match the slot cursor firstEmpty).",
+                  },
+                  verdict: {
+                    type: Type.STRING,
+                    enum: ["ok", "thin", "off_target", "duplicate"],
+                    description:
+                      "ok = acceptable; thin = too shallow/abstract, needs a concrete follow-up; off_target = answered a different argument beat; duplicate = repeats a confirmed sibling.",
+                  },
+                  reason: {
+                    type: Type.STRING,
+                    description: "ONE short Chinese sentence: why this verdict (internal, not student-facing).",
+                  },
+                  nextHint: {
+                    type: Type.STRING,
+                    description:
+                      "Optional one-line coaching direction for the next question (NOT a template; the coach phrases it naturally). Empty when verdict=ok.",
+                  },
+                },
+                required: ["slotKey", "verdict", "reason"],
               },
               progressUpdate: {
                 type: Type.OBJECT,
