@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useImperativeHandle,
+  forwardRef,
+} from 'react';
 import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
@@ -42,10 +48,33 @@ interface CoachChatProps {
   kickoffPrompt?: string;
   kickoffContextKey?: string;
   inputDisabled?: boolean;
+  /** loading 变化时通知父组件（Step3 秘书看板「确认写板」按钮据此禁用/启用）。 */
+  onLoadingChange?: (loading: boolean) => void;
   children?: React.ReactNode; // For any extra structured evaluation UI
 }
 
-export default function CoachChat({
+/** 暴露给父组件（Step3 看板「确认写板」按钮）的命令式句柄。 */
+export interface CoachChatHandle {
+  /** 发送一条学生消息（如纯「对」确认秘书 landed 内容）。 */
+  sendUserMessage: (
+    text: string,
+    options?: {
+      hiddenUserMessage?: boolean;
+      targetSubpointId?: string;
+      decision?: {
+        type: string;
+        action: string;
+        claim?: string;
+        proposalId?: string;
+        legacyType?: string;
+      };
+    },
+  ) => void;
+  loading: boolean;
+}
+
+const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat(
+  {
   topic,
   step,
   stepKey,
@@ -57,10 +86,18 @@ export default function CoachChat({
   kickoffPrompt = '',
   kickoffContextKey = '',
   inputDisabled = false,
+  onLoadingChange,
   children,
-}: CoachChatProps) {
+}: CoachChatProps,
+  ref: React.Ref<CoachChatHandle>,
+) {
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
+
+  // 把 loading 状态同步给父组件（ref 更新不会触发父组件重渲染，需用回调）。
+  useEffect(() => {
+    onLoadingChange?.(loading);
+  }, [loading, onLoadingChange]);
   const [errorMsg, setErrorMsg] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1066,6 +1103,18 @@ export default function CoachChat({
     await sendUserMessage(text);
   };
 
+  // 暴露发送能力给父组件（Step3 秘书看板「确认写板」按钮）。
+  useImperativeHandle(
+    ref,
+    () => ({
+      sendUserMessage: (text, options) => {
+        void sendUserMessage(text, options);
+      },
+      loading,
+    }),
+    [loading, chatHistory, session],
+  );
+
   const handleResetChat = () => {
     // Cancel in-flight turn so a late response cannot restore old chat.
     abortControllerRef.current?.abort();
@@ -1601,4 +1650,6 @@ export default function CoachChat({
       </form>
     </div>
   );
-}
+});
+
+export default CoachChat;

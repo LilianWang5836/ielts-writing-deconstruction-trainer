@@ -13,7 +13,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { Topic, PracticeSession } from "../types";
-import CoachChat from "./CoachChat";
+import CoachChat, { CoachChatHandle } from "./CoachChat";
 import {
   computeEssayFrameworkSignature,
   computeSubpointFrameworkSignature,
@@ -87,6 +87,17 @@ export default function Step3Drafting({
   >("step3");
   const [showClearBoardConfirm, setShowClearBoardConfirm] = useState(false);
   const hasAutoSelectedRef = useRef(false);
+  // 秘书看板「确认写板」按钮 → 调用 CoachChat 发送纯「对」确认 landed 内容。
+  const coachChatRef = useRef<CoachChatHandle>(null);
+  // 同步 CoachChat 的 loading 状态（ref 更新不触发父组件重渲染，故用回调存本地 state）。
+  const [coachLoading, setCoachLoading] = useState(false);
+
+  /** 确认当前 landed 待写板内容（发送纯「对」，由服务器秘书 commitPendingMinute）。 */
+  const confirmLanded = (targetSubpointId: string) => {
+    coachChatRef.current?.sendUserMessage("对", {
+      targetSubpointId,
+    });
+  };
 
   const subpointsStr =
     session.step2.coachEvaluation?.userPoints ||
@@ -591,10 +602,21 @@ export default function Step3Drafting({
                   {slot.label}
                 </span>
                 {slot.pending ? (
-                  <p className="text-xs md:text-[12.5px] mt-0.5 leading-relaxed bg-amber-50/70 border border-amber-200/70 rounded-md px-2 py-1 text-slate-700">
-                    <span className="text-amber-600 font-bold">待确认：</span>
-                    {slot.pending}
-                  </p>
+                  <div className="mt-0.5 bg-amber-50/70 border border-amber-200/70 rounded-md px-2 py-1">
+                    <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-700">
+                      <span className="text-amber-600 font-bold">待确认：</span>
+                      {slot.pending}
+                    </p>
+                    <button
+                      type="button"
+                      disabled={coachLoading}
+                      onClick={() => confirmLanded(activeSubpoint?.id || '')}
+                      className="mt-1 inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2 py-0.5 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3 w-3" />
+                      确认写板
+                    </button>
+                  </div>
                 ) : (
                   <p
                     className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
@@ -621,12 +643,14 @@ export default function Step3Drafting({
       {/* LEFT COLUMN: AI Coach Dialogue Area */}
       <div className="lg:col-span-5 xl:col-span-5 h-[480px] lg:h-full flex flex-col min-h-0">
         <CoachChat
+          ref={coachChatRef}
           topic={topic}
           step={3}
           stepKey="step3"
           session={session}
           onUpdateSession={onUpdateSession}
           stepContext={{ subpoints }}
+          onLoadingChange={setCoachLoading}
           welcomeMessage={welcomeMessage}
           autoKickoff={true}
           kickoffPrompt={kickoffPrompt}

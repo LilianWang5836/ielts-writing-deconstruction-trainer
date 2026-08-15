@@ -10760,6 +10760,7 @@ CRITICAL — REDUCE OVERLAP / EASE PARAPHRASE (introStance + conclusion):
 - Keep lexical overlap with the Full stance string LOW (avoid reusing long identical chunks).
 - Each of the three fields remains ONE Chinese sentence.
 - Do NOT include bullets, numbering, or explanation text.
+- Output a JSON object with exactly the keys introParaphrase, introStance, conclusion (the JSON must be valid and contain no other text).
       `;
 
       const introConclusionResponse = await generateContentWithFallback({
