@@ -115,6 +115,15 @@ import {
 } from "./src/server/step2/proposal";
 import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-agent";
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
+import {
+  appendMinute,
+  landMinuteToSlot,
+  commitPendingMinute,
+  renderBoard,
+  activeSlotLabel,
+  isSkeletonComplete,
+} from "./src/server/step3/secretary";
+import { toSkeleton, planToSkeleton } from "./src/utils/step3Skeleton";
 import { log } from "./src/server/logger";
 
 dotenv.config();
@@ -3084,6 +3093,10 @@ function isParagraphPlanFilled(plan: any): boolean {
 /** Board-quality gate for a Step 3 body. Never trust isCompleted alone. */
 function isSubpointQualityComplete(sp: any): boolean {
   if (!sp) return false;
+  // 会议秘书新路径：骨架填满 = 全部槽 confirmed（从 minutes 判定）
+  if (Array.isArray(sp.skeleton?.blocks) && sp.skeleton.blocks.length > 0) {
+    return isSkeletonComplete(sp);
+  }
   if (sp.paragraphPlan) return isParagraphPlanFilled(sp.paragraphPlan);
   if (Array.isArray(sp.structureSteps) && sp.structureSteps.length > 0) {
     return sp.structureSteps.every((s: any) => isStep3Confirmed(s));
@@ -3093,6 +3106,16 @@ function isSubpointQualityComplete(sp: any): boolean {
 
 /** At least one real student utterance in this body's chat (not kickoff/filler). */
 function subpointHasStudentDialogue(sp: any): boolean {
+  // 会议秘书新路径：有已落槽/已确认的学生纪要即视为有对话
+  if (Array.isArray(sp.skeleton?.blocks) && sp.skeleton.blocks.length > 0) {
+    const mins = Array.isArray(sp.minutes) ? sp.minutes : [];
+    return mins.some(
+      (m: any) =>
+        m?.role === "student" &&
+        m?.slotKey &&
+        (m.status === "landed" || m.status === "confirmed"),
+    );
+  }
   const hist = Array.isArray(sp?.chatHistory) ? sp.chatHistory : [];
   return hist.some((m: any) => {
     if (m?.sender !== "user") return false;
@@ -7537,6 +7560,21 @@ function enforceStep3LogicCompletion(
     (sp: any) => sp.id === activeId,
   );
 
+  // 会议秘书新路径：subpoint 已带冻结骨架 → 走秘书逻辑（纪要 + 确定性落槽）。
+  // 否则回退旧逻辑（整树 diff + guards）。逐步迁移，两路径共存直到旧路径下线。
+  if (activeSp && Array.isArray(activeSp.skeleton?.blocks) && activeSp.skeleton.blocks.length > 0) {
+    try {
+      enforceStep3SecretaryPath(data, session, activeSp, userMessage, options);
+    } catch (e: any) {
+      console.warn(`[Secretary] path error (fallback to legacy): ${e?.message || e}`);
+    }
+    attachStep3UiProgress(data, session, activeId, {
+      currentUserMessage: userMessage,
+      isHiddenKickoff: options?.isHiddenKickoff,
+    });
+    return;
+  }
+
   try {
     enforceStep3LogicCompletionInner(data, session, userMessage, options, activeId, activeSp);
   } finally {
@@ -7545,6 +7583,119 @@ function enforceStep3LogicCompletion(
       isHiddenKickoff: options?.isHiddenKickoff,
     });
   }
+}
+
+/**
+ * 会议秘书路径（restructure 新架构）。
+ *
+ * 学生说什么 → 记 minutes（真相源）→ 确定性落槽 → 确认写板。
+ * 看板是 renderBoard 的投影，不再持久化任何槽位内容。
+ *
+ * 本路径在 activeSp 带冻结 skeleton 时启用；否则走旧 enforceStep3LogicCompletionInner。
+ */
+function enforceStep3SecretaryPath(
+  data: any,
+  session: any,
+  activeSp: any,
+  userMessage: string,
+  options?: { isHiddenKickoff?: boolean },
+): void {
+  if (!data?.progressUpdate) return;
+  const sp = activeSp;
+  if (!sp || !Array.isArray(sp.skeleton?.blocks)) return;
+
+  // 确保 minutes 数组存在
+  if (!Array.isArray(sp.minutes)) sp.minutes = [];
+
+  const msg = String(userMessage || "").trim();
+  const isKickoff = !!options?.isHiddenKickoff;
+
+  // ---- kickoff：记录教练开场，输出引导，不落槽 ----
+  if (isKickoff) {
+    appendMinute(sp, "coach", String(data?.text || "我们开始构建这个主体段。").split("\n---\n")[0]);
+    data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    data.progressUpdate.secretaryBoard = renderBoard(sp);
+    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+    return;
+  }
+
+  // ---- 常规轮：分类学生发言 ----
+  const isAff = /^(对|好|是|嗯|可以|同意|采纳|确认|行|就按|确认写入|点击确认|确认提交)[。.!！?？]?$/.test(msg) || /确认写入|点击确认/.test(msg);
+  const isRej = /^(不对|不好|不是|重说|重写|换一个|去掉|不要|改一下|重新说)[。.!！?？]?$/.test(msg) || /拒绝|否决|撤销/.test(msg);
+
+  // 找当前 landed 待确认纪要（若有）
+  const landed = (sp.minutes || []).find((m: any) => m.status === "landed");
+
+  if (isAff && landed) {
+    // 确认 → 写板
+    commitPendingMinute(sp, landed);
+    data.progressUpdate.step3SubpointCompleted = isSkeletonComplete(sp);
+    data.progressUpdate.isCompleted = data.progressUpdate.step3SubpointCompleted;
+    data.progressUpdate.secretaryBoard = renderBoard(sp);
+    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+    return;
+  }
+
+  if (isRej) {
+    // 拒绝 → 该条 landed 回退为 recorded，不写板
+    if (landed) {
+      landed.status = "recorded";
+      landed.slotKey = undefined;
+    }
+    data.progressUpdate.secretaryBoard = renderBoard(sp);
+    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+    return;
+  }
+
+  // 实质回答 → 记纪要并尝试落槽
+  const minute = appendMinute(sp, "student", msg);
+  const land = landMinuteToSlot(sp, minute);
+  if (land.ok) {
+    // 已落为 landed（draft），等学生确认
+    data.progressUpdate.step3SubpointCompleted = false;
+  } else {
+    // rejected / 无空槽 / 无骨架 → 记录但看板不变
+    data.progressUpdate.step3SubpointCompleted = false;
+    if (land.reason) {
+      data.progressUpdate.secretaryRejectReason = land.reason;
+    }
+  }
+  data.progressUpdate.secretaryBoard = renderBoard(sp);
+  data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+}
+
+/**
+ * 骨架初始化（后端核心优先）：subpoint 尚无冻结骨架但 session 已有 Planner bodyPlans 时，
+ * 由后端生成 skeleton 并初始化 minutes。这是新架构的真相源注入点。
+ * 返回是否已初始化。
+ */
+function ensureStep3SkeletonForSubpoints(session: any): boolean {
+  const step3 = session?.step3;
+  if (!step3 || !Array.isArray(step3.subpoints) || step3.subpoints.length === 0) {
+    return false;
+  }
+  const bodyPlans = session?.step2_5?.bodyPlans;
+  if (!Array.isArray(bodyPlans) || bodyPlans.length === 0) return false;
+
+  let initialized = false;
+  step3.subpoints.forEach((sp: any) => {
+    if (sp && Array.isArray(sp.skeleton?.blocks) && sp.skeleton.blocks.length > 0) {
+      return; // 已有骨架，跳过
+    }
+    const bp = bodyPlans.find((b: any) => String(b?.id) === String(sp?.id));
+    const skeleton = bp ? toSkeleton(bp) : sp?.paragraphPlan ? planToSkeleton(sp.paragraphPlan) : null;
+    if (skeleton && skeleton.blocks.length > 0) {
+      sp.skeleton = skeleton;
+      if (!Array.isArray(sp.minutes)) sp.minutes = [];
+      if (typeof sp.activeSlotIndex !== "number") sp.activeSlotIndex = 0;
+      initialized = true;
+    }
+  });
+  if (initialized) {
+    console.warn(`[Secretary] Initialized frozen skeleton for ${step3.subpoints.length} subpoint(s).`);
+  }
+  return initialized;
 }
 
 /**
@@ -13893,6 +14044,11 @@ Student says:
       }
 
       // Step 3 completion safety net
+
+      // 会议秘书：若 subpoint 尚无冻结骨架，后端从 Planner bodyPlans 初始化骨架 + minutes。
+      if (currentStepNum === 3) {
+        ensureStep3SkeletonForSubpoints(session);
+      }
 
       // Step 3 completion safety net: merge prior values, backfill a missed last
       // step from the user message, and clear premature completion CTA / flags

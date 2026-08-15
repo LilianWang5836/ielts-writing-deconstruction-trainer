@@ -152,6 +152,121 @@ export interface ChatMessage {
   isSplit?: boolean;
 }
 
+// ============================================================
+// 会议秘书（Meeting Secretary）类型 — restructure 新架构
+// ============================================================
+
+/** 论证骨架的语义槽类型（P2 判断透镜的锚点）。 */
+export type Step3SlotSemantic =
+  | 'claim'
+  | 'reason'
+  | 'mechanism'
+  | 'impact'
+  | 'example'
+  | 'scenario'
+  | 'solution';
+
+/** 单个论证槽：只描述"结构"（期望什么内容），不存学生内容。 */
+export interface Step3Slot {
+  key: string;
+  label: string;
+  placeholder: string;
+  semantic: Step3SlotSemantic;
+}
+
+/** 一个 body 的论证块（对应旧 pointBlock）。 */
+export interface Step3SkeletonBlock {
+  id: string;
+  label: string;
+  subClaim: string;
+  role: 'major' | 'minor';
+  slots: Step3Slot[];
+}
+
+/** 冻结骨架：Planner/题型生成一次，之后只读。 */
+export interface Step3Skeleton {
+  blocks: Step3SkeletonBlock[];
+  chainType:
+    | 'cause_effect'
+    | 'problem_solution'
+    | 'concession'
+    | 'support'
+    | 'compare'
+    | 'parallel';
+}
+
+/** 会议纪要：学生/教练原话（保真），唯一真相源。 */
+export interface Step3Minute {
+  id: string;
+  role: 'student' | 'coach';
+  text: string;
+  ts: number;
+  slotKey?: string;
+  status: 'recorded' | 'landed' | 'confirmed' | 'rejected';
+  rejectReason?: string;
+  fromCoachAsk?: string;
+}
+
+/** Step 3 的一个主体段（body）。含会议秘书新架构字段。 */
+export interface Step3Subpoint {
+  id: string;
+  content: string;
+  points?: string[];
+  targetBody?: string;
+  theme?: string;
+  /** Carried from Step 2 clustering; internal, not rendered in UI. */
+  paragraphDensity?: BodyParagraphDensity;
+  pointRoles?: BodyPointRole[];
+  argumentRelation?: ArgumentRelation;
+  stanceRelation?: BodyStanceRelation;
+  layoutRationale?: string;
+  /** Fingerprint of Step 2 framework handoff; used to invalidate stale plans. */
+  frameworkSignature?: string;
+  draft?: string;
+  hint?: string;
+  isCompleted: boolean;
+  /** Server-authored: whether this body tab may be selected (sequential lock). */
+  selectable?: boolean;
+  claim?: string;
+  mechanism?: string;
+  result?: string;
+  reason?: string;
+  supportType?: 'example' | 'mechanism' | 'scenario';
+  supportContent?: string;
+  impact?: string;
+  completenessChecks?: { label: string; passed: boolean; desc: string }[];
+  transitionChecks?: { label: string; passed: boolean; desc: string }[];
+  sufficiencyCheck?: { label: string; passed: boolean; desc: string };
+  paragraphPlan?: ParagraphPlan;
+  structureSteps?: LogicStep[];
+  /**
+   * Confirm-then-write pending drafts (chat-only). Server-synced from
+   * validated step3SlotEval.pendingText; written only on student affirm.
+   * Persisted across turns on this subpoint (including body switches).
+   */
+  kickoffPendingDrafts?: {
+    key: string;
+    label: string;
+    text: string;
+    blockIndex: number;
+    stepIndex: number;
+  }[];
+  /** Last server hard-reject code (empty/theme_label/duplicate_sibling/…). */
+  lastRejectCode?: string;
+  /** Last model slot eval echoed for debugging / next-turn context. */
+  step3SlotEval?: Step3SlotEval;
+  chatHistory?: ChatMessage[];
+  // ============================================================
+  // 会议秘书新架构字段（restructure）
+  // ============================================================
+  /** 冻结骨架（Planner 生成一次，之后只读）。新架构真相结构。 */
+  skeleton?: Step3Skeleton;
+  /** 会议纪要（唯一真相源）：学生/教练原话流水。 */
+  minutes?: Step3Minute[];
+  /** 当前推进到第几个槽（skeleton 展开后的全局槽下标）。 */
+  activeSlotIndex?: number;
+}
+
 export interface LogicStep {
   key: string;
   label: string;
@@ -383,55 +498,7 @@ export interface PracticeSession {
   step3: {
     selectedTemplateId?: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
     userDraft?: string;
-    subpoints: {
-      id: string;
-      content: string;
-      points?: string[];
-      targetBody?: string;
-      theme?: string;
-      /** Carried from Step 2 clustering; internal, not rendered in UI. */
-      paragraphDensity?: BodyParagraphDensity;
-      pointRoles?: BodyPointRole[];
-      argumentRelation?: ArgumentRelation;
-      stanceRelation?: BodyStanceRelation;
-      layoutRationale?: string;
-      /** Fingerprint of Step 2 framework handoff; used to invalidate stale plans. */
-      frameworkSignature?: string;
-      draft?: string;
-      hint?: string;
-      isCompleted: boolean;
-      /** Server-authored: whether this body tab may be selected (sequential lock). */
-      selectable?: boolean;
-      claim?: string;
-      mechanism?: string;
-      result?: string;
-      reason?: string;
-      supportType?: 'example' | 'mechanism' | 'scenario';
-      supportContent?: string;
-      impact?: string;
-      completenessChecks?: { label: string; passed: boolean; desc: string }[];
-      transitionChecks?: { label: string; passed: boolean; desc: string }[];
-      sufficiencyCheck?: { label: string; passed: boolean; desc: string };
-      paragraphPlan?: ParagraphPlan;
-      structureSteps?: LogicStep[];
-      /**
-       * Confirm-then-write pending drafts (chat-only). Server-synced from
-       * validated step3SlotEval.pendingText; written only on student affirm.
-       * Persisted across turns on this subpoint (including body switches).
-       */
-      kickoffPendingDrafts?: {
-        key: string;
-        label: string;
-        text: string;
-        blockIndex: number;
-        stepIndex: number;
-      }[];
-      /** Last server hard-reject code (empty/theme_label/duplicate_sibling/…). */
-      lastRejectCode?: string;
-      /** Last model slot eval echoed for debugging / next-turn context. */
-      step3SlotEval?: Step3SlotEval;
-      chatHistory?: ChatMessage[];
-    }[];
+    subpoints: Step3Subpoint[];
     activeSubpointId?: string;
     isCompleted: boolean;
     chatHistory?: ChatMessage[];
