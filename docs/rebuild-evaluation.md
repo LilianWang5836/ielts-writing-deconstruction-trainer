@@ -7,7 +7,7 @@
 
 ## 0. 结论速览
 
-**总体符合预期，P0/P1/P2/P3 的架构目标全部落地并经多轮验证。** 相比旧架构，状态漂移的死锁根因（结构被 LLM 反复改写 + 双真相源）已被架构性消灭；判断质量通过透镜 + 瘦身 + 护栏分层提升。存在 **1 项未 100% 满足的验收点**（P0「旧字段全删」——兼容/防御性旧字段仍有残留）和 **1 项已知取舍**（Planner 仍输出 paragraphPlan 再转 skeleton，而非 LLM 直接输出 skeleton），二者均不影响运行正确性，属后续清理项。
+**总体符合预期，P0/P1/P2/P3 的架构目标全部落地并经多轮验证。** 相比旧架构，状态漂移的死锁根因（结构被 LLM 反复改写 + 双真相源）已被架构性消灭；判断质量通过透镜 + 瘦身 + 护栏分层提升。P0「旧字段全删」的最大残留（惰性 guard）已于补完提交（`b083d62`，-473 行）清除。现存剩余差距为**小型防御性回退**（Step2 正常使用 + Step3 旧会话兼容分支）和 **1 项已知取舍**（Planner 仍输出 paragraphPlan 再转 skeleton），均不影响运行正确性，可结合「Planner skeleton 直出」最终收口。
 
 ---
 
@@ -24,14 +24,16 @@
 | `6e4f032` | **P2 判断透镜 + 教练瘦身 + 结构化评估** | +110 |
 | `a7a4a08` | **P3 判断护栏（切题预检 + 卡死检测）** | +19 |
 | `bdb747c` | 前端优化：确认写板按钮 + Step4 json 修复 | +1 |
+| `b083d62` | **P0 补完：删除惰性 paragraphPlan guard + 归档旧脚本** | **-473** |
 
 **规模削减（复杂度控制核心指标）：**
 
 ```
 rebuild 起点 server.ts   16,094 行
-当前 HEAD server.ts      11,669 行
-净削减                    4,425 行（-27.5%）
-P0 阶段一次性削减         4,349 行
+当前 HEAD server.ts      11,205 行
+净削减                    4,889 行（-30.4%）
+P0 阶段一次性削减         4,349 行（b0a2d28）
+P0 补完再削减             473 行（b083d62）
 ```
 
 → 后端 Step3 逻辑从「merge + guards + backfill + reclass + framework 校验」的多机制并存，收敛为 4 个确定性函数 + 1 个 dup 预检（`src/server/step3/secretary.ts`），与设计 §3.2 完全一致。
@@ -107,17 +109,19 @@ P0 阶段一次性削减         4,349 行
 
 ### (a) P0「旧字段全删」未 100% ⚠️ — 主要差距
 
-server.ts 中旧字段引用约 72 处，其中活跃代码约 53 处：
+> ✅ 2026-08-15 已大幅改善（commit `b083d62`）：两处最大的惰性 guard（flat-wrap 回包 + 投影）及 mode-correction 死代码链已删除，server.ts -473 行，旧字段引用 72→48。
+
+server.ts 中旧字段引用当前约 48 处（含注释/提示词说明）：
 
 - **`step3SlotEval`**：无活跃代码依赖，仅存在于注释 + 提示词「不要输出」说明（≈安全，可视为已删）
-- **`paragraphPlan`（~50 处活跃）**：多为**防御性/兼容 guard**，例如：
-  - `9414` 附近：flat `step3SubpointSteps` → paragraphPlan 回包 wrap（LLM 已被告知不输出这些字段，实际几乎不触发）
-  - `9540` 附近：paragraphPlan 投影 guard
-  - `attachStep3UiProgress`（`3015`）：仍在处理 paragraphPlan 结构
-  - 骨架初始化（`4654`）：`sp?.paragraphPlan ? planToSkeleton(sp.paragraphPlan)` 作为回退路径（对新会话走 Planner 冻结 skeleton，此回退只为旧会话兼容）
-  - Step1/Step2 的正常 paragraphPlan 使用（这些步骤本就该保留）
+- **`paragraphPlan`（剩余活跃）**：
+  - Step2 反漂移检测（`4451`/`5225` 附近：Step2 误输出 paragraphPlan 时强制完成）——**语义仍有效，保留**
+  - Step2 正常使用（`7408` subClaim 提取、prompts 说明）——**应保留**
+  - Step3 防御性回退分支（`isSubpointQualityComplete` / `resolveStep3NextAskClamp` 内的 paragraphPlan/structureSteps 分支）——骨架存在时不走，**保留**为旧会话防御
+  - 骨架初始化回退（`planToSkeleton(sp.paragraphPlan)`）——**保留**（旧会话兼容，仅当放弃历史会话才可删）
+  - `attachStep3UiProgress`（`3015`）——仍在读取 progressUpdate.paragraphPlan 合并到 mergedSp（plan 为 null 时为空展开，无害）
 
-→ **判断**：这些是**惰性兼容层**，不参与秘书主路径、不影响运行正确性，但确实没做到「全删」。若要满足 v2「删除优先 + 不做兼容层」的字面要求，需后续专项清理（可在确认 Planner 直接输出 skeleton 后删除回退）。
+→ **判断**：两处最大惰性 guard 已删，剩余多为 Step2 正常使用或 Step3 防御性回退（正确性不受影响）。「全删」的剩余差距已显著缩小，可结合 Planner skeleton 直出（§6 第 2 项）最终收口。
 
 ### (b) Planner 仍输出 paragraphPlan 而非 skeleton 直出
 
@@ -159,8 +163,10 @@ server.ts 中旧字段引用约 72 处，其中活跃代码约 53 处：
 
 ## 6. 建议的后续工作（按优先级）
 
-1. **（清理）** 删除 server.ts 中惰性 paragraphPlan 兼容 guard（9414/9540 回包与投影 guard），前提是先确认历史会话兼容可放弃
-2. **（架构）** Planner prompt 改为直接输出 skeleton（去掉 paragraphPlan 中间产物），删除 `planToSkeleton` 回退
+> ✅ 2026-08-15 已处理：第 1 项（惰性 guard 删除，commit `b083d62`，-473 行）+ 第 4 项（旧诊断脚本归档到 `scripts/legacy/`）。
+
+1. ~~**（清理）** 删除 server.ts 中惰性 paragraphPlan 兼容 guard~~ ✅ 已删（9414 回包 + 9540 投影 + mode-correction 死代码链）
+2. **（架构）** Planner prompt 改为直接输出 skeleton（去掉 paragraphPlan 中间产物），删除 `planToSkeleton` 回退 —— 注意：`planToSkeleton` 回退已保留（旧会话兼容），仅当放弃历史会话后才可删
 3. **（清理）** 前端 `resolveBodyTheme` 等辅助函数迁移到 skeleton 语义，删除 paragraphPlan 读取
-4. **（维护）** 清理旧架构诊断脚本（slot-reuse / step3-schemes / momentum-guard），避免与新架构混淆
+4. ~~**（维护）** 清理旧架构诊断脚本~~ ✅ 已归档（slot-reuse / step3-schemes / momentum-guard → `scripts/legacy/`）
 5. **（可选）** 将评估中的 E2E 场景固化为可回归的 replay 脚本（当前依赖真实 LLM，成本较高）
