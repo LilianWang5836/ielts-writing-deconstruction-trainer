@@ -50,17 +50,89 @@ const TYPES = [
     ],
     // Step3 各槽模板：接收当前 body 主题（mapped point claim 前段）
     step3: {
-      reason: (th) => `因为在职人员平时工作繁忙、通勤耗时，很难按固定时间到线下教室上课；零散时间在线学习正好能把被浪费的通勤和午休利用起来，这正是它对在职人员特别重要的原因。`,
-      mechanism: (th) => `具体机制是：平台把课程切成短课时，配合自动记录进度与提醒复习，学习者利用零散时间逐段完成，系统持续追踪。`,
-      scenario: (th) => `比如一位在职的家长，通勤路上用手机完成一小节，午休再学一段，周末集中补齐，完全绕开往返教室的硬性时间。`,
-      impact: (th) => `最终结果是：原本因工作繁忙没时间学的人也能长期坚持提升技能，个人职业竞争力增强、晋升机会增多，整个社会的人力素质也整体提高。`,
+      reason: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `因为低龄学生的自控力和专注力尚未成熟，在教室里有老师现场监督、随时提醒，能帮他们保持注意力；而脱离监督的环境（如在家上网课）很容易分心走神。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `因为偏远地区原本缺乏优质师资和线下教育资源，网络与线上课程的出现打破了地理限制，让这些地区的学生也能接触到同样的课程内容。`;
+        }
+        return `因为在职人员平时工作繁忙、通勤耗时，很难按固定时间到线下教室上课；零散时间在线学习正好能把被浪费的通勤和午休利用起来，这正是它对在职人员特别重要的原因。`;
+      },
+      mechanism: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `具体机制是：课堂由老师现场组织，实时观察学生状态并提醒走神者，小组讨论和实验操作也需要现场互动与反馈，形成持续的外部约束。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `具体机制是：只要有网络接入，课程平台就能把完整内容推送到偏远地区，学生通过手机或电脑即可观看，实现资源跨地域共享。`;
+        }
+        return `具体机制是：平台把课程切成短课时，配合自动记录进度与提醒复习，学习者利用零散时间逐段完成，系统持续追踪。`;
+      },
+      scenario: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `比如低年级学生在课堂上走神时，老师能当场点名提醒；小组实验时老师现场指导纠正，这些互动是线上课堂难以替代的。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `比如西部山区的学生，过去要走很远才能上学、师资也有限，如今通过网络能收看到城市名师的课程直播，教育机会明显增多。`;
+        }
+        return `比如一位在职的家长，通勤路上用手机完成一小节，午休再学一段，周末集中补齐，完全绕开往返教室的硬性时间。`;
+      },
+      impact: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `最终结果是：低龄学生在监督与互动下学习效果更好，不易掉队，长期来看基础更扎实，也更利于培养团队协作与动手能力。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `最终结果是：偏远地区学生获得平等的学习机会，人才潜力被释放，教育资源差距逐步缩小，有助于整体社会人力资本提升。`;
+        }
+        return `最终结果是：原本因工作繁忙没时间学的人也能长期坚持提升技能，个人职业竞争力增强、晋升机会增多，整个社会的人力素质也整体提高。`;
+      },
     },
     // stall 时的"换个角度"替代答案（保持 on-topic，避免答非所问）
     step3b: {
-      reason: `在职人员没法保证固定的上课时间，通勤和午休这种碎片时间如果不用来学习就白白浪费了；在线学习恰好把这些碎片时间变成学习机会，这是最贴合他们处境的原因。`,
-      mechanism: `平台把内容拆成小段，学完自动标记进度并提醒复习；用户可以在手机上随时接着上次的地方学，系统把每一小段的完成情况都记录在案。`,
-      scenario: `拿一个常加班的白领举例：早高峰地铁上听一节音频课，午休做一组练习，晚上加班后睡前再看一段讲解，全程不用请假、不用赶路。`,
-      impact: `时间上的灵活让过去根本没条件上课的人也能稳定学下去，技能提升后竞争力变强、晋升空间变大，全社会的人力资本也随之抬升。`,
+      reason: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `换个角度说：低龄孩子最需要的是有人盯着、有人引导，老师现场的即时反馈能把分心拉回正轨，这正是学校课堂的核心价值。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `换个角度说：过去偏远地区想学好课缺的是渠道和资源，网络普及相当于给每个角落都接上了优质教育的入口。`;
+        }
+        return `在职人员没法保证固定的上课时间，通勤和午休这种碎片时间如果不用来学习就白白浪费了；在线学习恰好把这些碎片时间变成学习机会，这是最贴合他们处境的原因。`;
+      },
+      mechanism: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `机制上：课堂有明确的纪律与节奏，老师能即时捕捉走神并干预，学生也因集体环境而更投入，监督就藏在每天的课堂秩序里。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `机制上：一根网线加上普及的移动设备，就足以让课程内容跨过千山万水，偏远地区与城市共享同一套课程体系。`;
+        }
+        return `平台把内容拆成小段，学完自动标记进度并提醒复习；用户可以在手机上随时接着上次的地方学，系统把每一小段的完成情况都记录在案。`;
+      },
+      scenario: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `场景上：比如低年级孩子在家上网课时偷偷切到游戏，而教室里有老师巡堂，这样的分心会第一时间被发现并纠正。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `场景上：比如某个西部县城的中学，通过网络直播同步上了省重点中学的课程，学生们第一次见到真正名师讲解。`;
+        }
+        return `拿一个常加班的白领举例：早高峰地铁上听一节音频课，午休做一组练习，晚上加班后睡前再看一段讲解，全程不用请假、不用赶路。`;
+      },
+      impact: (th) => {
+        const t = String(th || '');
+        if (/低龄|老师|监督|低龄学生|学校/.test(t)) {
+          return `长期看，孩子在监督与互动中养成的专注和协作习惯会带到工作后，所以线下课堂对低龄阶段的价值不能简单被线上替代。`;
+        }
+        if (/偏远|网络普及|资源|门槛|线上课程/.test(t)) {
+          return `长期看，教育资源的普及会逐步拉平地区间的人才差距，更多偏远孩子能凭真才实学走出来，社会整体受益。`;
+        }
+        return `时间上的灵活让过去根本没条件上课的人也能稳定学下去，技能提升后竞争力变强、晋升空间变大，全社会的人力资本也随之抬升。`;
+      },
     },
   },
   {
@@ -109,13 +181,13 @@ const TYPES = [
       { cat: 'solution', text: '还应引导食品行业改良配方，在不过度牺牲口味的前提下降低含糖量。' },
     ],
     step3: {
-      reason: (th) => `因为${th || '高糖问题的根源'}在于便宜易得与广告诱导共同抬高了含糖食品的消费，糖分摄入远超身体所需。`,
+      reason: (th) => `因为${th || '高糖食品'}之所以便宜又容易买到，根本在于生产端成本低（糖与玉米糖浆廉价、工业化量产），销售端又铺货密集，便利店、超市、自动售货机随处可见。`,
       mechanism: (th) => `具体机制是：便利店与自动售货机让高糖饮品随手可得，营销强化了“快乐/解渴”联想，价格优势又压过健康选项，形成惯性。`,
       scenario: (th) => `比如青少年每天在便利店购买含糖饮料且几乎不受约束，家长与学校干预有限，长期积累导致肥胖和糖尿病高发。`,
       impact: (th) => `结果是长期高糖摄入会直接推高肥胖、2型糖尿病和心血管疾病的发病率，青少年牙齿腐蚀也明显增多，公共医疗负担随之加重。`,
     },
     step3b: {
-      reason: `高糖食品便宜、随处可得，再加上广告不断强化“解渴又快乐”的印象，消费者很容易在不知不觉中摄入远超身体需要的糖分。`,
+      reason: `含糖食品之所以便宜又容易买到，主要是生产成本低、原料（糖、玉米糖浆）廉价，加上超市、便利店、自动售货机铺货密集，几乎随时随地都能买到。`,
       mechanism: `超市和自动售货机把含糖饮料摆在最显眼的位置，营销把甜味和幸福感绑定，价格又比健康选项更有优势，这种组合让高糖消费成为习惯。`,
       scenario: `青少年放学后顺路在便利店买一大瓶含糖饮料，学校周边这样的店到处都是，家长和学校又很难每时每刻约束，日积月累肥胖和糖尿病就找上门了。`,
       impact: `长期过量摄入糖分，直接后果就是肥胖率、2型糖尿病和心血管疾病发病率上升，青少年牙齿腐蚀明显增多，公共医疗开支也被大幅推高。`,
@@ -174,7 +246,6 @@ function subpointTheme(session) {
   if (pts.length) return String(pts[0]).replace(/[（(][^）)]*[）)]/g, '').trim().slice(0, 30);
   return String(sp?.content || '').trim().slice(0, 30);
 }
-
 function toFullClaim(theme) {
   const t = String(theme || '').trim();
   if (!t) return '这个分论点需要围绕主要价值展开。';
@@ -310,9 +381,26 @@ function studentStep2(p2, type, session, p1) {
 }
 
 // ---- 我扮演学生：Step3（按当前 body 主题动态展开） ----
-/** 当前第一个 value 为空的 Step3 槽 label（从 paragraphPlan 读取）。 */
+/** 当前第一个 value 为空的 Step3 槽 label（从 paragraphPlan / skeleton 读取）。 */
 function pendingStep3Slot(session) {
   const sp = activeSubpoint(session);
+  // 会议秘书新架构：skeleton（冻结骨架）+ minutes 投影。已 confirmed 的槽看 minutes。
+  if (sp && Array.isArray(sp.skeleton?.blocks) && sp.skeleton.blocks.length > 0) {
+    const confirmedKeys = new Set(
+      (sp.minutes || [])
+        .filter((m) => m.status === 'confirmed' && m.slotKey)
+        .map((m) => m.slotKey),
+    );
+    for (const b of sp.skeleton.blocks) {
+      if (!Array.isArray(b?.slots)) continue;
+      for (const s of b.slots) {
+        if (!confirmedKeys.has(String(s.key || ''))) {
+          return { block: String(b?.label || ''), slot: String(s?.label || s?.placeholder || '展开'), key: String(s?.key || '') };
+        }
+      }
+    }
+    return null;
+  }
   const plan = sp?.paragraphPlan;
   if (plan && Array.isArray(plan.pointBlocks)) {
     for (const b of plan.pointBlocks) {
@@ -336,6 +424,18 @@ function studentStep3(p2, type, session) {
   if (/采纳|确认|对吗|可以吗|对不对|同意|确认写入|点击.*确认/.test(p2)) return '对';
   if (!String(p2 || '').trim()) return '对';
 
+  // 会议秘书：当前 active subpoint 若有 landed 待确认纪要（内容已落槽、只差学生确认写板），
+  // 且教练 P2 不是要求重说/换角度时，先返回「对」确认写板 → 推进 activeSlotIndex。
+  // 避免教练 P2 从「分论点」直接跳到「展开原因」（无"确认"字样）时，claim 永远 landed
+  // 导致 pendingStep3Slot 一直指向 claim、脚本复读 claim 死循环。
+  const sp = activeSubpoint(session);
+  const landed = Array.isArray(sp?.minutes)
+    ? sp.minutes.find((m) => m?.status === 'landed' && m?.slotKey)
+    : null;
+  if (landed && !/重说|重写|换一个|不对|不是|重新|去掉|改一下|再想想|换个角度|重复了/.test(p2)) {
+    return '对';
+  }
+
   // 看板 truth 优先：第一个空槽决定该答什么（服务端 P2 常滞后，不能只信 P2）。
   const pending = pendingStep3Slot(session);
   const slotLabel = pending?.slot || '';
@@ -347,11 +447,14 @@ function studentStep3(p2, type, session) {
   else if (/场景|例子|举例|典型|人群/.test(slotLabel)) role = 'scenario';
 
   // P2 点名了具体的槽（且与空槽不同）时，以 P2 为准（reclass 场景）。
-  if (/分论点|核心观点|论点|主张|claim/.test(p2)) role = 'claim';
+  // 注意：先匹配更具体的语义（共同特点/内容/为什么→reason），再匹配泛化的"分论点"字样，
+  // 避免教练问"工作内容有什么共同特点"时被"分论点"误判为 claim 而重复回答分论点。
+  if (/工作内容有什么共同特点|有什么共同特点|内容有什么共同|这些岗位.*特点|为什么.*取代|为什么.*被取代|为什么会/.test(p2)) role = 'reason';
   else if (/展开原因|原因|为什么|起因/.test(p2)) role = 'reason';
   else if (/机制|过程|怎么发生|链条|具体是怎么|操作|实现/.test(p2)) role = 'mechanism';
   else if (/结果|影响|后果|好处|作用|效果/.test(p2)) role = 'impact';
   else if (/场景|例子|举例|典型|人群|具体做/.test(p2)) role = 'scenario';
+  else if (/分论点|核心观点|论点|主张|claim/.test(p2)) role = 'claim';
 
   step3RoleCount[role] = (step3RoleCount[role] || 0) + 1;
   const theme = subpointTheme(session);
@@ -376,7 +479,9 @@ function studentStep3(p2, type, session) {
       // 避免答非所问（旧逻辑硬编码的泛化 impact 素材对 problem-solution 是错题素材，导致死循环）。
       if (step3Stalls[role] >= 2) {
         const alt = (type.step3b || {})[role];
-        if (typeof alt === 'string') {
+        if (typeof alt === 'function') {
+          ans = alt(theme, slotLabel);
+        } else if (typeof alt === 'string') {
           ans = alt;
         } else {
           const themed = String(theme || '').trim();
@@ -496,7 +601,12 @@ function applyProgress(session, stepKey, pu) {
     };
   } else if (stepKey === 3) {
     const currentStep3 = session.step3 || {};
-    const subpoints = Array.isArray(currentStep3.subpoints) ? currentStep3.subpoints : [];
+    // 会议秘书：服务器回传的 subpoints（含 skeleton + minutes + activeSlotIndex）是权威状态。
+    // 用它替换本地 subpoints，保证跨轮骨架/纪要/推进索引持久化。
+    const serverSubpoints = Array.isArray(pu.step3SecretarySubpoints)
+      ? pu.step3SecretarySubpoints
+      : null;
+    const subpoints = serverSubpoints || (Array.isArray(currentStep3.subpoints) ? currentStep3.subpoints : []);
     const activeId = currentStep3.activeSubpointId || (subpoints[0] && subpoints[0].id) || '';
     const step3Ui = pu.step3Ui;
     const uiById = new Map((Array.isArray(step3Ui?.bodies) ? step3Ui.bodies : []).map((b) => [String(b.id), b]));
@@ -507,8 +617,7 @@ function applyProgress(session, stepKey, pu) {
         next.isCompleted = !!uiBody.isCompleted;
         next.selectable = !!uiBody.selectable;
       }
-      if (String(sp.id) === String(activeId)) {
-        if (pu.paragraphPlan) next.paragraphPlan = pu.paragraphPlan;
+      if (String(sp.id) === String(activeId)) {        if (pu.paragraphPlan) next.paragraphPlan = pu.paragraphPlan;
         if (Array.isArray(pu.step3SubpointSteps) && pu.step3SubpointSteps.length) next.structureSteps = pu.step3SubpointSteps;
         if (pu.step3SlotEval) next.step3SlotEval = pu.step3SlotEval;
         if (Array.isArray(pu.step3KickoffPendingDrafts)) next.kickoffPendingDrafts = pu.step3KickoffPendingDrafts;

@@ -3371,6 +3371,13 @@ function attachStep3UiProgress(
     isStep3Finished,
     nextActiveSubpointId,
   };
+  if (process.env.STEP3_UI_DEBUG) {
+    console.warn(
+      `[Step3Ui] activeId=${activeId} next=${nextActiveSubpointId} bodies=${bodies
+        .map((b) => `${b.id}:${b.isCompleted}`)
+        .join(",")} finished=${isStep3Finished}`,
+    );
+  }
   // Keep whole-step flag aligned with the UI contract.
   data.progressUpdate.isCompleted = isStep3Finished;
 
@@ -7572,6 +7579,11 @@ function enforceStep3LogicCompletion(
       currentUserMessage: userMessage,
       isHiddenKickoff: options?.isHiddenKickoff,
     });
+    // 会议秘书：把更新后的 subpoints（含冻结骨架 skeleton + minutes 纪要把 + activeSlotIndex）
+    // 回传给客户端，客户端合并回 session —— 这是秘书状态跨请求持久化的唯一通道。
+    if (Array.isArray(session?.step3?.subpoints)) {
+      data.progressUpdate.step3SecretarySubpoints = session.step3.subpoints;
+    }
     return;
   }
 
@@ -7634,6 +7646,9 @@ function enforceStep3SecretaryPath(
     data.progressUpdate.isCompleted = data.progressUpdate.step3SubpointCompleted;
     data.progressUpdate.secretaryBoard = renderBoard(sp);
     data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+    console.warn(
+      `[Secretary] AFFIRM landed slotKey=${landed.slotKey} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
+    );
     return;
   }
 
@@ -7654,12 +7669,16 @@ function enforceStep3SecretaryPath(
   if (land.ok) {
     // 已落为 landed（draft），等学生确认
     data.progressUpdate.step3SubpointCompleted = false;
+    console.warn(
+      `[Secretary] LANDED ok slotKey=${land.slotKey} activeSlotIndex=${sp.activeSlotIndex}`,
+    );
   } else {
     // rejected / 无空槽 / 无骨架 → 记录但看板不变
     data.progressUpdate.step3SubpointCompleted = false;
     if (land.reason) {
       data.progressUpdate.secretaryRejectReason = land.reason;
     }
+    console.warn(`[Secretary] LANDED reject reason=${land.reason}`);
   }
   data.progressUpdate.secretaryBoard = renderBoard(sp);
   data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);

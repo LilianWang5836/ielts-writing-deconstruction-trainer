@@ -281,11 +281,15 @@ export default function Step3Drafting({
         structureSteps: existing.structureSteps,
         chatHistory: existing.chatHistory,
         kickoffPendingDrafts: (existing as any).kickoffPendingDrafts,
+        // 会议秘书新架构：保留服务器回传的冻结骨架 + 纪要 + 推进索引
+        skeleton: (existing as any).skeleton || parsed.skeleton,
+        minutes: (existing as any).minutes || parsed.minutes,
+        activeSlotIndex: (existing as any).activeSlotIndex ?? parsed.activeSlotIndex,
         isCompleted: existing.isCompleted,
       };
     }
     // Soft rebuild: keep dialogue/board if this body already has in-progress work
-    if (existing?.chatHistory?.length || existing?.paragraphPlan) {
+    if (existing?.chatHistory?.length || existing?.paragraphPlan || (existing as any)?.skeleton) {
       return {
         ...parsed,
         frameworkSignature: parsedSig,
@@ -295,12 +299,18 @@ export default function Step3Drafting({
         structureSteps: existing.structureSteps,
         chatHistory: existing.chatHistory,
         kickoffPendingDrafts: (existing as any).kickoffPendingDrafts,
+        skeleton: (existing as any).skeleton || parsed.skeleton,
+        minutes: (existing as any).minutes || parsed.minutes,
+        activeSlotIndex: (existing as any).activeSlotIndex ?? parsed.activeSlotIndex,
         isCompleted: existing.isCompleted,
       };
     }
     return {
       ...parsed,
       frameworkSignature: parsedSig,
+      skeleton: parsed.skeleton,
+      minutes: parsed.minutes,
+      activeSlotIndex: parsed.activeSlotIndex,
       isCompleted: false,
     };
   });
@@ -463,6 +473,9 @@ export default function Step3Drafting({
         hint: undefined,
         transitionChecks: undefined,
         sufficiencyCheck: undefined,
+        skeleton: undefined,
+        minutes: undefined,
+        activeSlotIndex: undefined,
         isCompleted: false,
       };
     });
@@ -476,6 +489,132 @@ export default function Step3Drafting({
     });
     setShowClearBoardConfirm(false);
   };
+
+  // ============================================================
+  // 会议秘书看板渲染（skeleton + minutes 投影）
+  // 当 activeSubpoint 带冻结骨架时使用；否则回退旧 paragraphPlan 渲染。
+  // ============================================================
+  const secretaryBoard = (() => {
+    const sp = activeSubpoint;
+    if (!sp || !Array.isArray(sp.skeleton?.blocks) || sp.skeleton.blocks.length === 0) {
+      return null;
+    }
+    const confirmedBySlot = new Map<string, string>();
+    const landedBySlot = new Map<string, string>();
+    for (const m of sp.minutes || []) {
+      if (!m?.slotKey) continue;
+      if (m.status === 'confirmed') confirmedBySlot.set(m.slotKey, m.text);
+      else if (m.status === 'landed' && !confirmedBySlot.has(m.slotKey)) {
+        landedBySlot.set(m.slotKey, m.text);
+      }
+    }
+    const flatSlots: { key: string; label: string; placeholder: string; semantic: string }[] = [];
+    for (const b of sp.skeleton.blocks) {
+      for (const s of b.slots) {
+        flatSlots.push({
+          key: String(s?.key || ''),
+          label: String(s?.label || ''),
+          placeholder: String(s?.placeholder || ''),
+          semantic: String(s?.semantic || ''),
+        });
+      }
+    }
+    const filledCount = flatSlots.filter((s) => confirmedBySlot.has(s.key)).length;
+    const activeIdx = Math.min(
+      Number(sp.activeSlotIndex || 0),
+      Math.max(flatSlots.length - 1, 0),
+    );
+    const activeKey = flatSlots[activeIdx]?.key || null;
+    const isComplete =
+      flatSlots.length > 0 && flatSlots.every((s) => confirmedBySlot.has(s.key));
+    return {
+      blocks: sp.skeleton.blocks.map((b) => ({
+        id: b.id,
+        label: b.label,
+        subClaim: b.subClaim,
+        role: b.role,
+        slots: b.slots.map((s) => ({
+          key: s.key,
+          label: s.label,
+          placeholder: s.placeholder,
+          semantic: s.semantic,
+          content: confirmedBySlot.get(s.key) || '',
+          pending: landedBySlot.get(s.key) || '',
+        })),
+      })),
+      flatSlots,
+      filledCount,
+      totalSlots: flatSlots.length,
+      activeKey,
+      isComplete,
+    };
+  })();
+
+  const renderSecretaryBlock = (block: any, blockIdx: number) => (
+    <div
+      key={block.id || blockIdx}
+      className="space-y-2 pt-1 border-t border-slate-100 first:border-t-0 first:pt-0"
+    >
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="font-sans text-xs md:text-[12.5px] font-bold text-slate-800">
+          {block.subClaim || block.label || `分点 ${blockIdx + 1}`}
+        </span>
+        <span className="text-[10px] text-slate-500">
+          {block.role === "major" ? "详写" : "略写"}
+        </span>
+      </div>
+      <div className="space-y-2.5 pl-0.5">
+        <p className="text-[10px] font-bold text-slate-400 pt-0.5">论证</p>
+        {block.slots.map((slot: any, idx: number, arr: any[]) => {
+          const isActive =
+            secretaryBoard?.activeKey === slot.key && !slot.content;
+          return (
+            <div key={slot.key} className="flex gap-2.5">
+              <div className="flex flex-col items-center shrink-0 pt-0.5">
+                <div
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    slot.content
+                      ? "bg-indigo-600"
+                      : slot.pending
+                      ? "bg-amber-400"
+                      : isActive
+                      ? "bg-indigo-400 animate-pulse"
+                      : "bg-slate-300"
+                  }`}
+                />
+                {idx < arr.length - 1 && (
+                  <div className="w-px flex-1 bg-slate-200 min-h-[10px] mt-1" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0 pb-0.5">
+                <span className="text-[10px] font-sans font-bold text-slate-400">
+                  {slot.label}
+                </span>
+                {slot.pending ? (
+                  <p className="text-xs md:text-[12.5px] mt-0.5 leading-relaxed bg-amber-50/70 border border-amber-200/70 rounded-md px-2 py-1 text-slate-700">
+                    <span className="text-amber-600 font-bold">待确认：</span>
+                    {slot.pending}
+                  </p>
+                ) : (
+                  <p
+                    className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
+                      slot.content
+                        ? "text-slate-700"
+                        : isActive
+                        ? "text-slate-400 italic"
+                        : "text-slate-300"
+                    }`}
+                  >
+                    {slot.content || (isActive ? "当前待回答…" : "待填写")}
+                  </p>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
@@ -787,7 +926,21 @@ export default function Step3Drafting({
                   )}
                 </div>
 
-                {activeSubpoint.paragraphPlan ? (
+                {secretaryBoard ? (
+                  <div className="space-y-4">
+                    {secretaryBoard.blocks.map(renderSecretaryBlock)}
+                    {secretaryBoard.isComplete && (
+                      <div className="pt-2 border-t border-slate-100">
+                        <p className="text-[10px] font-bold text-emerald-600 uppercase tracking-wider mb-0.5">
+                          本段论证链已完整
+                        </p>
+                        <p className="text-xs md:text-[12.5px] text-emerald-700 leading-relaxed">
+                          {secretaryBoard.filledCount} / {secretaryBoard.totalSlots} 槽已确认
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : activeSubpoint.paragraphPlan ? (
                   <div className="space-y-4">
                     <div className="space-y-4">
                       {activeSubpoint.paragraphPlan.pointBlocks.map(

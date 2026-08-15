@@ -784,7 +784,16 @@ export default function CoachChat({
         // sanitized, gated and completed the board before returning progressUpdate.
         if (stepKey === 'step3') {
           const currentStep3 = sessionUpdates.step3 || session.step3;
-          const currentSubpoints = currentStep3.subpoints || [];
+          // 会议秘书新架构：服务器回传的 subpoints（含冻结 skeleton + minutes + activeSlotIndex）
+          // 是权威状态，客户端只做 isCompleted/selectable 覆盖。无秘书字段时回退旧路径。
+          const secretarySubpoints = Array.isArray(
+            data.progressUpdate.step3SecretarySubpoints,
+          )
+            ? data.progressUpdate.step3SecretarySubpoints
+            : null;
+          const currentSubpoints = secretarySubpoints
+            ? secretarySubpoints
+            : currentStep3.subpoints || [];
           const activeId = activeSubpointIdAtSend || currentStep3.activeSubpointId || session.step3?.activeSubpointId;
           const step3Ui = data.progressUpdate.step3Ui;
           const uiById = new Map(
@@ -906,7 +915,30 @@ export default function CoachChat({
           // claim/reason/support/impact fields are fallbacks.
           const activeSp = updatedSubpoints.find((sp: any) => sp.id === activeId);
           let subpointDraft = activeSp?.draft || '';
-          if (activeSp && activeSp.paragraphPlan) {
+          // 会议秘书新架构：从 skeleton + minutes 构建 draft（真相源），供 LLM 上下文使用。
+          if (
+            activeSp &&
+            Array.isArray(activeSp.skeleton?.blocks) &&
+            activeSp.skeleton.blocks.length > 0
+          ) {
+            const parts: string[] = [];
+            for (const block of activeSp.skeleton.blocks) {
+              if (!Array.isArray(block?.slots)) continue;
+              for (const slot of block.slots) {
+                const confirmed = (activeSp.minutes || []).find(
+                  (m: any) => m.status === 'confirmed' && m.slotKey === slot.key,
+                );
+                const landed = (activeSp.minutes || []).find(
+                  (m: any) => m.status === 'landed' && m.slotKey === slot.key,
+                );
+                const text = confirmed?.text || landed?.text || '';
+                if (text) {
+                  parts.push(`【${slot.label}】\n${text}`);
+                }
+              }
+            }
+            subpointDraft = parts.join('\n\n');
+          } else if (activeSp && activeSp.paragraphPlan) {
             subpointDraft = buildDraftFromParagraphPlan(activeSp.paragraphPlan);
           } else if (activeSp && activeSp.structureSteps && activeSp.structureSteps.length > 0) {
             const parts = [];
