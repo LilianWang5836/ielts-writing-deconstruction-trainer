@@ -1,14 +1,41 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil } from 'lucide-react';
+import { MessageSquare, Send, Loader2, AlertCircle, RotateCcw, CheckCircle2, Pencil, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { Topic, PracticeSession, ChatMessage } from '../types';
+import {
+  isClaimSentence,
+  resolveBlockClaimSentence,
+} from '../utils/step3ClaimPrefill';
+import { computeSubpointFrameworkSignature } from '../utils/step3Quality';
+import {
+  coachMessageIsContentAskNotDecision,
+  coachMessageLooksLikeCapacityTrimDecision,
+  coachMessageLooksLikeRetentionDecision,
+  coachMessageLooksLikeSlotAddDecision,
+  coachMessageLooksLikeStanceDecision,
+} from '../server/step2/planner-payload';
+
+/** Step1 Q1 — mutually exclusive chips that fill the input box. */
+const STEP1_QUESTION_TYPES = [
+  'Agree / Disagree',
+  'Discuss Both Views',
+  'Advantages / Disadvantages',
+  'Two-part Question',
+  'Problem / Solution',
+  'Positive / Negative',
+  'Other',
+] as const;
 
 interface CoachChatProps {
   topic: Topic;
   step: number;
   stepKey: 'step1' | 'step2' | 'step3' | 'step4';
   session: PracticeSession;
-  onUpdateSession: (updates: Partial<PracticeSession>) => void;
+  onUpdateSession: (
+    updates:
+      | Partial<PracticeSession>
+      | ((prev: PracticeSession) => Partial<PracticeSession>),
+  ) => void;
   stepContext: any;
   welcomeMessage: string;
   autoKickoff?: boolean;
@@ -40,6 +67,8 @@ export default function CoachChat({
   const inputRef = useRef<HTMLInputElement>(null);
   const kickoffRef = useRef<string | null>(null);
   const migratedLegacyStep3HistoryRef = useRef(false);
+  const requestSeqRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Get current step's chat history or initialize it
   const activeStep3SubpointId =
@@ -53,8 +82,7 @@ export default function CoachChat({
       ? activeStep3Subpoint?.chatHistory || []
       : session[stepKey]?.chatHistory || [];
 
-  // Step 3 确认按钮：服务端已暂存 pending（kickoffPendingDrafts）时，
-  // 在输入区上方给出「确认」按钮，替代“请回复对”的自然语言交互。
+  // Step 3：服务端暂存 pending（kickoffPendingDrafts）时，确认 UI 挂在最新 Coach 气泡上。
   const pendingDrafts =
     stepKey === 'step3'
       ? Array.isArray(activeStep3Subpoint?.kickoffPendingDrafts)
@@ -63,7 +91,365 @@ export default function CoachChat({
           )
         : []
       : [];
-  const hasPendingConfirm = pendingDrafts.length > 0 && !loading;
+  // Keep confirm bubble stable while the affirm request is in flight (don't
+  // re-split the coach message on --- just because loading flipped true).
+  const hasPendingConfirm = pendingDrafts.length > 0;
+  const step2Payload = (session.step2?.coachEvaluation as any)?.plannerPayload;
+  const pendingProposal =
+    stepKey === 'step2' && step2Payload?.pendingProposal?.proposalId
+      ? step2Payload.pendingProposal
+      : null;
+  const hasPendingProposal = Boolean(pendingProposal);
+  const pendingProposalKind = String(pendingProposal?.kind || '');
+  const pendingProposalDecisionType =
+    pendingProposalKind === 'side_settle'
+      ? 'retention'
+      : pendingProposalKind === 'slot_add'
+        ? 'slot_add'
+        : pendingProposalKind === 'slot_merge'
+          ? 'slot_merge'
+          : pendingProposalKind === 'stance'
+            ? 'stance'
+            : '';
+  const pendingProposalSummary = (() => {
+    if (!pendingProposal) return '';
+    if (pendingProposal.kind === 'slot_add') {
+      return String(pendingProposal.payload?.claim || '');
+    }
+    if (pendingProposal.kind === 'slot_merge') {
+      const pts = Array.isArray(step2Payload?.points) ? step2Payload.points : [];
+      const label = (id: string) => {
+        const p = pts.find((x: any) => x.id === id);
+        return String(p?.claim || id)
+          .replace(/（[^）]*）/g, '')
+          .trim();
+      };
+      return `${label(String(pendingProposal.payload?.fromSlotId || ''))} → ${label(
+        String(pendingProposal.payload?.intoSlotId || ''),
+      )}`;
+    }
+    if (pendingProposal.kind === 'stance') {
+      return String(pendingProposal.payload?.text || '').slice(0, 80);
+    }
+    if (pendingProposal.kind === 'side_settle') {
+      const asg = pendingProposal.payload?.assignments || [];
+      const pts = Array.isArray(step2Payload?.points) ? step2Payload.points : [];
+      const label = (id: string) => {
+        const p = pts.find((x: any) => x.id === id);
+        return String(p?.claim || id)
+          .replace(/（[^）]*）/g, '')
+          .trim();
+      };
+      const d = asg
+        .filter((a: any) => a.role === 'detail')
+        .map((a: any) => label(a.slotId));
+      const b = asg
+        .filter((a: any) => a.role === 'brief')
+        .map((a: any) => label(a.slotId));
+      return `详写「${d.join('、') || '—'}」/ 略写「${b.join('、') || '—'}」`;
+    }
+    return '';
+  })();
+  const pendingSlotAddClaim =
+    stepKey === 'step2'
+      ? String(step2Payload?.pendingSlotAdd?.claim || '').trim()
+      : '';
+  const hasPendingSlotAdd =
+    !hasPendingProposal && Boolean(pendingSlotAddClaim);
+  const step2UserPoints = String(
+    (session.step2?.coachEvaluation as any)?.userPoints ||
+      session.step2?.userPoints ||
+      '',
+  );
+  const pendingRetentionMatch =
+    stepKey === 'step2' && !hasPendingProposal
+      ? /［待裁决：(?:详=([^｜］]+)｜略=([^｜］]+)|([^｜］]+))/.exec(step2UserPoints)
+      : null;
+  const hasPendingRetention = Boolean(pendingRetentionMatch);
+  const pendingRetentionSummary = pendingRetentionMatch
+    ? pendingRetentionMatch[1] && pendingRetentionMatch[2]
+      ? `详写「${pendingRetentionMatch[1].trim()}」/ 略写「${pendingRetentionMatch[2].trim()}」`
+      : String(pendingRetentionMatch[3] || '').trim()
+    : '';
+  const pendingCapacityTrim =
+    stepKey === 'step2' && !hasPendingProposal
+      ? step2Payload?.pendingCapacityTrim
+      : null;
+  const hasPendingCapacityTrim = Boolean(
+    pendingCapacityTrim?.sideKey &&
+      Array.isArray(pendingCapacityTrim?.pointClaims) &&
+      pendingCapacityTrim.pointClaims.length >= 3,
+  );
+  const pendingStanceConfirmText =
+    stepKey === 'step2' && !hasPendingProposal
+      ? String(step2Payload?.pendingStanceConfirm?.text || '').trim()
+      : '';
+  const hasPendingStanceConfirm = Boolean(pendingStanceConfirmText);
+
+  const lastAiHistoryIndex = (() => {
+    for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+      if (chatHistory[i]?.sender === 'ai') return i;
+    }
+    return -1;
+  })();
+
+  const lastAiText =
+    lastAiHistoryIndex >= 0
+      ? String(chatHistory[lastAiHistoryIndex]?.text || '')
+      : '';
+  // Hard rule: 采纳/拒绝 ONLY when this coach turn is proposing something to adopt.
+  // Content asks (补薄 / 展开 / 自由答详略) never get those buttons — even if stale pending remains.
+  const lastIsContentAsk = coachMessageIsContentAskNotDecision(lastAiText);
+  const lastLooksSlotAdd =
+    !lastIsContentAsk && coachMessageLooksLikeSlotAddDecision(lastAiText);
+  const lastLooksRetention =
+    !lastIsContentAsk && coachMessageLooksLikeRetentionDecision(lastAiText);
+  const lastLooksCapacityTrim =
+    !lastIsContentAsk && coachMessageLooksLikeCapacityTrimDecision(lastAiText);
+  const lastLooksStance =
+    !lastIsContentAsk && coachMessageLooksLikeStanceDecision(lastAiText);
+
+  type RenderedChatMessage = ChatMessage & {
+    isSplit: boolean;
+    isPendingHost: boolean;
+    isProposalHost: boolean;
+    isSlotAddHost: boolean;
+    isRetentionHost: boolean;
+    isCapacityTrimHost: boolean;
+    isStanceConfirmHost: boolean;
+  };
+
+  // Pending confirm / proposal / legacy: keep the latest Coach turn as ONE bubble.
+  const renderedMessages: RenderedChatMessage[] = chatHistory.flatMap(
+    (msg, historyIndex): RenderedChatMessage[] => {
+      if (msg.sender === 'ai') {
+        const isPendingHost =
+          hasPendingConfirm && historyIndex === lastAiHistoryIndex;
+        // Phase1: trust pendingProposal on latest AI turn (text is display-only).
+        // 产品约束：Step2 强制按钮白名单 = side_settle（每侧详略）+ stance（立场）。
+        // slot_add / slot_merge 走对话内确认（无按钮）——学生可直接打字「可以/采纳」
+        // 或说出自己的方案，由 resolvePendingProposalDecision 的文本路径处理。
+        const isProposalHost =
+          hasPendingProposal &&
+          !hasPendingConfirm &&
+          historyIndex === lastAiHistoryIndex &&
+          (pendingProposalKind === 'side_settle' ||
+            pendingProposalKind === 'stance');
+        const isSlotAddHost =
+          !isProposalHost &&
+          hasPendingSlotAdd &&
+          lastLooksSlotAdd &&
+          !hasPendingConfirm &&
+          !lastLooksRetention &&
+          !lastLooksCapacityTrim &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isRetentionHost =
+          !isProposalHost &&
+          hasPendingRetention &&
+          lastLooksRetention &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksCapacityTrim &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isCapacityTrimHost =
+          !isProposalHost &&
+          hasPendingCapacityTrim &&
+          lastLooksCapacityTrim &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksRetention &&
+          !lastLooksStance &&
+          historyIndex === lastAiHistoryIndex;
+        const isStanceConfirmHost =
+          !isProposalHost &&
+          hasPendingStanceConfirm &&
+          !hasPendingConfirm &&
+          !lastLooksSlotAdd &&
+          !lastLooksRetention &&
+          !lastLooksCapacityTrim &&
+          historyIndex === lastAiHistoryIndex &&
+          (lastLooksStance ||
+            /请点击「采纳」|点击「采纳」锁定|基于你材料的立场推荐/.test(
+              lastAiText,
+            ));
+        if (
+          isPendingHost ||
+          isProposalHost ||
+          isSlotAddHost ||
+          isRetentionHost ||
+          isCapacityTrimHost ||
+          isStanceConfirmHost
+        ) {
+          const joined = String(msg.text || '')
+            .split('---')
+            .map((part) => part.trim())
+            .filter(Boolean)
+            .join('\n\n');
+          return [
+            {
+              ...msg,
+              text: joined,
+              id: `${msg.id}-pending`,
+              isSplit: false,
+              isPendingHost,
+              isProposalHost,
+              isSlotAddHost,
+              isRetentionHost,
+              isCapacityTrimHost,
+              isStanceConfirmHost,
+            },
+          ];
+        }
+        return msg.text.split('---').map((part, i) => ({
+          ...msg,
+          text: part.trim(),
+          id: `${msg.id}-${i}`,
+          isSplit: i > 0,
+          isPendingHost: false,
+          isProposalHost: false,
+          isSlotAddHost: false,
+          isRetentionHost: false,
+          isCapacityTrimHost: false,
+          isStanceConfirmHost: false,
+        }));
+      }
+      return [
+        {
+          ...msg,
+          isSplit: false,
+          isPendingHost: false,
+          isProposalHost: false,
+          isSlotAddHost: false,
+          isRetentionHost: false,
+          isCapacityTrimHost: false,
+          isStanceConfirmHost: false,
+        },
+      ];
+    },
+  );
+
+  const beginEditPendingDraft = (d: any) => {
+    // Prefill the current confirm sentence so students edit 待确认句, not a blank label.
+    const label = String(d.label || '当前一环').trim();
+    const text = String(d.text || '').trim();
+    setInputText(text ? `${label}：${text}` : `${label}：`);
+    inputRef.current?.focus();
+  };
+
+  /** Render-only: let **bold** work when markers wrap CJK quotation marks. */
+  const prepareCoachMarkdown = (text: string) =>
+    String(text || '')
+      .replace(/\\n/g, '\n')
+      .replace(
+        /\*\*([“‘「『])([\s\S]+?)([”’」』])\*\*/g,
+        (_m, open, inner, close) => `${open}**${inner}**${close}`,
+      );
+
+  /** Render coach text with pending polished sentences as click-to-edit targets. */
+  const renderPendingHostText = (rawText: string) => {
+    const raw = prepareCoachMarkdown(rawText);
+    type Hit = { start: number; end: number; draft: any };
+    const hits: Hit[] = [];
+    for (const d of pendingDrafts) {
+      const t = String(d?.text || '').trim();
+      if (t.length < 4) continue;
+      const variants = [
+        t,
+        `「${t}」`,
+        `"${t}"`,
+        `'${t}'`,
+        `**${t}**`,
+        `**「${t}」**`,
+        `**“${t}”**`,
+      ];
+      for (const v of variants) {
+        let from = 0;
+        while (from <= raw.length - v.length) {
+          const idx = raw.indexOf(v, from);
+          if (idx < 0) break;
+          const end = idx + v.length;
+          if (!hits.some((h) => idx < h.end && end > h.start)) {
+            hits.push({ start: idx, end, draft: d });
+          }
+          from = end;
+        }
+      }
+    }
+    hits.sort((a, b) => a.start - b.start);
+
+    if (hits.length === 0) {
+      // Fallback: still show pending as the only editable confirm target (never
+      // invent a second sentence from chat). Server keeps pending = 待确认句.
+      return (
+        <>
+          <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+            <ReactMarkdown>{raw}</ReactMarkdown>
+          </div>
+          <div className="mt-2 space-y-1.5">
+            {pendingDrafts.map((d: any) => (
+              <button
+                key={String(d.key || d.label || d.text)}
+                type="button"
+                disabled={loading}
+                onClick={() => beginEditPendingDraft(d)}
+                className="block w-full text-left rounded-md bg-amber-50/80 border border-amber-200/70 px-2 py-1.5 text-[12px] leading-relaxed text-slate-800 hover:bg-amber-50 transition disabled:opacity-50"
+                title="点击修改当前待确认句"
+              >
+                {d.text}
+                <Pencil className="inline-block h-3 w-3 ml-1 text-slate-400 align-[-1px]" />
+              </button>
+            ))}
+          </div>
+        </>
+      );
+    }
+
+    const nodes: React.ReactNode[] = [];
+    let cursor = 0;
+    hits.forEach((h, i) => {
+      if (h.start > cursor) {
+        nodes.push(
+          <div
+            key={`pre-${i}`}
+            className="markdown-body text-xs md:text-[12.5px] text-slate-800"
+          >
+            <ReactMarkdown>{raw.slice(cursor, h.start)}</ReactMarkdown>
+          </div>,
+        );
+      }
+      nodes.push(
+        <button
+          key={`pend-${i}-${h.start}`}
+          type="button"
+          disabled={loading}
+          onClick={() => beginEditPendingDraft(h.draft)}
+          className="inline text-left rounded px-0.5 bg-amber-50 border-b border-dashed border-amber-400 text-slate-900 hover:bg-amber-100/80 transition disabled:opacity-50"
+          title="点击修改"
+        >
+          {raw.slice(h.start, h.end)}
+          <Pencil className="inline-block h-3 w-3 ml-0.5 text-slate-400 align-[-1px]" />
+        </button>,
+      );
+      cursor = h.end;
+    });
+    if (cursor < raw.length) {
+      nodes.push(
+        <div
+          key="post"
+          className="markdown-body text-xs md:text-[12.5px] text-slate-800"
+        >
+          <ReactMarkdown>{raw.slice(cursor)}</ReactMarkdown>
+        </div>,
+      );
+    }
+    return (
+      <div className="text-xs md:text-[12.5px] text-slate-800 leading-relaxed">
+        {nodes}
+      </div>
+    );
+  };
 
   useEffect(() => {
     if (stepKey !== 'step3') return;
@@ -172,7 +558,17 @@ export default function CoachChat({
 
   const sendUserMessage = async (
     textToSend: string,
-    options?: { hiddenUserMessage?: boolean; targetSubpointId?: string },
+    options?: {
+      hiddenUserMessage?: boolean;
+      targetSubpointId?: string;
+      decision?: {
+        type: string;
+        action: string;
+        claim?: string;
+        proposalId?: string;
+        legacyType?: string;
+      };
+    },
   ) => {
     if (!textToSend.trim() || loading) return;
 
@@ -186,6 +582,7 @@ export default function CoachChat({
     };
 
     const hiddenUserMessage = !!options?.hiddenUserMessage;
+    const decision = options?.decision;
     const activeSubpointIdAtSend =
       stepKey === 'step3'
         ? options?.targetSubpointId || session.step3?.activeSubpointId
@@ -202,16 +599,19 @@ export default function CoachChat({
     // Optimistically update UI (skip the synthetic kickoff user bubble)
     if (!hiddenUserMessage) {
       if (stepKey === 'step3' && activeSubpointIdAtSend) {
-        const nextSubpoints = (session.step3.subpoints || []).map((sp: any) =>
-          sp.id === activeSubpointIdAtSend
-            ? { ...sp, chatHistory: updatedHistory }
-            : sp,
-        );
-        onUpdateSession({
-          step3: {
-            ...session.step3,
-            subpoints: nextSubpoints,
-          },
+        onUpdateSession((prev) => {
+          const step3 = prev.step3 || session.step3;
+          const nextSubpoints = (step3.subpoints || []).map((sp: any) =>
+            sp.id === activeSubpointIdAtSend
+              ? { ...sp, chatHistory: updatedHistory }
+              : sp,
+          );
+          return {
+            step3: {
+              ...step3,
+              subpoints: nextSubpoints,
+            },
+          };
         });
       } else {
         onUpdateSession({
@@ -223,6 +623,11 @@ export default function CoachChat({
       }
     }
 
+    // Supersede any in-flight coach turn (reset / double-send safety).
+    abortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const reqId = ++requestSeqRef.current;
     setLoading(true);
 
     try {
@@ -233,6 +638,11 @@ export default function CoachChat({
               step3: {
                 ...session.step3,
                 activeSubpointId: activeSubpointIdAtSend,
+                subpoints: (session.step3.subpoints || []).map((sp: any) =>
+                  sp.id === activeSubpointIdAtSend
+                    ? { ...sp, chatHistory: updatedHistory }
+                    : sp,
+                ),
               },
             }
           : session;
@@ -240,6 +650,7 @@ export default function CoachChat({
       const res = await fetch('/api/coach/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: abortController.signal,
         body: JSON.stringify({
           question: topic.question,
           step,
@@ -247,17 +658,21 @@ export default function CoachChat({
           stepContext,
           session: sessionForRequest,
           userMessage: textToSend.trim(),
-          ...(stepKey === 'step3' && hiddenUserMessage
-            ? { isHiddenKickoff: true }
-            : {}),
+          // Hidden openers (Step2/Step3 kickoff) are system prompts — never student material.
+          ...(hiddenUserMessage ? { isHiddenKickoff: true } : {}),
+          ...(decision ? { decision } : {}),
         }),
       });
+
+      if (reqId !== requestSeqRef.current) return;
 
       const data = await res.json();
       if (!res.ok || data.error) {
         setErrorMsg(data.error || 'AI Coach 暂无回应，请检查 API 密钥。');
         return;
       }
+
+      if (reqId !== requestSeqRef.current) return;
 
       const newAiMessage: ChatMessage = {
         id: `msg-ai-${Date.now()}`,
@@ -416,6 +831,36 @@ export default function CoachChat({
               }
               if (data.progressUpdate.paragraphPlan) {
                 updatedSp.paragraphPlan = data.progressUpdate.paragraphPlan;
+                // Sync body「论点」from confirmed claim-step (theme heads ignored)
+                try {
+                  const pendingMap = new Map<string, string>();
+                  const drafts =
+                    data.progressUpdate.step3KickoffPendingDrafts ||
+                    updatedSp.kickoffPendingDrafts ||
+                    [];
+                  for (const d of drafts) {
+                    const k = String(d?.key || "").trim();
+                    const t = String(d?.text || "").trim();
+                    if (k && t) pendingMap.set(k, t);
+                  }
+                  const blocks =
+                    data.progressUpdate.paragraphPlan?.pointBlocks || [];
+                  for (const block of blocks) {
+                    const claim = resolveBlockClaimSentence(block, pendingMap);
+                    if (claim && isClaimSentence(claim)) {
+                      updatedSp.content = claim;
+                      // Keep signature on theme/structure (not claim text)
+                      updatedSp.frameworkSignature =
+                        computeSubpointFrameworkSignature(
+                          updatedSp,
+                          session,
+                        );
+                      break;
+                    }
+                  }
+                } catch {
+                  /* keep prior content */
+                }
               }
               if (
                 Array.isArray(data.progressUpdate.step3SubpointSteps) &&
@@ -517,6 +962,8 @@ export default function CoachChat({
           memory: data.progressUpdate.memory,
         };
       }
+      if (reqId !== requestSeqRef.current) return;
+
       if (stepKey === 'step3' && activeSubpointIdAtSend) {
         const step3State = sessionUpdates.step3 || session.step3;
         const nextSubpoints = (step3State.subpoints || []).map((sp: any) =>
@@ -544,15 +991,22 @@ export default function CoachChat({
         [stepKey]: nextStepKeyUpdate,
       });
     } catch (err: any) {
+      if (err?.name === 'AbortError') return;
       console.error(err);
-      setErrorMsg('发送失败，请稍后重试。' + (err.message || ''));
+      if (reqId === requestSeqRef.current) {
+        setErrorMsg('发送失败，请稍后重试。' + (err.message || ''));
+      }
     } finally {
-      setLoading(false);
+      if (reqId === requestSeqRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     if (!autoKickoff || !kickoffPrompt.trim() || loading) return;
+    // Step3: wait until a body is selected (avoids empty-key double kickoff).
+    if (stepKey === 'step3' && !String(kickoffContextKey || '').trim()) return;
     // Fire the opener only when the step chat is still empty (no welcome bubble is
     // seeded for autoKickoff steps). Once any message exists, never re-fire.
     const hasAnyMessage = chatHistory.some(
@@ -581,6 +1035,12 @@ export default function CoachChat({
   };
 
   const handleResetChat = () => {
+    // Cancel in-flight turn so a late response cannot restore old chat.
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    requestSeqRef.current += 1;
+    setLoading(false);
+
     // autoKickoff steps (step2/step3) have no welcome bubble; clear to empty so the
     // opener effect regenerates the first message. Other steps keep the welcome.
     const initialHistory: ChatMessage[] = autoKickoff
@@ -597,7 +1057,15 @@ export default function CoachChat({
     if (stepKey === 'step3') {
       const activeId = session.step3?.activeSubpointId;
       const resetSubpoints = (session.step3?.subpoints || []).map((sp: any) =>
-        sp.id === activeId ? { ...sp, chatHistory: initialHistory } : sp,
+        sp.id === activeId
+          ? {
+              ...sp,
+              chatHistory: initialHistory,
+              kickoffPendingDrafts: [],
+              step3SlotEval: undefined,
+              lastRejectCode: '',
+            }
+          : sp,
       );
       onUpdateSession({
         step3: {
@@ -682,17 +1150,7 @@ export default function CoachChat({
 
       {/* Chat Message History */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2.5 min-h-0">
-        {chatHistory.flatMap((msg) => {
-          if (msg.sender === 'ai') {
-            return msg.text.split('---').map((part, i) => ({
-              ...msg,
-              text: part.trim(),
-              id: `${msg.id}-${i}`,
-              isSplit: i > 0
-            }));
-          }
-          return [msg];
-        }).map((msg, index, arr) => (
+        {renderedMessages.map((msg) => (
           <div
             key={msg.id}
             className={`flex gap-2.5 items-start ${msg.sender === 'user' ? 'justify-end' : ''}`}
@@ -714,9 +1172,296 @@ export default function CoachChat({
             >
               {msg.sender === 'user' ? (
                 <p className="whitespace-pre-wrap">{msg.text}</p>
+              ) : (msg as any).isPendingHost ? (
+                <div>
+                  {renderPendingHostText(msg.text)}
+                  <div className="mt-2.5">
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={() => sendUserMessage('对')}
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      确认
+                    </button>
+                  </div>
+                </div>
+              ) : (msg as any).isProposalHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: {
+                            type: 'proposal',
+                            action: 'accept',
+                            proposalId: pendingProposal?.proposalId,
+                            // legacy alias for older server mappers
+                            ...(pendingProposalDecisionType
+                              ? { legacyType: pendingProposalDecisionType }
+                              : {}),
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: {
+                            type: 'proposal',
+                            action: 'reject',
+                            proposalId: pendingProposal?.proposalId,
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingProposalSummary ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      {pendingProposalKind === 'slot_add'
+                        ? `待决策：是否将「${pendingProposalSummary}」加入材料池`
+                        : pendingProposalKind === 'slot_merge'
+                          ? `待决策合并：${pendingProposalSummary}`
+                          : pendingProposalKind === 'stance'
+                            ? `待确认立场：${pendingProposalSummary}${
+                                String(pendingProposal?.payload?.text || '')
+                                  .length > 80
+                                  ? '…'
+                                  : ''
+                              }`
+                            : `待决策详略：${pendingProposalSummary}`}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isSlotAddHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'slot_add', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'slot_add', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingSlotAddClaim ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待决策：是否将「{pendingSlotAddClaim}」加入材料池
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isRetentionHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'retention', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'retention', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingRetentionSummary ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待决策详略：{pendingRetentionSummary}
+                    </p>
+                  ) : null}
+                </div>
+              ) : (msg as any).isCapacityTrimHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 space-y-2">
+                    {(pendingCapacityTrim?.pointClaims || []).map(
+                      (claim: string) => (
+                        <div
+                          key={claim}
+                          className="flex flex-wrap items-center gap-1.5 rounded-md border border-slate-100 bg-white px-2 py-1.5"
+                        >
+                          <span className="text-[11px] text-slate-700 flex-1 min-w-[8rem]">
+                            {claim}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() =>
+                              sendUserMessage(`略写「${claim}」`, {
+                                decision: {
+                                  type: 'capacity_trim',
+                                  action: 'brief',
+                                  claim,
+                                },
+                              })
+                            }
+                            className="rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-700 transition disabled:opacity-50"
+                          >
+                            略写此条
+                          </button>
+                          <button
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() =>
+                              sendUserMessage(`丢掉「${claim}」`, {
+                                decision: {
+                                  type: 'capacity_trim',
+                                  action: 'drop',
+                                  claim,
+                                },
+                              })
+                            }
+                            className="rounded-md border border-rose-100 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 transition disabled:opacity-50"
+                          >
+                            丢掉
+                          </button>
+                        </div>
+                      ),
+                    )}
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('全部保留', {
+                          decision: {
+                            type: 'capacity_trim',
+                            action: 'keep_all',
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      全部保留（不裁剪）
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-slate-400">
+                    单侧/单问已有 {pendingCapacityTrim?.pointClaims?.length || 0}{' '}
+                    条 —— 确认后再改板
+                  </p>
+                </div>
+              ) : (msg as any).isStanceConfirmHost ? (
+                <div>
+                  <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
+                    <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  </div>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('采纳', {
+                          decision: { type: 'stance', action: 'accept' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1 text-[11px] font-bold text-white transition disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      采纳
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading || inputDisabled}
+                      onClick={() =>
+                        sendUserMessage('拒绝', {
+                          decision: { type: 'stance', action: 'reject' },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-700 transition disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {pendingStanceConfirmText ? (
+                    <p className="mt-1.5 text-[10px] text-slate-400">
+                      待确认立场：{pendingStanceConfirmText.slice(0, 80)}
+                      {pendingStanceConfirmText.length > 80 ? '…' : ''}
+                    </p>
+                  ) : null}
+                </div>
               ) : (
                 <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
-                  <ReactMarkdown>{msg.text.replace(/\\n/g, '\n')}</ReactMarkdown>
+                  <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
+                  {/* Step1 Q1: question-type chips → fill input (mutually exclusive) */}
+                  {msg.sender === 'ai' &&
+                    stepKey === 'step1' &&
+                    chatHistory[0] &&
+                    msg.id.startsWith(chatHistory[0].id) &&
+                    !chatHistory.some((m) => m.sender === 'user') && (
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {STEP1_QUESTION_TYPES.map((type) => (
+                          <button
+                            key={type}
+                            type="button"
+                            disabled={loading || inputDisabled}
+                            onClick={() => sendUserMessage(type)}
+                            className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 transition hover:border-indigo-200 hover:bg-indigo-50/70 disabled:opacity-50"
+                          >
+                            {type}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   {/* Add selection buttons if in step 3 */}
                   {msg.sender === 'ai' &&
                     stepKey === 'step3' &&
@@ -799,60 +1544,6 @@ export default function CoachChat({
 
         <div ref={messagesEndRef} />
       </div>
-
-      {/* Step 3 Confirm Strip — 服务端暂存了待确认句时显示按钮，替代“回复对” */}
-      {hasPendingConfirm && (
-        <div className="bg-amber-50/80 border-t border-amber-200 px-3 py-2 shrink-0">
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider">
-              ✍️ 教练已整理，待你确认
-            </span>
-            <span className="text-[9px] text-amber-500">确认后写入右侧看板</span>
-          </div>
-          <div className="space-y-1.5 mb-2">
-            {pendingDrafts.map((d: any) => (
-              <div
-                key={String(d.key || '')}
-                className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5 text-xs text-slate-700 flex items-start gap-2"
-              >
-                <span className="flex-1 min-w-0">
-                  <span className="font-bold text-amber-700">
-                    {d.label || '当前一环'}：
-                  </span>
-                  {d.text}
-                </span>
-                <button
-                  type="button"
-                  disabled={loading}
-                  onClick={() => {
-                    setInputText(`${d.label || '当前一环'}：`);
-                    inputRef.current?.focus();
-                  }}
-                  className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 px-1.5 py-1 text-[10px] font-bold text-amber-700 transition shrink-0 disabled:opacity-50"
-                  title="修改这一项"
-                >
-                  <Pencil className="h-3 w-3" />
-                  修改
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={loading}
-              onClick={() => sendUserMessage('对')}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              确认无误，写入看板
-            </button>
-            <span className="text-[10px] text-slate-400">
-              想改某一项？点该项旁的【修改】补全内容后回车发送
-            </span>
-          </div>
-        </div>
-      )}
 
       {/* Dynamic Chat Input Bar at the Bottom */}
       <form

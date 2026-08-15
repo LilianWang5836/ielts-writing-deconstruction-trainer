@@ -8,9 +8,146 @@ import CoachChat from './CoachChat';
 function stripStep2InternalTags(text: string): string {
   return String(text || '')
     .replace(/［待裁决：[^\］]*］/g, '')
+    .replace(/［待新增：[^\］]*］/g, '')
+    .replace(/［[；;]\s*[:：]?[^\］]*］/g, '')
     .replace(/（待补例子）/g, '')
+    .replace(/（\s*[主次]\s*[／/]\s*(?:详写|略写)\s*）/g, '')
+    .replace(/（\s*已选详写[^）]*）/g, '')
+    .replace(/（\s*已选略写[^）]*）/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+/** Infer 详写/略写 only from locked tags — never from coach「建议详写」recommend copy. */
+function retentionRoleFromUserPoints(
+  claim: string,
+  userPoints: string,
+): 'detail' | 'brief' | 'dropped' | undefined {
+  const head = String(claim || '').trim();
+  if (head.length < 2 || !userPoints) return undefined;
+  // Pending proposal must not paint 详写/略写 on the board
+  if (/［待裁决：/.test(userPoints) && !/已选详写|已选略写|用户放弃/.test(userPoints)) {
+    return undefined;
+  }
+  const prefix = head.slice(0, Math.min(4, head.length));
+  const chunks = String(userPoints)
+    .split(/[；;\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const relevant = chunks.filter((c) => {
+    const bare = stripStep2InternalTags(c);
+    return (
+      bare.includes(head) ||
+      head.includes(bare.slice(0, 8)) ||
+      (prefix.length >= 3 && bare.includes(prefix))
+    );
+  });
+  // A corpus that never mentions this claim must NOT leak sibling tags onto
+  // it (mirror of the server-side inferRetentionRoleFromText fix): an unfilled
+  // B-side slot was painted 详写 by an A-side 已选详写 via the whole-text
+  // fallback window.
+  if (!relevant.length) return undefined;
+  const scan = relevant.join('；');
+  const idx = scan.indexOf(prefix);
+  const window =
+    idx >= 0 ? scan.slice(Math.max(0, idx - 2), idx + head.length + 20) : scan;
+  if (/用户放弃/.test(window)) return 'dropped';
+  if (/已选详写/.test(window)) return 'detail';
+  if (/已选略写|保留-略写/.test(window)) return 'brief';
+  return undefined;
+}
+
+/** Board quality badge: real body only — never mark claim-echo as 可写. */
+function displayPointQuality(
+  claim: string,
+  elaboration: string,
+): 'ready' | 'thin' {
+  const c = String(claim || '').trim();
+  const e = String(elaboration || '')
+    .replace(/［待裁决：[^\］]*］/g, '')
+    .replace(/（\s*已选详写[^）]*）/g, '')
+    .replace(/（\s*已选略写[^）]*）/g, '')
+    .trim();
+  if (!e || e.length < 8) return 'thin';
+  const core = c
+    .replace(
+      /[（(]\s*(原因|成因|评价|利弊|影响|解决|问题|主|次|详写|略写|待加深|可写)\s*[）)]/g,
+      '',
+    )
+    .trim();
+  if (
+    core &&
+    (e === core ||
+      e === c ||
+      (e.startsWith(core) && e.length <= core.length + 6))
+  ) {
+    return 'thin';
+  }
+  if (/^(?:原因|成因|评价|待加深|可写)$/.test(e)) return 'thin';
+  return 'ready';
+}
+
+function displayElaboration(claim: string, elaboration: string): string {
+  const e = String(elaboration || '').trim();
+  if (!e) return '';
+  if (displayPointQuality(claim, e) === 'thin' && e.length <= String(claim || '').length + 8) {
+    // Hide claim-echo shells like「主流文化冲击（待加深）」under the title
+    const core = String(claim || '')
+      .replace(
+        /[（(]\s*(原因|成因|评价|利弊|影响|解决|问题)\s*[）)]/g,
+        '',
+      )
+      .trim();
+    if (core && (e === core || e.startsWith(core))) return '';
+  }
+  return e;
+}
+
+function displayLeanTags(tags: string[]): string[] {
+  const list = (tags || []).map(String).filter(Boolean);
+  if (list.some((t) => t !== 'general')) {
+    return list.filter((t) => t !== 'general');
+  }
+  return list;
+}
+
+/** Fallback: pull elaboration from userPoints when payload point only has a short head. */
+function elabFromUserPoints(claim: string, userPoints: string): string {
+  const head = String(claim || '').trim();
+  if (!head || head.length < 2) return '';
+  const chunks = String(userPoints || '')
+    .split(/[；;\n]+/)
+    .map((s) => stripStep2InternalTags(s))
+    .filter(Boolean);
+  for (const chunk of chunks) {
+    const colon = chunk.match(
+      /^([\u4e00-\u9fffA-Za-z0-9·、]{2,24})\s*[：:]\s*([\s\S]+)$/,
+    );
+    if (colon) {
+      const h = colon[1].trim();
+      if (h === head || h.startsWith(head) || head.startsWith(h)) {
+        return colon[2].trim();
+      }
+    }
+    const paren = chunk.match(
+      /^([\u4e00-\u9fffA-Za-z0-9·、]{2,24})[（(]([\s\S]+?)[）)]/,
+    );
+    if (paren) {
+      const h = paren[1].trim();
+      const inner = paren[2].trim();
+      if (
+        (h === head || h.startsWith(head) || head.startsWith(h)) &&
+        inner.length >= 4 &&
+        !/^(?:主|次)?[／/]?(?:详写|略写)?$/.test(inner) &&
+        !/^(?:原因|成因|评价|利弊|影响|解决|问题|待加深|可写|可展开|空标签|质量待确认|已探测|已询退出)$/.test(
+          inner,
+        )
+      ) {
+        return inner;
+      }
+    }
+  }
+  return '';
 }
 
 /**
@@ -257,10 +394,22 @@ export default function Step2Brainstorm({
           (m.text.includes('下一步') && m.text.includes('第三步'))),
     );
     if (!ctaOk) return false;
+    const payload = (evalData as any)?.plannerPayload;
+    if (payload?.exitGate?.canComplete) return true;
+    const readyPoints = Array.isArray(payload?.points)
+      ? payload.points.filter(
+          (p: any) => !p?.supersededBy && p?.quality === 'ready',
+        ).length
+      : 0;
     const blueprint = (evalData as any)?.blueprint || {};
     const stance = String(
-      blueprint.position || evalData?.userStance || session.step2.userStance || '',
+      payload?.stance?.text ||
+        blueprint.position ||
+        evalData?.userStance ||
+        session.step2.userStance ||
+        '',
     ).trim();
+    if (readyPoints >= 2 && stance) return true;
     if (!stance) return false;
     const bodies = Array.isArray(blueprint.bodies) ? blueprint.bodies : [];
     const filledBodies = bodies.filter(
@@ -550,12 +699,12 @@ ${topic.question}
                       explore_A: { pct: 25, label: labelA },
                       explore_B: { pct: 50, label: labelB },
                       stance: { pct: 75, label: '明确立场' },
-                      summary: { pct: 90, label: '蓝图生成' },
+                      summary: { pct: 90, label: '材料确认' },
                     }
                   : {
                       explore_A: { pct: 33, label: labelA || '第一任务' },
                       explore_B: { pct: 66, label: labelB || '第二任务' },
-                      summary: { pct: 90, label: '蓝图生成' },
+                      summary: { pct: 90, label: '材料确认' },
                     };
                 const done = !!session.step2.isCompleted;
                 const meta = stageMeta[currentStage] || stageMeta.explore_A;
@@ -600,11 +749,14 @@ ${topic.question}
               </div>
 
               <div className="space-y-5">
-                {/* Essay Blueprint */}
+                {/* Flat materials board — paragraph layout is Planner's job */}
                 <div className="space-y-3">
                   <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider block">
-                    文章结构
+                    材料池（平铺论点）
                   </span>
+                  <p className="text-[10px] text-slate-500 leading-relaxed">
+                    此处只汇总立场与平行论点；主体段怎么排由下一步 Planner 决定。
+                  </p>
 
                   <div className="space-y-1">
                     <span className="text-[9px] font-bold text-slate-400 uppercase">写作原题 (Topic)</span>
@@ -616,104 +768,236 @@ ${topic.question}
                   <div className="space-y-1 pt-2 border-t border-slate-100">
                     <span className="text-[9px] font-bold text-slate-400 uppercase">
                       {(() => {
-                        const pos = String(evalData.blueprint?.position || evalData.userStance || '');
+                        const pos = String(
+                          (evalData as any)?.plannerPayload?.stance?.text ||
+                            evalData.blueprint?.position ||
+                            evalData.userStance ||
+                            '',
+                        );
                         const looksOverview = /本文按题目|先写「|两个任务|先解释|再提出|再写「/.test(pos);
                         return looksOverview
                           ? '总体概述 (Overview)'
                           : '全文立场 (Overall Position)';
                       })()}
                     </span>
-                    <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.position || evalData.userStance ? 'text-slate-900 font-bold' : 'text-slate-400 italic'}`}>
-                      {evalData.blueprint?.position || evalData.userStance || "⏳ 正在整理全文概述 / 立场..."}
+                    <p className={`text-xs md:text-[12.5px] leading-relaxed ${
+                      (evalData as any)?.plannerPayload?.stance?.text ||
+                      evalData.blueprint?.position ||
+                      evalData.userStance
+                        ? 'text-slate-900 font-bold'
+                        : 'text-slate-400 italic'
+                    }`}>
+                      {(evalData as any)?.plannerPayload?.stance?.text ||
+                        evalData.blueprint?.position ||
+                        evalData.userStance ||
+                        '⏳ 展开论点后，再在此确认立场...'}
                     </p>
                   </div>
 
-                  {evalData.blueprint?.bodies && evalData.blueprint.bodies.length > 0 ? (
-                    evalData.blueprint.bodies.map((b: any, index: number) => (
-                      <div key={index} className="space-y-1 pt-2 border-t border-slate-100">
-                        <span className="text-[9px] font-bold text-slate-400 uppercase">{b.title || `Body Paragraph ${index + 1}`}</span>
-                        <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-800 font-semibold">
-                          {b.content}
-                        </p>
+                  {(() => {
+                    const payloadPts = Array.isArray((evalData as any)?.plannerPayload?.points)
+                      ? (evalData as any).plannerPayload.points.filter(
+                          (p: any) => p && !p.supersededBy && String(p.claim || '').trim(),
+                        )
+                      : [];
+                    const listFallback = Array.isArray(evalData.clustering?.pointsList)
+                      ? evalData.clustering.pointsList
+                          .map((pt: string) => String(pt || '').trim())
+                          .filter(Boolean)
+                      : [];
+                    const fromUserPoints = String(evalData.userPoints || '')
+                      .split(/[；;\n]+/)
+                      .map((s) =>
+                        s
+                          .replace(/^[AB]面[^：:]*[：:]/g, '')
+                          .replace(/^\d+[.、．)\]]\s*/, '')
+                          .trim(),
+                      )
+                      .filter((s) => s.length >= 6);
+
+                    const userPointsRaw = String(evalData.userPoints || '');
+                    // Only locked tags count — never infer from coach recommend chatter.
+                    const hasLockedTags =
+                      /已选详写|已选略写|用户放弃/.test(userPointsRaw);
+                    const roleCorpus = hasLockedTags ? userPointsRaw : '';
+                    const rawItems =
+                      payloadPts.length > 0
+                        ? payloadPts.map((p: any) => {
+                            const claim = String(p.claim || '').trim();
+                            let elaboration = String(p.elaboration || '').trim();
+                            if (!elaboration) {
+                              elaboration = elabFromUserPoints(claim, userPointsRaw);
+                            }
+                            // Label-echo / task-role shell must stay 待加深 (not length≥4 → 可写).
+                            const quality = displayPointQuality(claim, elaboration);
+                            // Only the locked-tag corpus may drive display
+                            // roles — a raw-corpus call here bypassed the
+                            // hasLockedTags guard above.
+                            const retentionRole =
+                              p.retentionRole ||
+                              retentionRoleFromUserPoints(claim, roleCorpus);
+                            return {
+                              id: p.id,
+                              claim,
+                              elaboration: displayElaboration(claim, elaboration),
+                              quality,
+                              retentionRole,
+                              tags: displayLeanTags(
+                                Array.isArray(p.leanTags) ? p.leanTags : [],
+                              ),
+                            };
+                          })
+                        : (listFallback.length ? listFallback : fromUserPoints).map(
+                            (claim: string, i: number) => {
+                              const c = String(claim || '').trim();
+                              const elaboration = elabFromUserPoints(c, userPointsRaw);
+                              return {
+                                id: `f${i + 1}`,
+                                claim: c,
+                                elaboration: displayElaboration(c, elaboration),
+                                quality: displayPointQuality(c, elaboration),
+                                retentionRole: retentionRoleFromUserPoints(
+                                  c,
+                                  roleCorpus,
+                                ),
+                                tags: [] as string[],
+                              };
+                            },
+                          );
+                    // Collapse nested heads (社会文化 ⊂ 社会文化服务) for display
+                    const flatItems: typeof rawItems = [];
+                    for (const item of rawItems) {
+                      const idx = flatItems.findIndex((x) => {
+                        const a = x.claim;
+                        const b = item.claim;
+                        if (a === b) return true;
+                        const short = a.length <= b.length ? a : b;
+                        const long = a.length <= b.length ? b : a;
+                        return short.length >= 3 && long.startsWith(short);
+                      });
+                      if (idx < 0) {
+                        flatItems.push(item);
+                        continue;
+                      }
+                      const prev = flatItems[idx];
+                      if (item.claim.length > prev.claim.length) prev.claim = item.claim;
+                      if (
+                        item.elaboration &&
+                        !String(prev.elaboration || '').includes(item.elaboration)
+                      ) {
+                        prev.elaboration = [prev.elaboration, item.elaboration]
+                          .filter(Boolean)
+                          .join('；');
+                      }
+                      if (item.quality === 'ready') prev.quality = 'ready';
+                      if (item.retentionRole && !prev.retentionRole) {
+                        prev.retentionRole = item.retentionRole;
+                      }
+                      prev.tags = [...new Set([...(prev.tags || []), ...(item.tags || [])])];
+                    }
+
+                    const missing = Array.isArray(
+                      (evalData as any)?.plannerPayload?.coverage?.missingBuckets,
+                    )
+                      ? (evalData as any).plannerPayload.coverage.missingBuckets
+                      : [];
+
+                    return (
+                      <div className="space-y-2 pt-2 border-t border-slate-100">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[9px] font-bold text-slate-400 uppercase">
+                            平行论点 ({flatItems.length})
+                          </span>
+                          {missing.length > 0 && (
+                            <span className="text-[10px] font-semibold text-amber-700">
+                              待补：{missing.join('、')}
+                            </span>
+                          )}
+                        </div>
+                        {flatItems.length === 0 ? (
+                          <p className="text-xs md:text-[12.5px] text-slate-400 italic leading-relaxed">
+                            ⏳ 正在从对话中提取平行论点（尚无主体段概念）...
+                          </p>
+                        ) : (
+                          <ol className="space-y-2.5 list-none pl-0">
+                            {flatItems.map((item: any, idx: number) => (
+                              <li
+                                key={item.id || idx}
+                                className="pt-2 border-t border-slate-100 first:border-t-0 first:pt-0"
+                              >
+                                <div className="flex items-start gap-2">
+                                  <span className="text-[10px] font-bold text-indigo-500 shrink-0 mt-0.5">
+                                    {idx + 1}.
+                                  </span>
+                                  <div className="min-w-0 space-y-0.5">
+                                    <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-900 font-semibold">
+                                      {item.claim}
+                                      {item.retentionRole === 'detail' ? (
+                                        <span className="ml-1.5 text-[10px] font-bold text-indigo-600">
+                                          详写
+                                        </span>
+                                      ) : null}
+                                      {item.retentionRole === 'brief' ? (
+                                        <span className="ml-1.5 text-[10px] font-bold text-slate-500">
+                                          略写
+                                        </span>
+                                      ) : null}
+                                      {item.retentionRole === 'dropped' ? (
+                                        <span className="ml-1.5 text-[10px] font-bold text-slate-400">
+                                          放下
+                                        </span>
+                                      ) : null}
+                                    </p>
+                                    {item.elaboration ? (
+                                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                                        {item.elaboration}
+                                      </p>
+                                    ) : null}
+                                    <div className="flex flex-wrap gap-1.5 pt-0.5">
+                                      <span
+                                        className={`text-[9px] font-bold uppercase tracking-wide ${
+                                          item.quality === 'ready'
+                                            ? 'text-emerald-600'
+                                            : 'text-amber-600'
+                                        }`}
+                                      >
+                                        {item.quality === 'ready' ? '可写' : '待加深'}
+                                      </span>
+                                      {item.tags.map((t: string) => (
+                                        <span
+                                          key={t}
+                                          className="text-[9px] font-medium text-slate-400"
+                                        >
+                                          {t}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+                              </li>
+                            ))}
+                          </ol>
+                        )}
                       </div>
-                    ))
-                  ) : (
-                    <>
-                      <div className="space-y-1 pt-2 border-t border-slate-100">
-                        <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 1 (第一主体段核心分论点)</span>
-                        <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.body1 || pointsForBlueprint.body1 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
-                          {evalData.blueprint?.body1 || pointsForBlueprint.body1 || "⏳ 正在总结主体段 1 的核心观点..."}
-                        </p>
-                      </div>
-                      <div className="space-y-1 pt-2 border-t border-slate-100">
-                        <span className="text-[9px] font-bold text-slate-400 uppercase">Body Paragraph 2 (第二主体段核心分论点)</span>
-                        <p className={`text-xs md:text-[12.5px] leading-relaxed ${evalData.blueprint?.body2 || pointsForBlueprint.body2 ? 'text-slate-800 font-semibold' : 'text-slate-400 italic'}`}>
-                          {evalData.blueprint?.body2 || pointsForBlueprint.body2 || "⏳ 正在总结主体段 2 的核心观点..."}
-                        </p>
-                      </div>
-                    </>
-                  )}
+                    );
+                  })()}
                 </div>
 
-                {/* Argument Clustering */}
-                {evalData.clustering && (
-                  <div className="space-y-3 pt-1 border-t border-slate-100">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">
-                        观点展开
-                      </span>
-                      <span className="text-[10px] font-semibold text-slate-500">
-                        共 {evalData.clustering.totalPoints || 0} 个原始论点
-                      </span>
-                    </div>
-
-                    {evalData.clustering.pointsList && evalData.clustering.pointsList.length > 0 && (
-                      <div className="space-y-1.5">
-                        <span className="text-[9px] font-bold text-slate-400 uppercase">发散出的原始观点 (Brainstormed Points)</span>
-                        <div className="flex flex-wrap gap-1.5 pt-0.5">
-                          {evalData.clustering.pointsList.map((pt: string, idx: number) => (
-                            <span key={idx} className="text-xs md:text-[12.5px] text-slate-700 font-medium">
-                              {idx > 0 ? ' · ' : ''}{pt}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="space-y-3">
-                      {evalData.clustering.clusters.map((cluster: any, cIdx: number) => (
-                        <div key={cIdx} className="space-y-1.5 pt-2 border-t border-slate-100 first:border-t-0 first:pt-0">
-                          <div className="flex items-baseline justify-between gap-2">
-                            <span className="text-xs md:text-[12.5px] font-bold text-slate-800">
-                              聚类主题: {cluster.theme}
-                            </span>
-                            <span className="text-[10px] text-slate-500 shrink-0">
-                              {cluster.targetBody || `Body ${cIdx + 1}`}
-                            </span>
-                          </div>
-                          <p className="text-xs md:text-[12.5px] text-slate-500 leading-relaxed">
-                            {cluster.points.join(' · ')}
-                          </p>
-                          <p className="text-xs md:text-[12.5px] text-slate-700 font-semibold leading-relaxed">
-                            {cluster.content}
-                          </p>
+                {/* Optional: dropped/merged notes only — no body clustering UI */}
+                {evalData.clustering?.outliers &&
+                  evalData.clustering.outliers.length > 0 && (
+                  <div className="space-y-2 pt-1 border-t border-slate-100">
+                    <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block">
+                      已放下 / 已合并
+                    </span>
+                    <div className="space-y-1.5">
+                      {evalData.clustering.outliers.map((outlier: any, oIdx: number) => (
+                        <div key={oIdx} className="text-xs md:text-[12.5px] space-y-0.5">
+                          <span className="font-bold text-amber-900">“{outlier.point}”</span>
+                          <p className="text-slate-600 leading-relaxed">{outlier.suggestion}</p>
                         </div>
                       ))}
                     </div>
-
-                    {evalData.clustering.outliers && evalData.clustering.outliers.length > 0 && (
-                      <div className="space-y-2 pt-2 border-t border-slate-100">
-                        <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block">逸出观点与建议</span>
-                        <div className="space-y-1.5">
-                          {evalData.clustering.outliers.map((outlier: any, oIdx: number) => (
-                            <div key={oIdx} className="text-xs md:text-[12.5px] space-y-0.5">
-                              <span className="font-bold text-amber-900">“{outlier.point}”</span>
-                              <p className="text-slate-600 leading-relaxed">{outlier.suggestion}</p>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
                   </div>
                 )}
               </div>
@@ -724,9 +1008,9 @@ ${topic.question}
                 <Layers className="h-6 w-6" />
               </div>
               <div className="max-w-md space-y-1.5">
-                <h3 className="font-sans font-bold text-slate-800 text-sm">💡 立场与分论点看板酝酿中</h3>
+                <h3 className="font-sans font-bold text-slate-800 text-sm">💡 材料池酝酿中</h3>
                 <p className="font-sans text-xs text-slate-500 leading-relaxed">
-                  请在左侧对话区向 AI Coach 表达你对这道题目的<strong>全文立场</strong>（如赞同、反对还是中立）以及支持立场的<strong>分论点</strong>。AI 会在后台自动捕获提纯，并在这里渲染生成【立场与分论点提分看板】。
+                  请先在左侧把可写论点平行展开，再确认立场。这里只展示<strong>平铺论点</strong>，不排主体段；段落结构留给下一步 Planner。
                 </p>
               </div>
 

@@ -379,16 +379,36 @@ async function main() {
     }`,
   );
   console.log(
-    `Check: gives a reasoned default recommendation (not open-ended A/B) => ${
-      String(case5Turn1.text).includes("建议") ? "YES (GOOD)" : "NO (BAD)"
+    `Check: asks to expand uncovered content (not default 一详一略) => ${
+      /还没展开|请先补|不默认一详一略|补完后再/.test(String(case5Turn1.text)) &&
+      !/建议[：:].*详写.*略写|详写『.*』，略写『/.test(String(case5Turn1.text))
+        ? "YES (GOOD)"
+        : "NO (BAD)"
     }`,
   );
 
   const step2DataTurn1 = case5Turn1?.progressUpdate?.step2Data || {};
   const userPointsTurn1 = String(step2DataTurn1.userPoints || "");
-  const markerMatch = /［待裁决：([^｜］]+)(?:｜([^］]+))?］/.exec(userPointsTurn1);
-  const recommendation = markerMatch ? markerMatch[2] : null;
-  console.log(`Recommendation embedded in pending marker => ${recommendation || "(none found)"}`);
+  const markerMatch =
+    /［待裁决：详=([^｜］]+)｜略=([^｜］]+)｜默认=([^］]+)］/.exec(userPointsTurn1) ||
+    /［待裁决：([^｜］]+)(?:｜([^］]+))?］/.exec(userPointsTurn1);
+  const recommendation = markerMatch
+    ? markerMatch[3] || markerMatch[2] || null
+    : /还没展开|请先补|不默认一详一略/.test(String(case5Turn1.text))
+      ? "EXPAND_BOTH"
+      : null;
+  console.log(
+    `Recommendation (marker or inferred) => ${recommendation || "(none found)"}`,
+  );
+  console.log(
+    `Check: EXPAND_BOTH walk has no 待裁决 marker => ${
+      recommendation === "EXPAND_BOTH" && !/［待裁决/.test(userPointsTurn1)
+        ? "YES (GOOD)"
+        : recommendation === "EXPAND_BOTH" && /［待裁决/.test(userPointsTurn1)
+          ? "NO (BAD: marker would show 采纳/拒绝)"
+          : `n/a (rec=${recommendation})`
+    }`,
+  );
 
   function mergedSession(step2DataOverride) {
     return {
@@ -402,9 +422,8 @@ async function main() {
     };
   }
 
-  // Turn 2a: student gives a VAGUE confirmation ("好的"). Coach must interpret this as
-  // ACCEPTING the recommendation that was actually proposed (not always the same fixed
-  // outcome regardless of what was recommended), then transition without re-asking.
+  // Turn 2a: vague "好的" on a content-walk ask must NOT lock 详略 / jump to stance.
+  // On legacy KEEP_MINOR/DROP pending, soft ack still accepts that scheme.
   const case5UserTurn2a = "好的";
   const case5Turn2a = await postCoach({
     question,
@@ -420,21 +439,40 @@ async function main() {
     session: mergedSession(step2DataTurn1),
   });
   printCase(
-    "Step2 vague confirmation ('好的') -> accepts proposed recommendation (turn 2a)",
+    "Step2 vague confirmation ('好的') after retention/walk ask (turn 2a)",
     case5UserTurn2a,
     case5Turn2a,
   );
   const stage5Turn2a = case5Turn2a?.progressUpdate?.step2Data?.currentStage;
   const userPointsTurn2a = String(case5Turn2a?.progressUpdate?.step2Data?.userPoints || "");
-  console.log(
-    `Check: transitions to stance after vague confirmation => ${
-      stage5Turn2a === "stance" ? "YES (GOOD)" : `NO (BAD, got ${stage5Turn2a})`
-    }`,
-  );
+  if (recommendation === "EXPAND_BOTH") {
+    console.log(
+      `Check: EXPAND_BOTH + "好的" stays exploring (no stance lock) => ${
+        stage5Turn2a === "explore_B" || stage5Turn2a === "explore_A"
+          ? "YES (GOOD)"
+          : `NO (BAD, got ${stage5Turn2a})`
+      }`,
+    );
+    console.log(
+      `Check: does not lock 详略 tags on soft ack => ${
+        /已选详写|已选略写|保留-略写|用户放弃/.test(userPointsTurn2a)
+          ? `NO (BAD): ${userPointsTurn2a}`
+          : "YES (GOOD)"
+      }`,
+    );
+  } else {
+    console.log(
+      `Check: transitions to stance after vague confirmation => ${
+        stage5Turn2a === "stance" ? "YES (GOOD)" : `NO (BAD, got ${stage5Turn2a})`
+      }`,
+    );
+  }
   if (recommendation === "KEEP_MINOR") {
     console.log(
       `Check: vague "好的" accepted KEEP_MINOR -> recorded as 保留-略写 => ${
-        userPointsTurn2a.includes("保留-略写") ? "YES (GOOD)" : `NO (BAD): ${userPointsTurn2a}`
+        userPointsTurn2a.includes("保留-略写") || userPointsTurn2a.includes("已选略写")
+          ? "YES (GOOD)"
+          : `NO (BAD): ${userPointsTurn2a}`
       }`,
     );
   } else if (recommendation === "DROP") {
@@ -446,10 +484,13 @@ async function main() {
   }
   printJargonCheck("case5 turn2a", case5Turn2a.text);
 
-  // Turn 2b: student EXPLICITLY CONTRADICTS the proposed recommendation. Coach must flip
-  // the outcome relative to what was recommended, not just default to one fixed answer.
+  // Turn 2b: student EXPLICITLY CONTRADICTS / chooses role relative to the ask.
   const contradictionMessage =
-    recommendation === "DROP" ? "还是保留互动，简单提一句作为略写点" : "算了，放弃互动这个点吧";
+    recommendation === "DROP"
+      ? "还是保留互动，简单提一句作为略写点"
+      : recommendation === "EXPAND_BOTH"
+        ? "互动就先不写了，放弃这个点"
+        : "算了，放弃互动这个点吧";
   const case5Turn2b = await postCoach({
     question,
     step: 2,
@@ -464,7 +505,7 @@ async function main() {
     session: mergedSession(step2DataTurn1),
   });
   printCase(
-    "Step2 explicit contradiction of recommendation -> flips outcome (turn 2b)",
+    "Step2 explicit contradiction / drop of uncovered dimension (turn 2b)",
     contradictionMessage,
     case5Turn2b,
   );
@@ -478,7 +519,18 @@ async function main() {
   } else if (recommendation === "DROP") {
     console.log(
       `Check: explicit "保留" overrides DROP -> recorded as 保留-略写 => ${
-        userPointsTurn2b.includes("保留-略写") ? "YES (GOOD)" : `NO (BAD): ${userPointsTurn2b}`
+        userPointsTurn2b.includes("保留-略写") || userPointsTurn2b.includes("已选略写")
+          ? "YES (GOOD)"
+          : `NO (BAD): ${userPointsTurn2b}`
+      }`,
+    );
+  } else if (recommendation === "EXPAND_BOTH") {
+    console.log(
+      `Check: explicit "放弃" while walking -> recorded as 用户放弃 (or clears walk) => ${
+        userPointsTurn2b.includes("用户放弃") ||
+        !/［待裁决/.test(userPointsTurn2b)
+          ? "YES (GOOD)"
+          : `NO (BAD): ${userPointsTurn2b}`
       }`,
     );
   }

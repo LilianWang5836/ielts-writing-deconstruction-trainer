@@ -96,11 +96,30 @@ export interface ArgumentationFeedback {
   critique: string;
 }
 
+/** Span highlight on Step4 Chinese concept (S/V/O sets only). */
+export interface ConceptHighlightSpan {
+  /** Inclusive start index in `concept`. */
+  start: number;
+  /** Exclusive end index in `concept`. */
+  end: number;
+  /** Grammatical role within a clause. */
+  role: 'S' | 'V' | 'O';
+  /**
+   * Display priority:
+   * - core: logical main-clause S/V/O (brightest + underline)
+   * - subordinate: other clause S/V/O
+   */
+  tier: 'core' | 'subordinate';
+}
+
 export interface SentencePracticeTask {
   id: string;
   concept: string; // e.g. "Students have the flexibility to manage their study schedules"
-  section: 'intro' | 'body1' | 'body2' | 'conclusion';
+  /** e.g. intro | body1 | body2 | body3 | … | conclusion */
+  section: string;
   prompts: string[]; // Lexical cues: "have the flexibility to...", "manage study schedules"
+  /** Optional concept highlights for S/V/O + conjunctions (generated with tasks). */
+  highlights?: ConceptHighlightSpan[];
   userDraft?: string;
   confirmedSentence?: string;
   confirmed?: boolean;
@@ -171,6 +190,12 @@ export interface ParagraphPointBlock {
   role: 'major' | 'minor';
   expansionStrategy: 'explanation' | 'example' | 'mechanism' | 'impact' | 'contrast' | 'hybrid';
   steps: LogicStep[];
+  /**
+   * P2a（merge 按 pointBlock id 对齐）：块绑定到的 Step2 mapped point id
+   * （水合时按位置绑定）。稳定身份——label 被 reclass/确认改写后仍可对齐回原
+   * mapped point，框架守卫/merge 优先按 id 匹配，label 文本降为兜底。
+   */
+  mappedPointId?: string;
 }
 
 export interface ParagraphPlan {
@@ -239,6 +264,16 @@ export interface PracticeSession {
       dimensionsSufficient?: boolean;
       /** Silently skipped constraints when question has no hard qualifiers. */
       constraintsSkipped?: boolean;
+      /**
+       * Server-forced probe target (dimension core). Cleared after the next
+       * student reply is resolved to at least （已探测）.
+       */
+      pendingProbeCore?: string;
+      /**
+       * LLM verdict for the pending probe target only: expandable | thin.
+       * Server stamps tags from this; cleared after resolve.
+       */
+      probeVerdict?: string;
     };
     /** User edits on the right-side board; always win over later AI progressUpdate merges. */
     boardOverrides?: {
@@ -270,6 +305,22 @@ export interface PracticeSession {
       suggestions: string[];
       suggestedStance: string;
       suggestedPoints: string;
+      /**
+       * Structured 详略 scheme from the LLM on the recommend turn (labels
+       * copied from the frozen board). Transient — consumed by the proposal
+       * channel; prose parsing / volume ranking are fallbacks only.
+       */
+      retentionSuggestion?: {
+        detail?: string[];
+        brief?: string[];
+        drop?: string[];
+        reason?: string;
+      } | null;
+      /**
+       * Step2 → Planner material contract (single source of truth).
+       * Parallel points + stance + coverage; no paragraph layout.
+       */
+      plannerPayload?: Step2PlannerPayload;
       /** From questionBrief.taskMap.explore_A — student-facing explore label. */
       taskLabelA?: string;
       /** From questionBrief.taskMap.explore_B — student-facing explore label. */
@@ -476,7 +527,245 @@ export interface BodyPlan {
   argumentRelation?: string;
   pointRoles?: BodyPointRole[];
   mappedPoints?: string[];
+  /** Ids into session.step2.coachEvaluation.plannerPayload.points */
+  mappedPointIds?: string[];
   paragraphPlan: ParagraphPlan;
+}
+
+// ============================================================
+// Step2 → Planner payload (材料契约)
+// ============================================================
+
+export type CoverageBucket =
+  | 'view_a'
+  | 'view_b'
+  | 'advantage'
+  | 'disadvantage'
+  | 'cause'
+  | 'solution'
+  | 'positive'
+  | 'negative'
+  | 'part_1'
+  | 'part_2'
+  | 'support_main'
+  | 'oppose_or_qualify'
+  | 'general';
+
+export type Step2StancePolarity =
+  | 'agree'
+  | 'disagree'
+  | 'partial'
+  | 'positive'
+  | 'negative'
+  | 'balanced'
+  | 'outweigh_yes'
+  | 'outweigh_no'
+  | 'not_required'
+  | 'unknown';
+
+export type Step2StanceStrength = 'full' | 'qualified' | 'unknown';
+
+/** Detail/brief role chosen in Step2 retention (详写 / 略写). */
+export type Step2RetentionRole = 'detail' | 'brief' | 'dropped';
+
+export interface Step2Point {
+  id: string;
+  claim: string;
+  elaboration?: string;
+  fromDimension?: string;
+  leanTags: CoverageBucket[];
+  quality: 'thin' | 'ready';
+  /** 详写 / 略写 / 放下 — mirrored from userPoints retention tags */
+  retentionRole?: Step2RetentionRole;
+  /**
+   * Elaboration came only from Step1 seed / kickoff model rewrite — not yet
+   * expanded in a Step2 student content turn. Walk gates treat seedOnly as thin.
+   * undefined = legacy (pre-flag) → treat as already expanded.
+   */
+  seedOnly?: boolean;
+  sourceTurn?: number;
+  supersededBy?: string;
+}
+
+/** Coach-proposed new board slot awaiting explicit student confirm. */
+export interface Step2PendingSlotAdd {
+  claim: string;
+  elaboration?: string;
+}
+
+/** Single task-side / question bucket has ≥3 points — ask trim before stance. */
+export interface Step2PendingCapacityTrim {
+  sideKey: string;
+  sideLabel: string;
+  pointIds: string[];
+  pointClaims: string[];
+}
+
+/** Coach-recommended stance awaiting UI 采纳/拒绝. */
+export interface Step2PendingStanceConfirm {
+  text: string;
+}
+
+/** Role assignment inside a side_settle proposal. */
+export type Step2ProposalRole = 'detail' | 'brief' | 'dropped';
+
+export type Step2ProposalKind =
+  | 'side_settle'
+  | 'slot_add'
+  | 'slot_merge'
+  | 'stance';
+
+/** Structured decision object — UI/buttons bind this; never parse from chat text. */
+export type Step2Proposal =
+  | {
+      proposalId: string;
+      kind: 'side_settle';
+      rationale?: string;
+      createdTurn?: number;
+      payload: {
+        side: string;
+        assignments: Array<{ slotId: string; role: Step2ProposalRole }>;
+      };
+    }
+  | {
+      proposalId: string;
+      kind: 'slot_add';
+      rationale?: string;
+      createdTurn?: number;
+      payload: {
+        claim: string;
+        side: string;
+        body?: string;
+      };
+    }
+  | {
+      proposalId: string;
+      kind: 'slot_merge';
+      rationale?: string;
+      createdTurn?: number;
+      payload: {
+        /** Slot being folded away (superseded on accept). */
+        fromSlotId: string;
+        /** Slot that receives the folded content. */
+        intoSlotId: string;
+      };
+    }
+  | {
+      proposalId: string;
+      kind: 'stance';
+      rationale?: string;
+      createdTurn?: number;
+      payload: {
+        text: string;
+        polarity?: Step2StancePolarity;
+      };
+    };
+
+export interface Step2PlannerPayload {
+  version: 1;
+  status: 'draft' | 'ready' | 'invalid';
+  updatedAt: string;
+  questionType: string;
+  requiresStance: boolean;
+  /**
+   * When true, points[] slot count/labels are frozen from Step1 dimensions.
+   * Later turns may only attach elaborations onto existing slots — never append
+   * unless the student explicitly confirms a pendingSlotAdd.
+   */
+  slotsLocked?: boolean;
+  /** Canonical claim labels for locked slots (Step1 dimension cores). */
+  fixedClaims?: string[];
+  /**
+   * Student-confirmed claims added beyond Step1 dimensions.
+   * Merged into the locked slot list so later turns do not supersede them away.
+   */
+  extraClaims?: string[];
+  /**
+   * Current discussion focus point id.
+   * Used as mount fallback when string+semantic miss; hard-hang of raw
+   * userMessage when focusMode === 'deepen'.
+   */
+  activePointId?: string;
+  /**
+   * deepen = coach is asking to flesh out one named point (thin-ask / 详写『X』).
+   * none = everyday path: semantic mount → focus fallback → pendingSlotAdd (never silent-drop).
+   */
+  focusMode?: 'deepen' | 'none';
+  /** Proposed new slot — board grows only after explicit accept (采纳). */
+  pendingSlotAdd?: Step2PendingSlotAdd | null;
+  /**
+   * Claims the student declined to add as new parallel slots.
+   * Prevents re-proposing the same pending after 拒绝.
+   */
+  declinedSlotClaims?: string[];
+  /**
+   * Single-side / single-question overload (≥3 points in one bucket).
+   * Stance is blocked until keep_all / brief / drop is confirmed.
+   */
+  pendingCapacityTrim?: Step2PendingCapacityTrim | null;
+  /** Side keys where student chose 全部保留 (do not re-ask trim). */
+  capacityTrimDismissedSides?: string[];
+  /**
+   * Recommended stance awaiting explicit 采纳/拒绝.
+   * Accept locks userStance; reject clears and asks for student's own stance.
+   */
+  pendingStanceConfirm?: Step2PendingStanceConfirm | null;
+  /**
+   * When true, student already confirmed (or provided own) stance —
+   * do not re-arm pendingStanceConfirm from suggestedStance alone.
+   */
+  stanceConfirmResolved?: boolean;
+  /** After 拒绝: waiting for student's own stance text. */
+  stanceAwaitingCustom?: boolean;
+  /**
+   * After rejecting a side_settle: the side whose 详略 now waits for the
+   * student's own scheme. While set, the channel must NOT auto re-arm the
+   * same fallback settle for this side; it asks an open scheme question.
+   */
+  settleAwaitingCustomSide?: string | null;
+  /**
+   * slot_merge proposalIds the student rejected. Detection must skip these so
+   * a lingering 「已整合至…」 meta line in userPoints cannot re-arm the same
+   * merge every turn after a 拒绝.
+   */
+  rejectedMergeIds?: string[];
+  /**
+   * Phase0+ unified decision channel (side_settle / slot_add / stance).
+   * At most one pending proposal; chat text never reverse-parses into decisions.
+   * Legacy pendingSlotAdd / pendingCapacityTrim / pendingStanceConfirm remain
+   * until Phase1 tear-down.
+   */
+  pendingProposal?: Step2Proposal | null;
+  /** Side keys that already completed side_settle (详略+裁剪). */
+  sideSettled?: string[];
+  stance: {
+    text: string;
+    polarity: Step2StancePolarity;
+    strength: Step2StanceStrength;
+  };
+  points: Step2Point[];
+  redirects: Record<string, string>;
+  dimensionDispositions: Array<{
+    dimension: string;
+    disposition: 'expanded' | 'merged' | 'dropped' | 'pending';
+    side?: 'A' | 'B' | '';
+    mergedInto?: string;
+    note?: string;
+    pointIds?: string[];
+  }>;
+  coverage: {
+    passed: boolean;
+    requiredBuckets: CoverageBucket[];
+    filledBuckets: CoverageBucket[];
+    missingBuckets: CoverageBucket[];
+    softMissingBuckets: CoverageBucket[];
+  };
+  exitGate: {
+    canComplete: boolean;
+    canForceExit: boolean;
+    forceExitUsed: boolean;
+    blockReason?: string;
+  };
 }
 
 // ============================================================
@@ -563,6 +852,7 @@ export interface Step2Board {
   userPoints: string;
   suggestedStance: string;
   suggestedPoints: string;
+  plannerPayload?: Step2PlannerPayload;
   blueprint: {
     position: string;
     bodies: Array<{ title: string; content: string }>;
@@ -604,12 +894,23 @@ export interface PlannerInput {
   questionType: string;
   requiresStance: boolean;
   materials: {
+    /** Preferred: structured Step2 points */
+    points: Step2Point[];
+    stance: string;
+    stanceMeta?: {
+      polarity?: Step2StancePolarity;
+      strength?: Step2StanceStrength;
+    };
+    coverage?: Step2PlannerPayload['coverage'];
+    /** Soft one-line digest for dynamic bodyCount (not a hard lock). */
+    materialDigest?: string;
+    /** @deprecated legacy text sides — compatibility only */
     aSide: string;
     bSide: string;
-    stance: string;
     clusters: any[];
     userRawText: string;
   };
+  plannerPayload?: Step2PlannerPayload | null;
 }
 
 export interface PlannerOutput {

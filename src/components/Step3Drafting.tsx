@@ -18,14 +18,49 @@ import {
   computeEssayFrameworkSignature,
   computeSubpointFrameworkSignature,
 } from "../utils/step3Quality";
-import { prefillClaimSlotsFromSubClaims } from "../utils/step3ClaimPrefill";
+import {
+  demoteThemeHeadSubClaims,
+  isClaimSentence,
+  isThemeHeadOnly,
+  prefillClaimSlotsFromSubClaims,
+  resolveBlockClaimSentence,
+  resolveBlockThemeLabel,
+} from "../utils/step3ClaimPrefill";
 
-/** Clone plan and sync subClaim → empty claim slots for immediate board display. */
+/** Clone plan: demote theme heads only (no silent claim write — confirm-then-write). */
 function planWithClaimPrefill<T>(plan: T): T {
   if (!plan || typeof plan !== "object") return plan;
   const next = JSON.parse(JSON.stringify(plan));
-  prefillClaimSlotsFromSubClaims(next);
+  demoteThemeHeadSubClaims(next);
+  prefillClaimSlotsFromSubClaims(next); // no-op
   return next as T;
+}
+
+/** Body-level 论点句: first block's confirmed/full claim, never a theme word. */
+function resolveBodyClaimSentence(bp: any): string {
+  const plan = bp?.paragraphPlan;
+  const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
+  for (const block of blocks) {
+    const s = resolveBlockClaimSentence(block);
+    if (s) return s;
+  }
+  const sub = String(blocks[0]?.subClaim || "").trim();
+  if (isClaimSentence(sub)) return sub;
+  const theme = String(bp?.theme || "").trim();
+  return isClaimSentence(theme) ? theme : "";
+}
+
+function resolveBodyTheme(bp: any): string {
+  const t = String(bp?.theme || "").trim();
+  if (t && isThemeHeadOnly(t)) return t;
+  const blocks = Array.isArray(bp?.paragraphPlan?.pointBlocks)
+    ? bp.paragraphPlan.pointBlocks
+    : [];
+  for (const block of blocks) {
+    const head = resolveBlockThemeLabel(block);
+    if (head) return head;
+  }
+  return t && !isClaimSentence(t) ? t : "";
 }
 
 type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
@@ -33,7 +68,11 @@ type Step3Subpoint = PracticeSession["step3"]["subpoints"][number];
 interface Step3DraftingProps {
   topic: Topic;
   session: PracticeSession;
-  onUpdateSession: (updates: Partial<PracticeSession>) => void;
+  onUpdateSession: (
+    updates:
+      | Partial<PracticeSession>
+      | ((prev: PracticeSession) => Partial<PracticeSession>),
+  ) => void;
   onNextStep: () => void;
 }
 
@@ -52,7 +91,6 @@ export default function Step3Drafting({
   const subpointsStr =
     session.step2.coachEvaluation?.userPoints ||
     session.step2.userPoints ||
-    session.step2.coachEvaluation?.suggestedPoints ||
     "第一个分论点\n第二个分论点";
 
   const clusters = session.step2.coachEvaluation?.clustering?.clusters;
@@ -113,21 +151,28 @@ export default function Step3Drafting({
   const step2_5BodyPlans = (session as any).step2_5?.bodyPlans;
 
   const parsedSubpoints: Step3Subpoint[] = step2_5BodyPlans && step2_5BodyPlans.length > 0
-    ? step2_5BodyPlans.map((bp: any) => ({
+    ? step2_5BodyPlans.map((bp: any) => {
+        const plan = planWithClaimPrefill(bp.paragraphPlan);
+        const theme = resolveBodyTheme({ ...bp, paragraphPlan: plan }) || bp.role || '';
+        const claimSentence = resolveBodyClaimSentence({ ...bp, paragraphPlan: plan });
+        const mapped = Array.isArray(bp.mappedPoints) ? bp.mappedPoints : [];
+        // Keep theme heads out of "包含分论点" list; only full sentences
+        const pointLines = mapped.filter((p: string) => isClaimSentence(String(p || '')));
+        return {
         id: bp.id,
-        content: bp.paragraphPlan?.pointBlocks?.[0]?.subClaim || bp.theme || bp.targetBody,
-        points: bp.mappedPoints || [bp.paragraphPlan?.pointBlocks?.[0]?.subClaim || ''].filter(Boolean),
+        content: claimSentence || (theme ? `（主题：${theme}，待确认论点句）` : bp.targetBody),
+        points: pointLines.length ? pointLines : [],
         targetBody: bp.targetBody,
-        theme: bp.theme || bp.role,
+        theme: theme || bp.role,
         paragraphDensity: bp.paragraphDensity,
         pointRoles: bp.pointRoles,
         argumentRelation: bp.argumentRelation,
         stanceRelation: bp.argumentRelation,
         layoutRationale: (session as any).step2_5?.rationale || '',
-        paragraphPlan: planWithClaimPrefill(bp.paragraphPlan),
-        frameworkSignature: `${bp.id}-${bp.argumentRelation || ''}`,
+        paragraphPlan: plan,
         isCompleted: false,
-      }))
+      };
+      })
     : clusters && Array.isArray(clusters) && clusters.length > 0
     ? clusters.map((cluster: any, i: number) => ({
         id: `body-${i + 1}`,
@@ -192,18 +237,64 @@ export default function Step3Drafting({
     );
     const parsedSig = computeSubpointFrameworkSignature(parsed, session);
     const existingSig = existing
-      ? String(
-          existing.frameworkSignature ||
-            computeSubpointFrameworkSignature(existing, session),
-        )
+      ? computeSubpointFrameworkSignature(existing, session)
       : "";
-    if (existing && existingSig && existingSig === parsedSig) {
+    // Legacy stored sig may embed claim text; treat theme/structure match as same framework.
+    const sameFramework =
+      !!existing &&
+      !!existingSig &&
+      (existingSig === parsedSig ||
+        String(existing.frameworkSignature || "") === parsedSig ||
+        (() => {
+          const stored = String(existing.frameworkSignature || "");
+          if (!stored || stored === parsedSig) return stored === parsedSig;
+          const a = stored.split("::");
+          const b = parsedSig.split("::");
+          if (a.length !== b.length || a.length < 2) return false;
+          for (let i = 0; i < a.length; i++) {
+            if (i === 1) continue;
+            if (a[i] !== b[i]) return false;
+          }
+          return true;
+        })());
+    if (sameFramework && existing) {
+      const plan = planWithClaimPrefill(
+        existing.paragraphPlan || parsed.paragraphPlan,
+      );
+      const claimFromBoard = resolveBodyClaimSentence({
+        ...parsed,
+        paragraphPlan: plan,
+      });
+      const themeFromBoard =
+        resolveBodyTheme({ ...parsed, paragraphPlan: plan }) || parsed.theme;
+      return {
+        ...parsed,
+        // Keep 论点 in sync with confirmed claim-step value (not stale theme placeholder)
+        content:
+          claimFromBoard ||
+          (themeFromBoard
+            ? `（主题：${themeFromBoard}，待确认论点句）`
+            : parsed.content),
+        theme: themeFromBoard,
+        frameworkSignature: parsedSig,
+        paragraphPlan: plan,
+        structureSteps: existing.structureSteps,
+        chatHistory: existing.chatHistory,
+        kickoffPendingDrafts: (existing as any).kickoffPendingDrafts,
+        isCompleted: existing.isCompleted,
+      };
+    }
+    // Soft rebuild: keep dialogue/board if this body already has in-progress work
+    if (existing?.chatHistory?.length || existing?.paragraphPlan) {
       return {
         ...parsed,
         frameworkSignature: parsedSig,
-        paragraphPlan: planWithClaimPrefill(existing.paragraphPlan),
+        paragraphPlan: planWithClaimPrefill(
+          existing.paragraphPlan || parsed.paragraphPlan,
+        ),
         structureSteps: existing.structureSteps,
         chatHistory: existing.chatHistory,
+        kickoffPendingDrafts: (existing as any).kickoffPendingDrafts,
         isCompleted: existing.isCompleted,
       };
     }
@@ -224,27 +315,30 @@ export default function Step3Drafting({
       parsedSubpoints.some((parsed, idx) => {
         const prev = existing[idx];
         if (!prev || prev.id !== parsed.id) return true;
-        const prevSig = String(
-          prev.frameworkSignature ||
-            computeSubpointFrameworkSignature(prev, session),
-        );
-        return prevSig !== computeSubpointFrameworkSignature(parsed, session);
-      });
-    // Stale boards: subClaim present but claim step still empty (coach plan churn).
-    const claimSyncNeeded = (existing || []).some((sp) => {
-      const plan = sp?.paragraphPlan;
-      if (!plan || !Array.isArray(plan.pointBlocks)) return false;
-      return plan.pointBlocks.some((block: any) => {
-        const sub = String(block?.subClaim || "").trim();
-        const first = block?.steps?.[0];
-        if (sub.length < 8 || !first) return false;
-        if (!/分论点|核心观点|核心主张|主张|论点|观点|claim/i.test(String(first.label || ""))) {
-          return false;
+        const nextSig = computeSubpointFrameworkSignature(parsed, session);
+        const prevLive = computeSubpointFrameworkSignature(prev, session);
+        if (prevLive === nextSig) return false;
+        // Ignore legacy claim-content-only drift in stored signature
+        const stored = String(prev.frameworkSignature || "");
+        if (stored === nextSig) return false;
+        const a = stored.split("::");
+        const b = nextSig.split("::");
+        if (a.length === b.length && a.length >= 2) {
+          let onlyContent = true;
+          for (let i = 0; i < a.length; i++) {
+            if (i === 1) continue;
+            if (a[i] !== b[i]) {
+              onlyContent = false;
+              break;
+            }
+          }
+          if (onlyContent) return false;
         }
-        return !String(first.value || "").trim();
+        return prevLive !== nextSig;
       });
-    });
-    if (shapeChanged || claimSyncNeeded) {
+    // Do NOT full-rewrite subpoints for claim/prefill sync — that raced affirm
+    // and wiped chatHistory. Shape/id changes only.
+    if (shapeChanged) {
       const currentActive = session.step3.activeSubpointId;
       const activeStillExists =
         currentActive && parsedSubpoints.some((sp) => sp.id === currentActive);
@@ -257,7 +351,7 @@ export default function Step3Drafting({
           ...session.step3,
           subpoints,
           activeSubpointId: nextActiveSubpointId,
-          ...(shapeChanged ? { isCompleted: false } : {}),
+          isCompleted: false,
         },
       });
     }
@@ -312,10 +406,19 @@ export default function Step3Drafting({
     return map;
   })();
 
+  const kickoffFirstLabel = activeSubpoint?.paragraphPlan
+    ? findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)
+    : "分论点";
+  const kickoffTheme = String(activeSubpoint?.theme || "").trim();
+  const kickoffNeedsClaimAsk =
+    /分论点|核心主张|核心观点|主张|论点/.test(kickoffFirstLabel) &&
+    !isClaimSentence(String(activeSubpoint?.content || ""));
   const kickoffPrompt = activeSubpoint?.paragraphPlan
-    ? `请基于右侧已展示的段落结构直接开始，对准第一个空槽（${findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)}）用中文苏格拉底式提问。如果「分论点」槽已预填（来自第二步已确认的主张），不要重复问它，直接跳过去问下一个空槽。不要重新规划结构，不要一次性确认所有步骤，不要输出 pendingText。只问一个问题。`
+    ? kickoffNeedsClaimAsk
+      ? `开场：主题「${kickoffTheme || "本段主题"}」只是标签，不是论点。firstEmpty 必须是「${kickoffFirstLabel}」（论点槽）。DEFAULT：mode=expand — 用第二步素材引导学生用完整句说出本段论点。确认时保留学生逻辑，关联紧密多层可同槽；FORBIDDEN 过度缩成口号；FORBIDDEN 说「分论点已确立」或跳到展开原因。禁止静默写入、禁止改已确认槽。`
+      : `开场：对准 firstEmpty「${kickoffFirstLabel}」。DEFAULT：mode=expand。确认整理句以逻辑通顺为准（紧密多层可同槽）；仅当功能明显不同且后面有空槽时才拆多槽。禁止过度简化、禁止从零发明、禁止改 plan 骨架。`
     : activeSubpoint?.content
-    ? `请基于这个已确立的主体段分论点直接开始：${activeSubpoint.content}。请先规划本段 paragraphPlan 骨架（分点/角色/步骤标签），所有 steps[].value 保持空。step3SlotEval 必须 mode=expand，对准 firstEmpty，用自然中文苏格拉底问题开问。第二步材料只作提问线索，禁止整理成待确认整链草稿，禁止 mode=confirm / pendingText，禁止让我一次性确认。结构细节写入系统即可，对话里不要提字段名。`
+    ? `开场本段。论点槽优先。DEFAULT expand；确认时保留学生因果链，勿过度一句化。禁止静默写入。`
     : "";
 
   // Server is the sole authority for whole-step unlock (via progressUpdate.step3Ui).
@@ -530,19 +633,35 @@ export default function Step3Drafting({
                         )}
                       </div>
                       <p className="text-slate-800 font-bold text-xs leading-relaxed mb-1.5">
-                        中心句：{subpoint.content}
+                        {(() => {
+                          const m = String(
+                            subpoint.paragraphPlan?.mode || "",
+                          );
+                          if (m === "direct_points") {
+                            const themes = (
+                              subpoint.paragraphPlan?.pointBlocks || []
+                            )
+                              .map((b) => resolveBlockThemeLabel(b))
+                              .filter(Boolean);
+                            return themes.length
+                              ? `并列分点：${themes.join(" · ")}`
+                              : "分点直写（无总起句）";
+                          }
+                          if (m === "total_then_points") {
+                            const tc = String(
+                              subpoint.paragraphPlan?.totalClaim || "",
+                            ).trim();
+                            return `总观点：${tc || "待确认"}`;
+                          }
+                          return `论点：${
+                            isClaimSentence(String(subpoint.content || ""))
+                              ? subpoint.content
+                              : subpoint.theme
+                                ? `（主题：${subpoint.theme}，待确认论点句）`
+                                : "待确认论点句"
+                          }`;
+                        })()}
                       </p>
-                      {subpoint.points && subpoint.points.length > 0 && (
-                        <div className="mt-2 bg-slate-50 rounded-lg p-2 space-y-1 text-[11px] text-slate-600 border border-slate-100">
-                          <p className="font-bold text-slate-500 text-[10px] uppercase tracking-wider">📌 包含分论点：</p>
-                          {subpoint.points.map((pt: string, pIdx: number) => (
-                            <div key={pIdx} className="flex items-start gap-1">
-                              <span className="text-indigo-500 shrink-0">•</span>
-                              <span>{pt}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
                       <span className="text-[10px] text-slate-450 flex items-center gap-1 font-semibold mt-2.5">
                         {subpoint.isCompleted ? (
                           <span className="text-emerald-600 flex items-center gap-1 font-bold">✓ 论证逻辑已闭环</span>
@@ -562,6 +681,32 @@ export default function Step3Drafting({
           ) : (
             /* Socratic Visual Logic Chain */
             <div className="p-5 space-y-5 animate-fade-in">
+              {(() => {
+                const planMode = String(
+                  activeSubpoint.paragraphPlan?.mode || "single_point",
+                );
+                const isTotalThenPoints = planMode === "total_then_points";
+                const isDirectPoints = planMode === "direct_points";
+                // single_point (and unknown): one body-level 论点; no per-block echo
+                const showBodyClaimHeader = !isDirectPoints && !isTotalThenPoints;
+                const totalClaimText = String(
+                  activeSubpoint.paragraphPlan?.totalClaim || "",
+                ).trim();
+                const bodyClaimText = isClaimSentence(
+                  String(activeSubpoint.content || ""),
+                )
+                  ? String(activeSubpoint.content)
+                  : (
+                      activeSubpoint.paragraphPlan?.pointBlocks || []
+                    )
+                      .map((b) => resolveBlockClaimSentence(b, pendingByKey))
+                      .find(Boolean) ||
+                    (activeSubpoint.theme
+                      ? `（主题：${activeSubpoint.theme}，待确认论点句）`
+                      : "待确认论点句");
+
+                return (
+              <>
               <div>
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-[10px] font-bold text-indigo-700">
@@ -572,29 +717,42 @@ export default function Step3Drafting({
                       {activeSubpoint.theme}
                     </span>
                   )}
+                  {activeSubpoint.paragraphPlan?.mode && (
+                    <span className="text-[10px] font-bold text-indigo-600/80">
+                      {modeLabel[activeSubpoint.paragraphPlan.mode] ||
+                        activeSubpoint.paragraphPlan.mode}
+                    </span>
+                  )}
                 </div>
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
-                  段落中心句
-                </p>
-                <p className="text-slate-800 font-bold text-xs md:text-[12.5px] leading-relaxed">
-                  {activeSubpoint.content}
-                </p>
-                {activeSubpoint.points && activeSubpoint.points.length > 0 && (
-                  <ul className="mt-2 space-y-0.5 text-xs md:text-[12.5px] text-slate-600">
-                    {activeSubpoint.points.map((pt: string, pIdx: number) => (
-                      <li key={pIdx} className="flex items-start gap-1.5">
-                        <span className="text-slate-400 shrink-0">·</span>
-                        <span>{pt}</span>
-                      </li>
-                    ))}
-                  </ul>
+                {isTotalThenPoints ? (
+                  <>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
+                      总观点
+                    </p>
+                    <p className="text-slate-800 font-bold text-xs md:text-[12.5px] leading-relaxed">
+                      {totalClaimText || "待确认总观点"}
+                    </p>
+                  </>
+                ) : showBodyClaimHeader ? (
+                  <>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
+                      论点
+                    </p>
+                    <p className="text-slate-800 font-bold text-xs md:text-[12.5px] leading-relaxed">
+                      {bodyClaimText}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    并列分点直写：各分点下分别确认论点，本段无总起句。
+                  </p>
                 )}
               </div>
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                    论证链条
+                    论证过程
                   </span>
                   {showClearBoardConfirm ? (
                     <div className="flex items-center gap-2 shrink-0">
@@ -631,34 +789,60 @@ export default function Step3Drafting({
 
                 {activeSubpoint.paragraphPlan ? (
                   <div className="space-y-4">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[10px] font-bold text-indigo-700">
-                        {modeLabel[activeSubpoint.paragraphPlan.mode] ||
-                          activeSubpoint.paragraphPlan.mode}
-                      </span>
-                    </div>
-
-                    {activeSubpoint.paragraphPlan.totalClaim && (
-                      <div className="pb-3 border-b border-slate-100">
-                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">
-                          总观点
-                        </p>
-                        <p className="text-xs md:text-[12.5px] text-slate-800 font-bold leading-relaxed">
-                          {activeSubpoint.paragraphPlan.totalClaim}
-                        </p>
-                      </div>
-                    )}
-
                     <div className="space-y-4">
                       {activeSubpoint.paragraphPlan.pointBlocks.map(
-                        (block, blockIdx) => (
+                        (block, blockIdx) => {
+                          const themeLabel = resolveBlockThemeLabel(
+                            block,
+                            activeSubpoint.theme || "",
+                          );
+                          const claimSentence = resolveBlockClaimSentence(
+                            block,
+                            pendingByKey,
+                          );
+                          // Per-block 论点: multi-point modes only (总分 / 分点直写)
+                          const showPerBlockClaim =
+                            isDirectPoints || isTotalThenPoints;
+                          // Claim step in chain: hide when already shown as header
+                          // (single_point top) or as per-block 论点 (filled).
+                          const chainSteps = (block.steps || []).filter(
+                            (step) => {
+                              const lab = String(step?.label || "");
+                              if (
+                                !/分论点|核心观点|核心主张|主张|论点|观点|claim/i.test(
+                                  lab,
+                                )
+                              ) {
+                                return true;
+                              }
+                              const filled = String(step?.value || "").trim();
+                              const pend = pendingByKey.get(
+                                String(step?.key || ""),
+                              );
+                              if (showBodyClaimHeader) {
+                                // single_point: claim lives at body header
+                                return !filled && !pend && !claimSentence;
+                              }
+                              if (showPerBlockClaim && claimSentence) {
+                                // Shown under this block as「论点」
+                                return false;
+                              }
+                              // Empty claim still listed as 待填写 in 论证
+                              return true;
+                            },
+                          );
+                          return (
                           <div
                             key={block.id || blockIdx}
                             className="space-y-2 pt-1 border-t border-slate-100 first:border-t-0 first:pt-0"
                           >
                             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                               <span className="font-sans text-xs md:text-[12.5px] font-bold text-slate-800">
-                                {block.label || `分点 ${blockIdx + 1}`}
+                                {themeLabel ||
+                                  (isClaimSentence(String(block.label || ""))
+                                    ? `分点 ${blockIdx + 1}`
+                                    : block.label) ||
+                                  `分点 ${blockIdx + 1}`}
                               </span>
                               <span className="text-[10px] text-slate-500">
                                 {block.role === "major" ? "详写" : "略写"}
@@ -668,14 +852,24 @@ export default function Step3Drafting({
                               </span>
                             </div>
 
-                            {block.subClaim && (
-                              <p className="text-xs md:text-[12.5px] text-slate-700 leading-relaxed">
-                                {block.subClaim}
-                              </p>
-                            )}
+                            {showPerBlockClaim ? (
+                              <div className="space-y-0.5">
+                                <p className="text-[10px] font-bold text-slate-400">
+                                  论点
+                                </p>
+                                <p className="text-xs md:text-[12.5px] text-slate-800 font-semibold leading-relaxed">
+                                  {claimSentence || "待填写"}
+                                </p>
+                              </div>
+                            ) : null}
 
                             <div className="space-y-2.5 pl-0.5">
-                              {block.steps.map((step, idx, arr) => {
+                              {chainSteps.length > 0 && (
+                                <p className="text-[10px] font-bold text-slate-400 pt-0.5">
+                                  论证
+                                </p>
+                              )}
+                              {chainSteps.map((step, idx, arr) => {
                                 const pendingText = step.value
                                   ? ""
                                   : pendingByKey.get(String(step.key || "")) ||
@@ -724,7 +918,8 @@ export default function Step3Drafting({
                               })}
                             </div>
                           </div>
-                        ),
+                          );
+                        },
                       )}
                     </div>
 
@@ -801,6 +996,9 @@ export default function Step3Drafting({
                   </div>
                 )}
               </div>
+              </>
+                );
+              })()}
             </div>
           )}
         </div>

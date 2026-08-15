@@ -695,6 +695,233 @@ export function mergeParagraphPlanPreserveBlocks(prevPlan: any, nextPlan: any): 
   };
 }
 
+function frameworkLabelCore(text: string): string {
+  return String(text || '')
+    .replace(/[（(][^（）()]*[）)]/g, '')
+    .replace(/详写|略写|放下|已选|保留-|用户放弃/g, '')
+    .trim();
+}
+
+/**
+ * ③ 骨架硬传承：把模型回合返回的 paragraphPlan 对齐到权威骨架（planner bodyPlans
+ * 的 pointBlocks）。块级结构（id/label/role/expansionStrategy/顺序）以骨架为准；
+ * 块内 steps 以骨架为基础、叠加模型对同 key 的 value/status/label 修改，
+ * 模型新增的步骤 key 允许追加（支持槽内 reclass/合并）。
+ * 模型结构性 diff（新增/删除块、改块顺序/角色）一律拒收。
+ * 返回被拒收的模型块数量（>0 表示发生结构性 diff）。
+ */
+export function enforceStep3SkeletonLock(
+  plan: any,
+  skeleton: any,
+): number {
+  if (
+    !plan ||
+    !skeleton ||
+    !Array.isArray(skeleton.pointBlocks) ||
+    !skeleton.pointBlocks.length
+  ) {
+    return 0;
+  }
+  if (!Array.isArray(plan.pointBlocks)) {
+    plan.pointBlocks = skeleton.pointBlocks.map((b: any) => ({ ...b }));
+    return 0;
+  }
+
+  const skeletonBlocks = skeleton.pointBlocks;
+  const planById = new Map<string, any>();
+  plan.pointBlocks.forEach((b: any, i: number) => {
+    const id = String(b?.id || '').trim();
+    if (id) planById.set(id, b);
+    else planById.set(`__idx_${i}`, b);
+  });
+
+  const aligned: any[] = [];
+  skeletonBlocks.forEach((skel: any, i: number) => {
+    const id = String(skel?.id || '').trim();
+    const modelBlock = (id && planById.get(id)) || planById.get(`__idx_${i}`);
+    // 骨架 steps 为基础，叠加模型同 key 的修改；模型新增 key 允许追加。
+    const skeletonSteps = Array.isArray(skel?.steps) ? skel.steps : [];
+    const modelSteps = Array.isArray(modelBlock?.steps) ? modelBlock.steps : [];
+    const modelByKey = new Map<string, any>(
+      modelSteps.map((s: any) => [String(s?.key || ''), s]),
+    );
+    const steps = skeletonSteps.map((s: any) => {
+      const key = String(s?.key || '');
+      const m = key ? modelByKey.get(key) : undefined;
+      return m ? { ...s, ...m } : { ...s };
+    });
+    const seen = new Set(steps.map((s: any) => String(s?.key || '')));
+    modelSteps.forEach((m: any) => {
+      const key = String(m?.key || '');
+      if (key && !seen.has(key)) {
+        steps.push({ ...m });
+        seen.add(key);
+      }
+    });
+    aligned.push({ ...skel, steps });
+  });
+
+  // 模型新增的块（骨架里没有）→ 拒收
+  let rejected = 0;
+  plan.pointBlocks.forEach((b: any) => {
+    const id = String(b?.id || '').trim();
+    const isSkeleton = skeletonBlocks.some((s) => {
+      const sid = String(s?.id || '').trim();
+      return Boolean(id && sid && id === sid);
+    });
+    if (!isSkeleton) rejected += 1;
+  });
+  plan.pointBlocks = aligned;
+  return rejected;
+}
+
+function frameworkLabelsMatch(a: string, b: string): boolean {
+  const x = frameworkLabelCore(a);
+  const y = frameworkLabelCore(b);
+  if (x.length < 2 || y.length < 2) return false;
+  return (
+    x === y ||
+    x.includes(y) ||
+    y.includes(x) ||
+    (x.length >= 4 && y.includes(x.slice(0, 4))) ||
+    (y.length >= 4 && x.includes(y.slice(0, 4)))
+  );
+}
+
+function escRe(s: string): string {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * P0（真实旅程发现 A）：模型下一问是否在让学生填一个【已确认】的槽（回退到
+ * 已完成的步骤，如「请先把「分论点」说具体一点」当分论点已确认）。服务端据此
+ * 钳制——veto 到真实 firstEmpty 的规范问句，避免"反复问已填好的槽"。
+ */
+export function step3TextAsksConfirmedSlot(text: string, plan: any): boolean {
+  const t = String(text || '');
+  if (!t.trim() || !plan || !Array.isArray(plan.pointBlocks)) return false;
+  for (const block of plan.pointBlocks) {
+    for (const step of block?.steps || []) {
+      if (!isStep3Confirmed(step)) continue;
+      const lab = String(step?.label || '').trim();
+      if (lab.length < 2) continue;
+      const esc = escRe(lab);
+      if (
+        new RegExp(`请先把?「?${esc}」?说具体一点`).test(t) ||
+        new RegExp(
+          `请(?:回答|补充|再说一下|具体说说|写一下|确认)「?${esc}」?`,
+        ).test(t) ||
+        new RegExp(`「${esc}」的具体内容`).test(t)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The paragraph's framework (subpoint.points + pointRoles, planner-derived
+ * ledger) is the block authority — the coach LLM may narrate a paragraph with
+ * fewer angles (e.g. still believing its own "网络普及不独立成段" story from
+ * Step2 prose) and emit a plan that silently drops a mapped point's block.
+ * Append a synthesized block for every non-dropped framework point that no
+ * block represents. Returns the labels appended.
+ */
+/** One entry of the Step2→Step3 planner ledger (bodyPlans.mappedPointIds +
+ * plannerPayload.points[].retentionRole). label 可含维度短语（非完整句）。 */
+export interface Step3FrameworkLedgerEntry {
+  label: string;
+  /** detail | brief | dropped（来自 Step2Point.retentionRole）。 */
+  role?: string;
+}
+
+export function ensureParagraphPlanCoversFrameworkPoints(
+  plan: any,
+  subpoint: any,
+  frameworkLedger?: Step3FrameworkLedgerEntry[] | null,
+): string[] {
+  if (!plan || !Array.isArray(plan.pointBlocks) || !plan.pointBlocks.length) {
+    return [];
+  }
+  // 数据源优先级：planner 账本（bodyPlans.mappedPointIds/mappedPoints +
+  // retentionRole）→ 旧路径 subpoint.points（会被客户端 isClaimSentence 滤空）。
+  let points: string[] = [];
+  const roleOf = new Map<string, string>();
+  if (Array.isArray(frameworkLedger) && frameworkLedger.length) {
+    for (const e of frameworkLedger) {
+      const label = String(e?.label || '').trim();
+      if (!label) continue;
+      points.push(label);
+      const role = String(e?.role || '').trim();
+      if (role) roleOf.set(frameworkLabelCore(label), role);
+    }
+  } else {
+    points = Array.isArray(subpoint?.points)
+      ? subpoint.points.map((p: any) => String(p || '').trim()).filter(Boolean)
+      : [];
+    (Array.isArray(subpoint?.pointRoles) ? subpoint.pointRoles : []).forEach(
+      (r: any) => {
+        const key = frameworkLabelCore(String(r?.point || ''));
+        if (key) roleOf.set(key, String(r?.role || '').trim());
+      },
+    );
+  }
+  if (!points.length) return [];
+
+  const appended: string[] = [];
+  for (const point of points) {
+    const role = roleOf.get(frameworkLabelCore(point)) || '';
+    if (role === 'dropped' || role === 'drop') continue;
+    const represented = plan.pointBlocks.some(
+      (b: any) =>
+        frameworkLabelsMatch(String(b?.label || ''), point) ||
+        frameworkLabelsMatch(String(b?.subClaim || ''), point),
+    );
+    if (represented) continue;
+    const bid = `fw-${plan.pointBlocks.length + 1}-${frameworkLabelCore(point).slice(0, 6)}`;
+    const isDetail = role === 'detail';
+    plan.pointBlocks.push({
+      id: bid,
+      label: frameworkLabelCore(point) || point,
+      subClaim: '',
+      role: isDetail ? 'major' : 'minor',
+      expansionStrategy: isDetail ? 'mechanism' : 'explanation',
+      steps: isDetail
+        ? [
+            {
+              key: `${bid}_s1`,
+              label: '分论点',
+              placeholder: '确认本段核心主张',
+              value: '',
+            },
+            {
+              key: `${bid}_s2`,
+              label: '展开原因',
+              placeholder: '解释这个主张为什么成立',
+              value: '',
+            },
+            {
+              key: `${bid}_s3`,
+              label: '典型场景',
+              placeholder: '举一个具体场景或例子',
+              value: '',
+            },
+          ]
+        : [
+            {
+              key: `${bid}_s1`,
+              label: '补充点',
+              placeholder: '用一两句带过此略写点',
+              value: '',
+            },
+          ],
+    });
+    appended.push(frameworkLabelCore(point) || point);
+  }
+  return appended;
+}
+
 /** Body N is selectable only when all prior bodies are genuinely completed. */
 export function canSelectSubpoint(subpoints: any[], targetId: string): boolean {
   const idx = subpoints.findIndex((sp) => sp.id === targetId);
@@ -878,6 +1105,28 @@ export function computeEssayFrameworkSignature(session: any): string {
   return [stance, bodyCount, layout, clusterSig].join("::");
 }
 
+/**
+ * Theme / structural key for framework fingerprinting.
+ * Must NOT include confirmed claim sentences — those change during Step3 dialogue
+ * (pending → affirm) and must not look like a Planner framework change.
+ */
+export function resolveFrameworkThemeKey(subpoint: any): string {
+  const theme = String(subpoint?.theme || "").trim();
+  if (theme) return theme;
+  const content = String(subpoint?.content || "").trim();
+  const placeholder = content.match(/^（主题：(.+?)，待确认论点句）$/);
+  if (placeholder) return String(placeholder[1] || "").trim();
+  // Bare short heads only; full claim sentences are runtime board state, not framework.
+  if (
+    content &&
+    content.length <= 16 &&
+    !/是|能|会|应该|因为|所以|导致|使得|牺牲|降低|提升/.test(content)
+  ) {
+    return content;
+  }
+  return "";
+}
+
 /** Stable fingerprint for Step 2 → Step 3 body framework handoff. */
 export function computeSubpointFrameworkSignature(
   subpoint: any,
@@ -899,7 +1148,7 @@ export function computeSubpointFrameworkSignature(
   const essaySig = session ? computeEssayFrameworkSignature(session) : "";
   return [
     String(subpoint.id || "").trim(),
-    String(subpoint.content || "").trim(),
+    resolveFrameworkThemeKey(subpoint),
     String(subpoint.targetBody || "").trim(),
     String(subpoint.paragraphDensity || "").trim(),
     resolveArgumentRelation(subpoint),

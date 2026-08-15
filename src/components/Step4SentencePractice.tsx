@@ -7,7 +7,13 @@ import {
   Sparkles,
   Trophy,
 } from 'lucide-react';
-import { Topic, SentencePracticeTask, PracticeSession, InlineGuidanceResult } from '../types';
+import {
+  Topic,
+  SentencePracticeTask,
+  PracticeSession,
+  InlineGuidanceResult,
+  ConceptHighlightSpan,
+} from '../types';
 
 interface Step4SentencePracticeProps {
   topic: Topic;
@@ -16,7 +22,8 @@ interface Step4SentencePracticeProps {
   onNextStep: () => void;
 }
 
-type SectionKey = 'intro' | 'body1' | 'body2' | 'conclusion';
+/** intro | bodyN | conclusion — body count follows Step3 subpoints. */
+type SectionKey = string;
 type GuidanceIntent =
   | 'selected_vocabulary'
   | 'selected_grammar'
@@ -37,21 +44,38 @@ type SentenceTaskMatchResult = {
   reason: string;
 };
 
-const SECTION_ORDER: SectionKey[] = ['intro', 'body1', 'body2', 'conclusion'];
-const SECTION_LABELS: Record<SectionKey, string> = {
-  intro: '第一段（改写+立场）',
-  body1: 'Body 1',
-  body2: 'Body 2',
-  conclusion: 'Conclusion（总结立场）',
-};
+function sectionSortRank(section: SectionKey): number {
+  if (section === 'intro') return 0;
+  if (section === 'conclusion') return 1000;
+  const m = String(section || '').match(/^body(\d+)$/i);
+  if (m) return parseInt(m[1], 10);
+  return 500;
+}
+
+function sectionLabel(section: SectionKey): string {
+  if (section === 'intro') return '第一段（改写+立场）';
+  if (section === 'conclusion') return 'Conclusion（总结立场）';
+  const m = String(section || '').match(/^body(\d+)$/i);
+  if (m) return `Body ${m[1]}`;
+  return section;
+}
 
 /** Compact nav pills on Step4 left rail. */
-const SECTION_SHORT_LABELS: Record<SectionKey, string> = {
-  intro: 'Intro',
-  body1: 'Body1',
-  body2: 'Body2',
-  conclusion: 'Conc',
-};
+function sectionShortLabel(section: SectionKey): string {
+  if (section === 'intro') return 'Intro';
+  if (section === 'conclusion') return 'Conc';
+  const m = String(section || '').match(/^body(\d+)$/i);
+  if (m) return `Body${m[1]}`;
+  return section;
+}
+
+function buildSectionOrder(tasks: SentencePracticeTask[]): SectionKey[] {
+  const set = new Set<SectionKey>();
+  tasks.forEach((t) => {
+    set.add(t.section || inferSectionFromId(t.id));
+  });
+  return [...set].sort((a, b) => sectionSortRank(a) - sectionSortRank(b));
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   grammar: '语法',
@@ -76,6 +100,67 @@ type GuidanceThreadMessage = {
   issue?: string;
   hint?: string;
 };
+
+const HIGHLIGHT_TIER_CLASS: Record<'core' | 'subordinate', string> = {
+  core: 'rounded px-0.5 bg-amber-200/90 text-amber-950 font-semibold underline decoration-2 decoration-amber-700 underline-offset-2 box-decoration-clone',
+  subordinate: 'rounded px-0.5 bg-sky-100 text-sky-900 box-decoration-clone',
+};
+
+/** Render Chinese concept with S/V/O highlights (core = brightest + underline). */
+function renderConceptWithHighlights(
+  concept: string,
+  highlights?: ConceptHighlightSpan[],
+): React.ReactNode {
+  const raw = String(concept || '');
+  if (!raw) return null;
+  if (!Array.isArray(highlights) || highlights.length === 0) return raw;
+
+  const tierRank = (t: ConceptHighlightSpan['tier']) =>
+    t === 'core' ? 0 : t === 'subordinate' ? 1 : 2;
+
+  const sorted = [...highlights]
+    .filter(
+      (h) =>
+        (h.tier === 'core' || h.tier === 'subordinate') &&
+        Number.isFinite(h.start) &&
+        Number.isFinite(h.end) &&
+        h.start >= 0 &&
+        h.end > h.start &&
+        h.end <= raw.length,
+    )
+    .sort(
+      (a, b) =>
+        a.start - b.start ||
+        b.end - a.end ||
+        tierRank(a.tier) - tierRank(b.tier),
+    );
+
+  // Drop overlaps: earlier (already sorted with core-first among same start) wins.
+  const accepted: ConceptHighlightSpan[] = [];
+  for (const h of sorted) {
+    if (accepted.some((a) => h.start < a.end && h.end > a.start)) continue;
+    accepted.push(h);
+  }
+  accepted.sort((a, b) => a.start - b.start);
+
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  accepted.forEach((h, i) => {
+    if (h.start > cursor) nodes.push(raw.slice(cursor, h.start));
+    const tierClass =
+      h.tier === 'core'
+        ? HIGHLIGHT_TIER_CLASS.core
+        : HIGHLIGHT_TIER_CLASS.subordinate;
+    nodes.push(
+      <mark key={`cspan-${i}-${h.start}`} className={tierClass}>
+        {raw.slice(h.start, h.end)}
+      </mark>,
+    );
+    cursor = h.end;
+  });
+  if (cursor < raw.length) nodes.push(raw.slice(cursor));
+  return nodes.length ? <>{nodes}</> : raw;
+}
 
 /** Highlight key fragments in coach guidance (candidates, quotes, bold). */
 function renderHighlightedGuidanceText(text: string): React.ReactNode {
@@ -118,9 +203,9 @@ function renderHighlightedGuidanceText(text: string): React.ReactNode {
 
 function inferSectionFromId(id: string): SectionKey {
   if (id.startsWith('intro-')) return 'intro';
-  if (id.startsWith('body1-')) return 'body1';
-  if (id.startsWith('body2-')) return 'body2';
   if (id.startsWith('conclusion')) return 'conclusion';
+  const bodyMatch = id.match(/^body(\d+)/i);
+  if (bodyMatch) return `body${bodyMatch[1]}`;
   return 'body1';
 }
 
@@ -138,10 +223,9 @@ function normalizeTask(task: SentencePracticeTask): SentencePracticeTask {
 
 function taskSortKey(task: SentencePracticeTask): [number, number] {
   const section = task.section || inferSectionFromId(task.id);
-  const sectionIdx = SECTION_ORDER.indexOf(section);
   const numMatch = task.id.match(/(\d+)$/);
   const num = numMatch ? parseInt(numMatch[1], 10) : 0;
-  return [sectionIdx === -1 ? 99 : sectionIdx, num];
+  return [sectionSortRank(section), num];
 }
 
 function sortTasksBySectionOrder(tasks: SentencePracticeTask[]): SentencePracticeTask[] {
@@ -238,6 +322,8 @@ export default function Step4SentencePractice({
   const [draftExpanded, setDraftExpanded] = useState(false);
   const [activeAnnotationIdx, setActiveAnnotationIdx] = useState<number | null>(null);
   const [guidanceThread, setGuidanceThread] = useState<GuidanceThreadMessage[]>([]);
+  const [startScaffoldActive, setStartScaffoldActive] = useState(false);
+  const [scaffoldReply, setScaffoldReply] = useState('');
   const [selectionGuidance, setSelectionGuidance] = useState<InlineGuidanceResult | null>(null);
   const [selectionAskLoading, setSelectionAskLoading] = useState(false);
   const fullDraftRef = useRef<HTMLDivElement>(null);
@@ -250,22 +336,23 @@ export default function Step4SentencePractice({
   const activeTask = tasks[currentTaskIndex];
   const allConfirmed = tasks.length > 0 && tasks.every((t) => !!t.confirmed);
   const activeSection: SectionKey = activeTask?.section || 'intro';
+  const sectionOrder = useMemo(() => buildSectionOrder(tasks), [tasks]);
 
   const sectionTaskMap = useMemo(() => {
-    return SECTION_ORDER.reduce((acc, section) => {
+    return sectionOrder.reduce((acc, section) => {
       acc[section] = tasks
         .map((task, idx) => ({ task, idx }))
         .filter((entry) => entry.task.section === section);
       return acc;
     }, {} as Record<SectionKey, { task: SentencePracticeTask; idx: number }[]>);
-  }, [tasks]);
+  }, [tasks, sectionOrder]);
 
   const fullDraftText = useMemo(() => {
     const lines: string[] = [];
-    SECTION_ORDER.forEach((section) => {
+    sectionOrder.forEach((section) => {
       const sectionTasks = sectionTaskMap[section];
-      if (!sectionTasks.length) return;
-      lines.push(`${SECTION_LABELS[section]}:`);
+      if (!sectionTasks?.length) return;
+      lines.push(`${sectionLabel(section)}:`);
       sectionTasks.forEach(({ task }) => {
         if (task.confirmedSentence?.trim()) {
           lines.push(task.confirmedSentence.trim());
@@ -274,7 +361,7 @@ export default function Step4SentencePractice({
       lines.push('');
     });
     return lines.join('\n').trim();
-  }, [sectionTaskMap]);
+  }, [sectionTaskMap, sectionOrder]);
 
   const totalWords = useMemo(() => {
     return fullDraftText.split(/\s+/).filter(Boolean).length;
@@ -357,6 +444,8 @@ export default function Step4SentencePractice({
     setActiveAnnotationIdx(null);
     setDraftExpanded(false);
     setGuidanceThread([]);
+    setStartScaffoldActive(false);
+    setScaffoldReply('');
     return sorted;
   };
 
@@ -372,7 +461,19 @@ export default function Step4SentencePractice({
     const hasConclusionSection =
       normalizedExisting.length > 0 &&
       normalizedExisting.some((task) => task.section === 'conclusion');
-    const isLegacyTaskShape = hasTasks && (!hasIntroSection || !hasConclusionSection);
+    const expectedBodyCount = Array.isArray(session.step3.subpoints)
+      ? session.step3.subpoints.filter((sp) => sp && (sp.id || sp.paragraphPlan)).length
+      : 0;
+    const bodySectionsInTasks = new Set(
+      normalizedExisting
+        .map((task) => task.section)
+        .filter((section) => /^body\d+$/i.test(section)),
+    );
+    const bodyCountMismatch =
+      expectedBodyCount > 0 && bodySectionsInTasks.size < expectedBodyCount;
+    const isLegacyTaskShape =
+      hasTasks &&
+      (!hasIntroSection || !hasConclusionSection || bodyCountMismatch);
 
     if (hasTasks && !hasEnglishConcepts && !isLegacyTaskShape) {
       const sorted = jumpToFirstPendingTask(normalizedExisting);
@@ -576,6 +677,8 @@ export default function Step4SentencePractice({
       setShowGuidance(false);
       setActiveAnnotationIdx(null);
       setGuidanceThread([]);
+      setStartScaffoldActive(false);
+      setScaffoldReply('');
 
       const nextPendingIdx = sortedUpdated.findIndex((task) => !task.confirmed);
       if (nextPendingIdx !== -1) {
@@ -606,6 +709,8 @@ export default function Step4SentencePractice({
     setErrorMsg('');
     setActiveAnnotationIdx(null);
     setGuidanceThread([]);
+    setStartScaffoldActive(false);
+    setScaffoldReply('');
     setSelectionGuidance(null);
   };
 
@@ -686,14 +791,35 @@ export default function Step4SentencePractice({
   handleRequestGuidanceRef.current = () => {};
 
 
-  const handleLeftQuickAsk = async (ask: { id: GuidanceIntent; label: string }) => {
-    if (!activeTask || guidanceLoading) return;
-    const userMsgId = `u-${Date.now()}`;
-    setGuidanceThread((prev) => [
-      ...prev,
-      { id: userMsgId, role: 'user', label: ask.label },
-    ]);
-    setGuidanceIntent(ask.id);
+  const buildHighlightPayload = (task: SentencePracticeTask) =>
+    (Array.isArray(task.highlights) ? task.highlights : []).map((h) => ({
+      start: h.start,
+      end: h.end,
+      role: h.role,
+      tier: h.tier,
+      text: String(task.concept || '').slice(h.start, h.end),
+    }));
+
+  const buildGuidanceHistoryPayload = (thread: GuidanceThreadMessage[]) =>
+    thread.map((msg) => ({
+      role: msg.role,
+      text:
+        msg.role === 'user'
+          ? String(msg.label || '')
+          : [msg.issue, msg.hint].filter(Boolean).join(' '),
+      label: msg.label,
+      issue: msg.issue,
+      hint: msg.hint,
+    }));
+
+  const requestLeftGuidance = async (
+    intent: GuidanceIntent,
+    userLabel: string,
+    priorThread: GuidanceThreadMessage[],
+  ) => {
+    if (!activeTask) return;
+    setGuidanceIntent(intent);
+    if (intent === 'start_sentence') setStartScaffoldActive(true);
     setGuidanceLoading(true);
     setErrorMsg('');
     try {
@@ -705,8 +831,10 @@ export default function Step4SentencePractice({
           fullDraft: userDraft.trim(),
           concept: activeTask.concept,
           prompts: activeTask.prompts,
-          intent: ask.id,
-          questionText: ask.label,
+          intent,
+          questionText: userLabel,
+          guidanceHistory: buildGuidanceHistoryPayload(priorThread),
+          highlights: buildHighlightPayload(activeTask),
         }),
       });
       const data = await res.json();
@@ -754,6 +882,33 @@ export default function Step4SentencePractice({
     } finally {
       setGuidanceLoading(false);
     }
+  };
+
+  const handleLeftQuickAsk = async (ask: { id: GuidanceIntent; label: string }) => {
+    if (!activeTask || guidanceLoading) return;
+    const userMsg: GuidanceThreadMessage = {
+      id: `u-${Date.now()}`,
+      role: 'user',
+      label: ask.label,
+    };
+    const prior = [...guidanceThread, userMsg];
+    setGuidanceThread(prior);
+    await requestLeftGuidance(ask.id, ask.label, prior);
+  };
+
+  const handleScaffoldReply = async () => {
+    if (!activeTask || guidanceLoading) return;
+    const text = scaffoldReply.trim();
+    if (!text) return;
+    const userMsg: GuidanceThreadMessage = {
+      id: `u-${Date.now()}`,
+      role: 'user',
+      label: text,
+    };
+    const prior = [...guidanceThread, userMsg];
+    setGuidanceThread(prior);
+    setScaffoldReply('');
+    await requestLeftGuidance('start_sentence', text, prior);
   };
 
   useEffect(() => {
@@ -805,8 +960,8 @@ export default function Step4SentencePractice({
           </div>
 
           <div className="flex gap-1 overflow-x-auto">
-            {SECTION_ORDER.map((section) => {
-              const sectionTasks = sectionTaskMap[section];
+            {sectionOrder.map((section) => {
+              const sectionTasks = sectionTaskMap[section] || [];
               const done = sectionTasks.filter(({ task }) => task.confirmed).length;
               const total = sectionTasks.length;
               const isActive = activeSection === section;
@@ -815,7 +970,7 @@ export default function Step4SentencePractice({
                   key={section}
                   onClick={() => handleSectionSelect(section)}
                   disabled={total === 0}
-                  title={SECTION_LABELS[section]}
+                  title={sectionLabel(section)}
                   className={`shrink-0 rounded-md border px-2 py-1 text-[10px] font-bold transition ${
                     isActive
                       ? 'border-indigo-600 bg-indigo-600 text-white'
@@ -824,7 +979,7 @@ export default function Step4SentencePractice({
                       : 'border-slate-200 bg-white text-slate-600'
                   } ${total === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
-                  {SECTION_SHORT_LABELS[section]}
+                  {sectionShortLabel(section)}
                   <span className="ml-1 font-mono font-normal opacity-80">
                     {done}/{total || 0}
                   </span>
@@ -915,7 +1070,10 @@ export default function Step4SentencePractice({
                     🎯 当前中文语义目标
                   </span>
                   <p className="text-slate-900 font-bold text-sm leading-relaxed bg-indigo-50/50 border-l-4 border-indigo-500 p-2.5 rounded-r-lg font-sans">
-                    {activeTask.concept}
+                    {renderConceptWithHighlights(
+                      activeTask.concept,
+                      activeTask.highlights,
+                    )}
                   </p>
                 </div>
 
@@ -1051,6 +1209,32 @@ export default function Step4SentencePractice({
                       <div ref={guidanceThreadEndRef} />
                     </div>
                   )}
+                  {startScaffoldActive && (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <input
+                        type="text"
+                        value={scaffoldReply}
+                        onChange={(e) => setScaffoldReply(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            void handleScaffoldReply();
+                          }
+                        }}
+                        disabled={guidanceLoading}
+                        placeholder="接着回答起步引导…"
+                        className="flex-1 min-w-0 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-200 disabled:opacity-50"
+                      />
+                      <button
+                        type="button"
+                        disabled={guidanceLoading || !scaffoldReply.trim()}
+                        onClick={() => void handleScaffoldReply()}
+                        className="shrink-0 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-bold text-white hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        发送
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             )
@@ -1084,7 +1268,7 @@ export default function Step4SentencePractice({
               </button>
               <span className="text-slate-300 hidden sm:inline">|</span>
               <span className="text-[11px] font-bold text-indigo-700 truncate hidden sm:inline">
-                {SECTION_LABELS[activeSection]}
+                {sectionLabel(activeSection)}
               </span>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
@@ -1151,13 +1335,13 @@ export default function Step4SentencePractice({
                   <p className="text-xs text-slate-400">{tasks.length} 句 · 约 {totalWords} 词</p>
                 </div>
               )}
-              {SECTION_ORDER.map((section) => {
+              {sectionOrder.map((section) => {
                 const sectionTasks = sectionTaskMap[section];
-                if (!sectionTasks.length) return null;
+                if (!sectionTasks?.length) return null;
                 return (
                   <section key={section} className="space-y-1">
                     <h4 className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500 mb-1">
-                      {SECTION_LABELS[section]}
+                      {sectionLabel(section)}
                     </h4>
                     <div className="divide-y divide-slate-100">
                       {sectionTasks.map(({ task, idx }) => {
@@ -1199,13 +1383,13 @@ export default function Step4SentencePractice({
                 <p className="text-xs text-slate-400">{tasks.length} 句 · 约 {totalWords} 词</p>
               </div>
               <div className="bg-slate-50/40 rounded-xl p-4 space-y-4">
-                {SECTION_ORDER.map((section) => {
+                {sectionOrder.map((section) => {
                   const sectionTasks = sectionTaskMap[section];
-                  if (!sectionTasks.length) return null;
+                  if (!sectionTasks?.length) return null;
                   return (
                     <section key={section} className="space-y-1">
                       <h4 className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500 mb-1">
-                        {SECTION_LABELS[section]}
+                        {sectionLabel(section)}
                       </h4>
                       <div className="divide-y divide-slate-100">
                         {sectionTasks.map(({ task }) => (
