@@ -106,7 +106,7 @@ import {
   activeSlotLabel,
   isSkeletonComplete,
 } from "./src/server/step3/secretary";
-import { toSkeleton, planToSkeleton } from "./src/utils/step3Skeleton";
+import { toSkeleton, planToSkeleton, skeletonFlatSlots } from "./src/utils/step3Skeleton";
 import { log } from "./src/server/logger";
 
 dotenv.config();
@@ -2060,37 +2060,26 @@ function refreshMemoryAfterProgress(
     if (progressUpdate.isCompleted === false) virtual.step2.isCompleted = false;
   }
 
-  if (Number(progressUpdate?.step) === 3 || progressUpdate?.paragraphPlan || progressUpdate?.step3SubpointSteps) {
-    // Step3 plan lives on the active subpoint; mirror into virtual for hashing.
+  if (Number(progressUpdate?.step) === 3 || progressUpdate?.step3SecretarySubpoints) {
+    // Step3 秘书路径：结构由服务器确定性落槽，LLM 不再输出 paragraphPlan /
+    // step3SlotEval / step3SubpointSteps。虚拟 session 只需镜像服务器回传的
+    // subpoints（含冻结骨架 + minutes + activeSlotIndex）。
     const activeId =
       session?.step3?.activeSubpointId ||
       (Array.isArray(session?.step3?.subpoints) && session.step3.subpoints[0]?.id) ||
       "";
-    const subpoints = Array.isArray(session?.step3?.subpoints)
-      ? session.step3.subpoints.map((sp: any) => {
-          if (sp.id !== activeId) return sp;
-          const next = { ...sp };
-          if (progressUpdate.paragraphPlan) {
-            next.paragraphPlan = progressUpdate.paragraphPlan;
-          }
-          if (Array.isArray(progressUpdate.step3SubpointSteps)) {
-            next.structureSteps = progressUpdate.step3SubpointSteps;
-          }
-          if (Array.isArray(progressUpdate.step3KickoffPendingDrafts)) {
-            next.kickoffPendingDrafts = progressUpdate.step3KickoffPendingDrafts;
-          }
-          if (typeof progressUpdate.step3LastRejectCode === "string") {
-            next.lastRejectCode = progressUpdate.step3LastRejectCode;
-          }
-          if (
-            progressUpdate.step3SlotEval &&
-            typeof progressUpdate.step3SlotEval === "object"
-          ) {
-            next.step3SlotEval = progressUpdate.step3SlotEval;
-          }
-          return next;
-        })
-      : [];
+    const subpoints = Array.isArray(progressUpdate.step3SecretarySubpoints)
+      ? progressUpdate.step3SecretarySubpoints
+      : Array.isArray(session?.step3?.subpoints)
+        ? session.step3.subpoints.map((sp: any) => {
+            if (sp.id !== activeId) return sp;
+            const next = { ...sp };
+            if (typeof progressUpdate.step3LastRejectCode === "string") {
+              next.lastRejectCode = progressUpdate.step3LastRejectCode;
+            }
+            return next;
+          })
+        : [];
     virtual.step3 = {
       ...virtual.step3,
       subpoints,
@@ -3086,15 +3075,6 @@ function attachStep3UiProgress(
   }
 }
 
-type PendingPlanStep = {
-  blockLabel: string;
-  stepLabel: string;
-  cleanStepLabel: string;
-  blockIndex: number;
-  stepIndex: number;
-  hasGenuineValue: boolean;
-};
-
 /** Strip a duplicated "分点N - " / blockLabel prefix from a step label. */
 function stripStep3BlockLabelPrefix(blockLabel: string, stepLabel: string): string {
   let label = String(stepLabel || "").trim();
@@ -3122,29 +3102,6 @@ function formatStep3FlatStepLabel(blockLabel: string, stepLabel: string): string
   const block = String(blockLabel || "").trim() || "分点";
   const clean = stripStep3BlockLabelPrefix(block, stepLabel);
   return `${block} - ${clean}`;
-}
-
-function findFirstEmptyPlanStep(plan: any): PendingPlanStep | null {
-  if (!plan || !Array.isArray(plan.pointBlocks)) return null;
-  for (let bi = 0; bi < plan.pointBlocks.length; bi++) {
-    const block = plan.pointBlocks[bi];
-    const steps = Array.isArray(block?.steps) ? block.steps : [];
-    for (let si = 0; si < steps.length; si++) {
-      if (!isStep3Confirmed(steps[si])) {
-        const blockLabel = String(block?.label || `分点${bi + 1}`);
-        const rawLabel = String(steps[si]?.label || "展开");
-        return {
-          blockLabel,
-          stepLabel: rawLabel,
-          cleanStepLabel: stripStep3BlockLabelPrefix(blockLabel, rawLabel),
-          blockIndex: bi,
-          stepIndex: si,
-          hasGenuineValue: isGenuineStep3StepValue(steps[si]),
-        };
-      }
-    }
-  }
-  return null;
 }
 
 /**
@@ -3416,26 +3373,6 @@ type SlotEvalResult = {
   text: string;
   hint: string;
 };
-
-/** Confirmed sibling values in the same pointBlock (exclude current key). */
-function collectConfirmedSiblingValues(
-  plan: any,
-  blockIndex: number,
-  excludeKey: string,
-): string[] {
-  const steps = Array.isArray(plan?.pointBlocks?.[blockIndex]?.steps)
-    ? plan.pointBlocks[blockIndex].steps
-    : [];
-  const out: string[] = [];
-  for (const s of steps) {
-    const key = String(s?.key || "");
-    if (key && key === excludeKey) continue;
-    if (!isStep3Confirmed(s)) continue;
-    const v = String(s?.value || "").trim();
-    if (v) out.push(v);
-  }
-  return out;
-}
 
 /**
  * Legacy expand hint builder — demoted; MUST NOT drive student-facing Part2.
@@ -3853,44 +3790,53 @@ function formatStep2BodyFrameworkForPrompt(framework: Record<string, unknown> | 
   return lines.join("\n");
 }
 
-/** Inject firstEmpty / pending / lastRejectCode for Step 3 model context. */
+/** 基于秘书骨架 + 纪要投影当前 Step3 槽位光标（restructure 新架构）。
+ * 旧实现读 paragraphPlan 槽位；新实现读冻结骨架 skeleton + minutes（真相源）。
+ * 让教练 LLM 看到的槽位状态与右侧秘书看板完全一致，消灭双真相源。 */
 function formatStep3SlotCursorForPrompt(activeSp: any): string {
-  if (!activeSp) {
-    return "Not provided (no active subpoint).";
+  if (!activeSp) return "Not provided (no active subpoint).";
+  const skeleton = activeSp.skeleton;
+  if (!skeleton || !Array.isArray(skeleton.blocks) || skeleton.blocks.length === 0) {
+    return "Not provided (no frozen skeleton yet — secretary initializes it on first Step3 turn).";
   }
-  const plan = activeSp.paragraphPlan;
-  const empty = plan ? findFirstEmptyPlanStep(plan) : null;
-  const emptyStep =
-    empty && plan?.pointBlocks?.[empty.blockIndex]?.steps?.[empty.stepIndex];
-  const emptyKey = emptyStep
-    ? String(emptyStep.key || `${empty!.blockIndex}:${empty!.stepIndex}`)
-    : "";
-  const beat = emptyStep ? classifyStep3Beat(emptyStep) : "";
-  const siblings =
-    empty && plan
-      ? collectConfirmedSiblingValues(plan, empty.blockIndex, emptyKey)
-      : [];
-  const pending = Array.isArray(activeSp.kickoffPendingDrafts)
-    ? activeSp.kickoffPendingDrafts
-        .map(
-          (d: any) =>
-            `${String(d?.key || "")}: ${String(d?.text || "").trim().slice(0, 80)}`,
+  const minutes = Array.isArray(activeSp.minutes) ? activeSp.minutes : [];
+  const flat = skeletonFlatSlots(skeleton);
+  const confirmedKeys = new Set(
+    minutes
+      .filter((m: any) => m.status === "confirmed" && m.slotKey)
+      .map((m: any) => m.slotKey as string),
+  );
+  const firstEmpty = flat.find((f) => !confirmedKeys.has(f.slot.key));
+  const pending = minutes.find((m: any) => m.status === "landed");
+  const siblings = firstEmpty
+    ? flat
+        .filter(
+          (f) =>
+            f.blockIndex === firstEmpty.blockIndex && confirmedKeys.has(f.slot.key),
         )
+        .map((f) => {
+          const m = minutes.find(
+            (x: any) => x.slotKey === f.slot.key && x.status === "confirmed",
+          );
+          return m
+            ? `${f.slot.label}: ${String(m.text || "").slice(0, 40)}`
+            : "";
+        })
         .filter(Boolean)
-        .join(" | ")
-    : "";
-  const lastReject = String(activeSp.lastRejectCode || "").trim();
+    : [];
   const lines = [
-    `- firstEmpty key: ${emptyKey || "(none — body may be complete)"}`,
-    `- firstEmpty label: ${empty?.cleanStepLabel || "(none)"}`,
-    `- firstEmpty beat: ${beat || "(none)"}`,
+    `- firstEmpty key: ${firstEmpty ? firstEmpty.slot.key : "(none — body may be complete)"}`,
+    `- firstEmpty label: ${firstEmpty ? firstEmpty.slot.label : "(none)"}`,
+    `- firstEmpty placeholder: ${firstEmpty ? firstEmpty.slot.placeholder : "(none)"}`,
     `- confirmed sibling summaries: ${
-      siblings.length
-        ? siblings.map((s) => s.slice(0, 40)).join(" || ")
+      siblings.length ? siblings.join(" || ") : "(none)"
+    }`,
+    `- current pending (landed, awaiting「对」): ${
+      pending
+        ? `${String(pending.slotKey || "")}: ${String(pending.text || "").slice(0, 60)}`
         : "(none)"
     }`,
-    `- current pending: ${pending || "(none)"}`,
-    `- lastRejectCode: ${lastReject || "(none)"}`,
+    `- skeleton completion: ${confirmedKeys.size}/${flat.length} slots confirmed`,
   ];
   return lines.join("\n");
 }
@@ -3922,29 +3868,6 @@ function cleanStep2EvidenceSnippet(text: string): string {
 }
 
 type Step3BeatKind = "reason" | "mechanism" | "impact" | "example" | "other";
-
-function classifyStep3Beat(step: any): Step3BeatKind {
-  const hay = [
-    step?.key,
-    step?.label,
-    step?.placeholder,
-  ]
-    .map((x) => String(x || ""))
-    .join(" ");
-  if (/impact|result|影响|效果|保护|结果|后果|benefit/i.test(hay)) {
-    return "impact";
-  }
-  if (/mechanism|机制|吸入|受害|被迫|过程|链条/i.test(hay)) {
-    return "mechanism";
-  }
-  if (/example|scenario|例子|场景|举例|eg\b/i.test(hay)) {
-    return "example";
-  }
-  if (/reason|原因|通风|密闭|空间|为何|为什么|起因/i.test(hay)) {
-    return "reason";
-  }
-  return "other";
-}
 
 /**
  * Narrow evidence for kickoff organization: student argument blobs only.
@@ -4603,7 +4526,13 @@ function ensureStep3SkeletonForSubpoints(session: any): boolean {
       return; // 已有骨架，跳过
     }
     const bp = bodyPlans.find((b: any) => String(b?.id) === String(sp?.id));
-    const skeleton = bp ? toSkeleton(bp) : sp?.paragraphPlan ? planToSkeleton(sp.paragraphPlan) : null;
+    const skeleton = bp?.skeleton
+      ? bp.skeleton
+      : bp
+        ? toSkeleton(bp)
+        : sp?.paragraphPlan
+          ? planToSkeleton(sp.paragraphPlan)
+          : null;
     if (skeleton && skeleton.blocks.length > 0) {
       sp.skeleton = skeleton;
       if (!Array.isArray(sp.minutes)) sp.minutes = [];
@@ -8125,13 +8054,13 @@ ${step2Summary}
 - Subpoint logic chains: ${JSON.stringify(step3Subpoints)}
 - Active Subpoint (= starting claim for this turn): ${activeStep3Claim || "Not selected / not provided"}
 - Active Subpoint belongs to: ${activeStep3Subpoint?.targetBody || "Unknown"}
-- Step 2 Body Framework for Active Subpoint (INTERNAL — inherit in paragraphPlan per STEP 0; do not echo field names to student):
+- Step 2 Body Framework for Active Subpoint (INTERNAL — the frozen skeleton for this body; do not echo field names to student):
 ${activeFrameworkStr}
-- Step 3 slot cursor (INTERNAL — firstEmpty / pending / lastRejectCode; do not echo to student):
+- Step 3 slot cursor (INTERNAL — firstEmpty / confirmed siblings / pending; do not echo to student):
 ${step3SlotCursorStr}
 - Step 2 mapped brainstorm points are QUESTION CUES only for this body's coaching: use them to shape the firstEmpty Socratic ask. FORBIDDEN: organizing them into multi-slot draft values / a confirm bundle / mode=confirm on kickoff or before the student has spoken this beat in Step 3.
-- Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. Start diagnosis and paragraphPlan directly. Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
-- Mode hint: If Step 2 framework specifies paragraphDensity, follow STEP 0 mapping. Otherwise, if Step 2 blueprint already gives an overall thesis/position AND this body claim already umbrella-covers two sub-points, prefer direct_points (no separate totalClaim) for multi-point bodies.
+- Rule for this turn: If Active Subpoint exists, treat it as the student's already-approved claim. The server (meeting secretary) owns the skeleton and slot landing — you only produce dialogue. Start by asking the first still-missing slot (see slot cursor). Ask clarification only if this claim is empty, too vague, or bundles unclear mixed points.
+- Mode hint: structure is already frozen by the server; do NOT propose paragraph modes / paragraphPlan / direct_points in Step 3. Just coach the current slot conversationally.
 
 Current objective:
 Review the context above and the current step's instructions. Organize and develop the existing ideas. Keep full consistency with the established positions. Prefer memory digests' filled/openGaps over re-deriving what is already known.
@@ -8510,7 +8439,11 @@ ${memoryDigestStr}
 - Step 3: Body Paragraph Argument Building (段落逻辑链构建)
   Current State: REASONING TRAINING / DRAFTING COACH
   Role: Writing Cognitive Drafting Coach.
-  Objective: Help students expand one chosen Body Paragraph (主体段) into a complete, logically closed argument. 
+
+  ⚠️ STRUCTURE IS SERVER-OWNED (HIGHEST PRIORITY — overrides everything below):
+  - The server's meeting secretary owns the frozen skeleton, slot landing, board writing, and completion flags. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / step3SubpointCompletenessChecks / step3SubpointTransitionChecks / step3SubpointSufficiencyCheck / step3SubpointClaim|Reason|Mechanism|SupportContent|Impact|Result — in fact do NOT output ANY progressUpdate structure fields in Step 3.
+  - Your ONLY job in Step 3: produce the dialogue "text". Read the "Step 3 slot cursor" in ContextSummary (firstEmpty label / placeholder / confirmed siblings / pending). Ask the first still-missing slot in natural, plain Chinese. Briefly acknowledge the student's answer (reference what they said, do not restate verbatim). Guide them to confirm via the button.
+  - Everything below about plain-language, Socratic tone, compactness, anti-loop, no-spoiler, no-internal-jargon, Part 1 / "---" / Part 2 structure STILL APPLIES. Ignore ONLY the instructions that tell you to emit structure JSON (paragraphPlan / step3SlotEval / step3SubpointSteps / mode / expansionStrategy / steps[].value / status:confirmed / step3SubpointCompleted) — those are legacy and the server no longer reads them.
 
   ## STEP 3 PLAIN-LANGUAGE / WRITABILITY STANDARD (CRITICAL, governs all Chinese you generate here):
   - Target learner is IELTS band 5-5.5. Prefer plain, concrete Chinese that a band 5-5.5 student can later turn into English — but do NOT gut the student's logic.
@@ -8526,252 +8459,24 @@ ${memoryDigestStr}
     - Bad: "面对面的物理环境提供了实时、高频率、全方位的社交接口。"
       Good: "在教室里，学生每天都能和同学面对面说话、一起做事。"
 
-  ## STEP 3 DECISION ORDER (STRICT — follow in this exact order):
-  STEP 0 — INHERIT STEP 2 ESSAY FRAMEWORK WHEN PROVIDED (authoritative skeleton; Step 3 fills chains only):
-  - ContextSummary includes "Step 2 Body Framework for Active Subpoint" when Step 2 converge/summary completed. This is the authoritative paragraph skeleton for the CURRENT body only.
-  - When framework fields are present, Step 3's job is to FILL argument content via dialogue — NOT to re-decide essay-level layout (2 vs 3 bodies, merge vs split points across bodies, major/minor assignment, or argumentRelation).
-  - Mapping framework → paragraphPlan:
-    - \`paragraphDensity: "single_point"\` → \`mode: "single_point"\`, exactly ONE pointBlock for the major mapped point.
-    - \`paragraphDensity: "dual_point"\` → \`mode: "direct_points"\`, TWO pointBlocks matching \`pointRoles\` / \`mappedPoints\` (major/详写: prefer ≥4 steps including claim; minor/略写: 1–2 steps). Do not thin the major chain just to make room for minor.
-    - Set each pointBlock.\`subClaim\` ONLY when mapped point text is already a FULL CLAIM SENTENCE (planning hint). If mapped text is only a theme head (e.g. 「环境保护」「人际关系」), put that word in \`label\` / theme and leave \`subClaim\` empty. Set \`role\` from \`pointRoles\`.
-    - Board is TWO layers: (1) 论点 = one full claim sentence (2) 论证过程 = mechanism/example/impact steps (may be multiple steps). Theme words are labels only.
-    - CONFIRM-THEN-WRITE (CRITICAL — all slots): Server NEVER silent-writes \`steps[].value\`. Write path is always pending →【确认】→ write. DEFAULT for each firstEmpty: mode=expand — use Step2/Planner snippets as a QUESTION SEED to guide the student to补论证. When confirming, organize the student's meaning into pendingText that stays logically complete — closely related multi-layer content may stay in ONE pendingText; do NOT oversimplify. Split to pendingDrafts / later slots ONLY when layers are clearly different argument functions and empty slots exist. FORBIDDEN: cutting the same Step2 blob into near-duplicate confirms; FORBIDDEN: saying「分论点已确立」while the claim slot is still empty; FORBIDDEN: starting at 展开原因 before 论点 is confirmed; FORBIDDEN: rewriting confirmed steps or inserting new steps mid-dialogue. ContextSummary firstEmpty is authoritative.
-    - \`argumentRelation\` (or legacy \`stanceRelation\`) selects REQUIRED argument beats for this body. Cover those beats with open student-filled steps; do NOT force a fixed step count or fixed canned labels:
-      - supports / elaborates: no mandatory beats. Choose 2–4 steps from the expansion strategies below that best fit the student's STEP 2 materials. NEVER default to a fixed "claim → reason → mechanism → example" template — different materials need different chains (e.g. a material strong on causal logic uses mechanism→impact; a material strong on concrete situations uses example→explanation).
-      - concedes: must cover (1) acknowledge the opposite side exists (2) show why it does not overturn the overall thesis — step count flexible.
-      - compares: both sides → key difference → which is better (flexible phrasing).
-      - solves: problem/gap → solution → why it works.
-  - EXPANSION STRATEGY CHOICE (applies to ALL relation types): BEFORE you write any \`pointBlock.steps[]\`, decide the \`expansionStrategy\` for each pointBlock by inspecting the Step 2 material quality:
-    - \`explanation\`: the material focuses on clarifying a concept or definition → steps build a logical explanation chain.
-    - \`example\`: the material naturally lends itself to a concrete scene/case → steps build around a vivid example.
-    - \`mechanism\`: the material traces a cause→effect process → steps follow the causal chain.
-    - \`impact\`: the material emphasizes consequences or significance → steps lead toward impact/outcome.
-    - \`contrast\`: the material compares two sides or before/after → steps highlight the contrast.
-    - \`hybrid\`: the material requires 2+ strategies mixed (e.g. mechanism + example) → combine as needed within budget.
-    - Record your choice in \`pointBlock.expansionStrategy\`. DO NOT write every block as "mechanism" or follow the same template for every body paragraph. Two body paragraphs with the same relation but different material SHOULD produce different step layouts.
-  - CONTENT REUSE FROM STEP 2 / PLANNER (CRITICAL): Never invent from zero. DEFAULT = expand with material as seed (e.g.「你提到超长时间工作——这对家人陪伴具体会怎样？」). Confirm when the beat is complete enough and non-redundant vs confirmed siblings. After student answers, organize THEIR words into pendingText for【确认】 — keep their causal layers when tightly related (fluent multi-clause OK); FORBIDDEN: crushing a rich answer into a short slogan. Split across slots only for clearly different functions + empty later slots. FORBIDDEN: rubber-stamping thin Step2 cuts; FORBIDDEN: writing \`steps[].value\` yourself; FORBIDDEN: mutating the plan skeleton mid-dialogue.
-  - After the student affirms (「对/是的/没问题」), the SERVER writes confirmed values. Your next turn asks the next empty slot with mode=expand (Socratic) unless the student already answered that next beat in this Step 3 dialogue. Do not make the student restate already-confirmed material.
-  - Record \`[inherited-step2-framework]\` in \`paragraphPlan.diagnosis\` when inheriting.
-  - FORBIDDEN when framework exists: re-asking whether to split/combine mapped points; changing the number of pointBlocks vs Step 2 \`mappedPoints\`; ignoring \`pointRoles\`; re-diagnosing single vs multi-point against the claim text; inventing a new argumentRelation.
-  - Override ONLY if the student explicitly requests a different structure in Step 3 chat; then tag \`[framework-override]\` in diagnosis and explain briefly in plain Chinese (no internal field names).
-  - NEVER expose \`paragraphDensity\`, \`argumentRelation\`, \`stanceRelation\`, \`layoutPattern\`, \`layoutRationale\`, or \`pointRoles\` in student-facing chat.
+  ## STEP 3 DIALOGUE FOCUS (what actually matters now):
+  - Never invent from zero. Expand the student's Step 2 material as a seed: "你提到超长时间工作——这对家人陪伴具体会怎样？"
+  - One micro-step per turn: ask ONLY the first still-missing slot (per slot cursor). When the student answers, either acknowledge and guide to confirm (if their answer fills the slot), or ask one deeper follow-up (if shallow). At most ONE depth follow-up per slot.
+  - If the student's answer is off-target for the current slot, name the mismatch in one short sentence, then guide back — do NOT open with empty praise.
+  - Anti-loop: never re-ask the same question 3+ times; after one depth follow-up, accept concise content and move on.
+  - Do NOT propose paragraph modes, pointBlock splits, direct_points / total_then_points, or any structural scheme — the skeleton is already frozen.
+  - Keep it human: vary openers, no filler superlatives, no meta-commentary about the board/write process (「确认前不会写入右侧」类禁止), no English translations.
+  - SINGLE-SUBPOINT SCOPE: each reply serves ONLY the current Active Subpoint. Do not start the next body or ask "我们接着写第二个分论点吧" — switching bodies is the UI's job.
+  - No-spoiler acknowledgment: Part 1 may name WHICH slot the answer fills, but must NOT explain why it works or spell out the reasoning chain for the student (that reasoning is their own thinking practice).
+  - CRITICAL — NO INTERNAL JARGON IN CHAT TEXT: never quote slot/field names like paragraphPlan / pointBlock / mode / step / slot / firstEmpty / skeleton in student-facing text. Use natural Chinese (这一步 / 展开原因 / 举个例子 / 影响).
+  - If every slot in the current body's skeleton is confirmed (server tells you via the board), give a one-line closure and let the UI handle body switching / Step 4 CTA. Do not fabricate completion yourself.
+  - FORBIDDEN in student-facing text: 「不会写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」and similar board-process meta. Guide the argument; the server silently handles pending/write.
 
-  STEP A — POINT COUNT (ONLY when Step 0 framework is ABSENT):
-  - If Step 0 framework is present: SKIP this entire step. Copy \`paragraphDensity\` + \`pointRoles\` into diagnosis (e.g. "[inherited-step2-framework] single_point") and proceed to STEP B/C. Do NOT re-run multi-point detection.
-  - If framework is ABSENT only: decide whether the claim contains ONE internally-single point or MULTIPLE independently-developable points. Record this in 'progressUpdate.paragraphPlan.diagnosis'.
-  - PRECEDENCE RULE (no-framework path only): Multi-point detection OUTRANKS all flat logic-chain schemes. If the claim contains multiple independently-developable points, you MUST create one 'pointBlock' per point.
-  - HOW TO DECIDE "multiple independently-developable points" (no-framework path only): the claim asserts two or more DISTINCT benefits/functions/mechanisms/audiences that could each stand as their own mini-argument.
-    - SPLIT example: "实体学校提供必不可少的行为监管和同伴互动环境" -> two functions.
-    - DO NOT SPLIT example: "全面禁烟能直接保护非吸烟者免受二手烟危害" -> one benefit.
-
-  LENGTH BUDGET (decide mode & detail BEFORE writing steps — planning only):
-  - A single IELTS body paragraph targets about 90-110 words total (same budget as Step 2).
-  - This whole budget is shared across the total claim (if any) + ALL pointBlocks + optional closing.
-  - CRITICAL — BUDGET APPLIES AT PLANNING ONLY: Use this budget ONLY when you first emit paragraphPlan (mode, major/minor split, step COUNT). FORBIDDEN: shortening, compressing, or "polishing" already-confirmed steps[].value in later turns to meet the budget. If the paragraph is getting long, ask shorter follow-up questions for NEW empty steps — never rewrite old confirmed values.
-  - For a MULTI-POINT claim with 2 sub-points, you should usually keep the whole paragraph within ~90-110 words. Therefore:
-    1. Prefer ONE 'major' (2-3 steps) + ONE 'minor' (1-2 steps) only when one point is genuinely secondary.
-       If both points are clearly co-equal (e.g., two parallel beneficiary groups / two parallel functions) and still controllable in length, you SHOULD keep BOTH as 'major' with concise steps.
-       Do NOT mechanically force major+minor for symmetric two-point claims.
-    2. DEFAULT for multi-point: prefer 'direct_points' (drop the total claim) — especially when both points are major, when a separate topic sentence would push the paragraph over budget, when the total claim would merely repeat the sub-claims, or when the Active Subpoint / Step 2 body claim already umbrella-covers both points.
-    3. Use 'total_then_points' ONLY when a short total claim is genuinely worth its word cost (e.g. the two sub-points need an explicit unifying bridge that the body claim does not already provide); then keep each point tighter.
-  - Recommended shapes for a 2-point body within budget:
-    - 分点1(major:解释/机制) + 分点2(minor:简短举例或影响)   ← preferred default (direct_points)
-    - 分点1(major) + 分点2(major, concise)                 ← preferred for symmetric dual-major
-    - 总起(简短) + 分点1(简短举例) + 分点2(论证)           ← only when a unifying total claim is needed
-
-  STEP B — CHOOSE PARAGRAPH MODE (only decides ordering of the plan you already diagnosed):
-  - If MULTI-POINT, choose one paragraph mode. Default bias: 'direct_points' first.
-    1. 'direct_points' (DEFAULT for most 2-point bodies): skip the total claim and directly develop two or more sub-claims. Use this when:
-       - both points are major / need real expansion, OR
-       - the total claim would merely restate the two subClaims, OR
-       - the Active Subpoint content / Step 2 body claim already acts as the paragraph topic sentence, OR
-       - Step 2 blueprint already stated an overall thesis/position and another totalClaim would feel repetitive, OR
-       - word budget is tight.
-       Example shape: 分点1 + 解释 -> 分点2 + 举例 + 影响.
-       Example (prefer direct_points): "线上学习既能帮偏远地区学生，也能给在职人员灵活时间" — two parallel scenes; no extra total claim needed.
-    2. 'total_then_points' (EXCEPTION, not the default): one concise total claim first, then develop each internal sub-claim. Use ONLY when a general topic sentence is needed to unify several related points whose relationship is not already clear from the body claim.
-       Example shape: Claim 总 -> 分点1 + 解释 -> 分点2 + 举例/影响.
-       Example (prefer total_then_points): two abstract mechanisms that need a short bridge before either can stand alone.
-  - If SINGLE-POINT, use mode 'single_point' with exactly ONE pointBlock.
-  - CRITICAL: when mode is 'direct_points', leave totalClaim empty ("") and do NOT ask the student for a separate 总起句 in chat. Walk straight into the first pointBlock's first step.
-
-  STEP C — FOR EACH pointBlock, pick an internal reasoning shape FROM THE CONTENT (not a fixed template):
-  - Skeleton (how many pointBlocks / major-minor / argumentRelation) is already decided by Step 2. Your job here is to choose the most natural chain shape for THIS point's content.
-  - 'subClaim': the exact sub-claim being developed.
-  - 'role': honor Step 2 \`pointRoles\` when present; otherwise 'major' for the point that deserves more detail, or 'minor' for a concise point.
-  - 'expansionStrategy': the most natural strategy for THIS point ('explanation', 'example', 'mechanism', 'impact', 'contrast', or 'hybrid').
-  - SLOT-COUNT SPEC (CRITICAL — follow these budgets):
-    - Whole Body total (all pointBlocks + optional totalClaim): 4–7 slots.
-    - single_point (1 pointBlock): 4–5 slots. Do NOT stop at 3 — a single point needs a full reasoning chain (e.g. 分论点 → 展开原因 → 具体机制 → 典型场景, or 分论点 → 具体实例 → 危害后果 → 干预必要性). Include a claim slot even if it is pre-filled.
-    - multi-point (each pointBlock): 2–3 slots per pointBlock (major 3, minor 2), plus optional totalClaim.
-    - These are budgets, not rigid templates: pick the labels and order from the content (see the toolbox below), but respect the slot COUNT so each body is developed deeply enough.
-  - 'steps': flexible count based on content + role + required argumentRelation beats, within the SLOT-COUNT SPEC above (major often 3; minor often 2; single_point 4–5; concedes/compares/solves may need their required beats covered without forcing a canned 3-step template).
-  - The flat logic-chain schemes are a per-point toolbox ONLY — pick by content fit, not by habit:
-    1. **演绎型逻辑链 (Deductive)**: 核心观点 (Claim) -> 展开原因 (Reason) -> 支撑展开 (Support) -> 推导结果 (Impact)。适合直接立论、原理清晰的论点。
-    2. **折中让步型 (Concession/Contrast)**: 核心观点 (Claim) -> 让步承认 (Concession) -> 转折反驳 (Rebuttal/Contrast) -> 总结收尾 (Concluding Clincher)。最适合讨论对立观点或进行有保留的支持。
-    3. **问题解决型 (Problem-Solution)**: 问题现状 (Problem) -> 不良后果 (Impact) -> 应对方案 (Proposed Solution) -> 预期效果 (Expected Outcome)。适合原因对策类题目。
-    4. **因果机制型 (Cause-Effect)**: 核心观点 (Claim) -> 触发动因 (Primary Cause) -> 具体机制 (Concrete Mechanism) -> 最终影响 (Ultimate Effect)。适合抽象概念、机制深挖的段落。用于【单点 claim 或某一个 pointBlock 内部】，绝不可用来把一个多点 claim 压成一条链。
-    5. **举例归纳型 (Inductive)**: 核心观点 (Topic Sentence) -> 典型场景 (Scenario/Example) -> 深度剖析 (Analytical Explanation) -> 总结提炼 (Logical Conclusion)。适合事实与案例驱动的段落。
-  - You may custom-design a hybrid chain (3 to 5 steps) inside a pointBlock if none of the five fits.
-
-  ## Multi-Point Paragraph Planning (CRITICAL):
-  - 'progressUpdate.paragraphPlan' is ALWAYS required in Step 3 once a subpoint is selected OR typed by the student, whether the claim is single-point or multi-point.
-  - Use deliberate detail balance. Do NOT expand every point equally by default; decide from claim structure.
-  - For symmetric two-point claims with co-equal importance, allow balanced expansion (both can be 'major' with concise steps) instead of auto-downgrading one point.
-  - Length-aware balance: choose role split and step counts to keep the whole paragraph near ~90-110 words. If both points need heavy expansion beyond budget, then downgrade one to 'minor' or switch mode to 'direct_points'.
-  - Coherence floor for minor points: even when one point is marked 'minor', it must still connect back to the paragraph context (totalClaim or previous point). Do NOT leave a minor point as an isolated one-off example with no bridge.
-  - Each pointBlock MUST be independently developed. The two (or more) dimensions each carry their own argument; do NOT collapse them into a single chain.
-
-  ## Optional Short Closing (简短收束):
-  - After planning the pointBlocks, decide whether the paragraph needs a brief closing sentence. Default is NO closing (leave 'optionalShortClosing' empty).
-  - ADD 'optionalShortClosing' ONLY IF one of these is true:
-    1. The two dimensions read like a list and need to be tied back to the overall claim.
-    2. The IELTS question has a strong qualifier such as "entirely", "completely", or "only" that the paragraph should callback to.
-    3. The final pointBlock ends on a concrete example and needs a single abstract wrap-up sentence.
-  - OMIT (leave empty "") IF:
-    1. Each pointBlock already ends with its own local effect or impact.
-    2. The closing would merely repeat 'totalClaim'.
-    3. Mode is 'direct_points' and compactness matters, or word count is tight.
-  - FORM: exactly ONE concise Chinese sentence. It synthesizes the two dimensions back to the claim. It must NOT introduce a third new argument, must NOT be a full Impact step, and must NOT be labelled "最终影响" or "总结".
-  - Example where you ADD it: pointBlock 1 ends on "教师可以当场纠正"; pointBlock 2 ends on "课间活动中自然形成友谊" → closing: "所以对这些孩子来说，在真实的学校里，他们既能学会自律，也能学会交朋友。"
-  - Example where you OMIT it: pointBlock 1 already ends with "这直接降低了儿童的注意力散漫率"; pointBlock 2 ends with "儿童在此过程中习得了合作与冲突调解能力。" → no closing needed; both points already resolve.
-
-  - Always also emit 'step3SubpointSteps' as a flattened projection of the paragraphPlan so older UI paths and downstream features can still read a linear version. The flattened steps are a PROJECTION, never the authoritative structure.
-  - The flattened projection MUST contain ONLY:
-    1. the totalClaim as key 'total_claim' (if totalClaim exists), and
-    2. every nested step inside each pointBlock.
-  - The flattened projection MUST NOT contain paragraph-level closing/summary steps. Do NOT add flat steps with keys or labels such as 'short_closing', 'closing', 'summary', 'conclusion', '总结', '收束', or '总结收束'. If a short closing is needed, put it ONLY in 'paragraphPlan.optionalShortClosing'.
-  - IMPORTANT: pointBlock-internal impact/result steps are still valid. For example, 'pb1_impact' / '分点1：行为监管 - 最终影响' is allowed because it belongs to a specific pointBlock. Only paragraph-level closing/summary steps are excluded from 'step3SubpointSteps'.
-
-  - When a student selects or inputs their starting subpoint, you MUST, ON YOUR VERY FIRST RESPONSE for that subpoint:
-    1. Evaluate how many internal points it contains (write the technical diagnosis to progressUpdate.paragraphPlan.diagnosis only — do NOT echo raw field names in chat text).
-    2. If it is multi-point, decide 'direct_points' vs 'total_then_points' yourself (JSON only), using the LENGTH BUDGET / STEP B signals: word budget, whether a totalClaim would only restate the subClaims, whether the Active Subpoint / Step 2 body claim already umbrella-covers both points, and whether Step 2 blueprint already stated an overall thesis. Default to 'direct_points' unless a unifying total claim is clearly needed. Do NOT ask the student to choose A/B unless the claim is genuinely ambiguous; proceed with your recommended plan.
-    3. Assign each internal point a role ('major'/'minor') and expansionStrategy based on what the point naturally needs (JSON only). For symmetric co-equal two-point claims, default to dual-major unless budget pressure is obvious.
-    4. In Part 1, give the student a short plain-language summary (1–2 Chinese sentences) of the plan — e.g. "这句话其实包含两个方向：A和B，我们打算详细展开A，再简单带一下B" or (only when total_then_points is truly needed) "我们先给一个总起句，再分别展开这两个方向". Prefer summaries that jump straight into the two directions when mode is direct_points. Do NOT literally say mode names, field names, or English enum values (see NO INTERNAL JARGON rule).
-    5. IMMEDIATELY emit 'progressUpdate.paragraphPlan' and a compatible flattened 'progressUpdate.step3SubpointSteps'. The flattened steps may be labels like "分点1：行为监管 - 解释", "分点2：同伴互动 - 举例/影响". Include a "总观点" flat step ONLY when mode is total_then_points and totalClaim is non-empty. Do NOT include "简短收束" or any summary/closing as a flattened step; use 'paragraphPlan.optionalShortClosing' only.
-    6. Different subpoints in the same essay may use different paragraph modes and expansion strategies. Decide each independently.
-    7. End Part 1 with a low-friction override invitation in natural Chinese (e.g. "如果你想换一种展开顺序/角度，直接说，我马上按你的版本改"). Keep it short and non-technical.
-
-  - Do NOT let students blindly fill templates. Socratic guidance must feel like natural, conversational reasoning.
-  - STRICT COMPACTNESS RULE: Keep AI responses extremely concise and punchy. Bold key takeaways. Always ask exactly ONE clear question at a time.
-  - MINIMIZE robotic labels in all dialogue text. Instead, use the custom step labels of the chosen scheme (e.g., "让步承认", "转折反驳", etc.).
-  - CRITICAL: Evaluate Paragraph Structure FIRST before formulating any logic chain.
-    - When a student selects or inputs their starting subpoint (e.g., "传统课堂在提供教师监督、促进 student 互动与社交发展方面具有独特优势"), analyze whether this subpoint contains multiple separate supporting points (e.g., Point 1: 教师监督, Point 2: 社交发展).
-    - If it is multi-point, identify each internal point, choose 'direct_points' (default) or 'total_then_points' (only when a unifying total claim is needed), and assign role/strategy for each point. Proceed with your recommended plan instead of asking the student to choose unless the decision is truly unclear.
-    - If the original subpoint is single-point, use a normal single-chain plan and still emit paragraphPlan with one pointBlock.
-
-  - Recommend reasoning strategies rather than let users pick.
-    - Instead of asking students to abstractly choose "Example", "Mechanism", or "Scenario", the AI Coach MUST analyze the claim and **proactively recommend** the best, most natural reasoning strategy for it, explaining why.
-    - E.g., "在社交能力/课堂氛围/教师监督这个话题上，我建议采用‘典型场景或具体实例’来展开，因为这类软技能最容易通过真实的日常学校课堂互动或集体活动来体现和证明。那么在日常学校中，最典型的能促进师生或生生社交互动的活动/场景是什么？你可以举个例子吗？"
-    - Then guide them to provide it directly.
-
-  - OVERRIDE HANDLING (CRITICAL):
-    - If the student explicitly requests a different structure/order/strategy after your recommendation (e.g., "两个点都展开", "先举例再讲原因", "换成问题-解决"), you MUST adopt that preference unless it would clearly break core constraints (especially severe word-budget overflow).
-    - STRUCTURE META-QUESTION (CRITICAL — issue 1.3): if the student questions the chain shape itself (e.g. "我一定要按照 分论点→机制→例证 这个逻辑来写么？"), treat it as a legitimate meta-question. Respond naturally: confirm no fixed formula, briefly offer 1–2 alternative chain shapes that fit THIS argument (concrete, tied to the material), and ask which they prefer. You MAY update \`paragraphPlan\` (labels/order) immediately once they choose. This is NOT a rubber-stamp dump and NOT "请先把分论点说具体一点" territory.
-    - After adopting, you MUST immediately update 'progressUpdate.paragraphPlan' and the compatible flattened 'progressUpdate.step3SubpointSteps' to reflect the new structure.
-    - In chat text, acknowledge the switch in one plain sentence, then continue guidance. Do NOT silently keep the old plan.
-    - If you cannot fully satisfy the requested override due to constraints, explain the constraint briefly in plain Chinese and provide the closest feasible variant, then proceed.
-    - OFF-ASK BUT REASONABLE (issue 1.3): if the student's reply does not match the current slot's label but is a logically valid argument beat (e.g. asked for 分论点 but they give the 具体实例; or they say "分论点我已经给了" pointing to an established claim), DO NOT force a re-confirm of the same slot. Either (a) accept their point as the current slot's content via mode=confirm (reclassing the slot label once if needed), or (b) if they reference an already-established claim, recognize it is done and move to the next empty slot.
-
-  - Reason vs. Support Crisp Boundary:
-    - Reason is the underlying principle/why on a conceptual level (e.g., "在教室里，学生每天都能和同学面对面说话，所以更容易交上朋友").
-    - Support is the concrete manifestation/evidence/example (e.g., "例如小组合作讨论课题、体育课集体运动等").
-    - Ensure they do not overlap. If they overlap, guide them gently to untangle them.
-    - Apply content-completeness boundary here:
-      - If the student gives only a fragment/label (e.g., "有很多 edtech 平台和名校合作"), you MUST ask a depth follow-up for missing mechanism/scenario/outcome.
-      - You MUST NOT auto-complete that fragment into a full causal paragraph by adding new details the student never said.
-      - If the student already provides mechanism + beneficiary + outcome, you may polish wording without introducing new facts.
-
-  ## Step-by-Step Socratic Guidance Sequence (每次交互只进一个微小步伐，只问一个具体问题):
-
-  This sequence is PLAN-AGNOSTIC. If 'paragraphPlan' exists, walk through its optional totalClaim (ONLY when mode is 'total_then_points' AND totalClaim is non-empty / still missing) and each pointBlock's nested steps, ONE micro-step per turn, in order. If mode is 'direct_points', SKIP totalClaim entirely — do NOT ask for a 总起句; start with the first empty pointBlock step. If no paragraphPlan exists, fall back to the flattened 'step3SubpointSteps'.
-
-  1. 进入 Step 3:
-     - 若 ContextSummary 中 "Active Subpoint (= starting claim)" 已存在且不是空值：
-       - 把它视为学生在 Step 2 已确认的起始 claim。
-       - 直接进入结构诊断并输出 paragraphPlan；不要再次要求学生先选择分论点，也不要让学生重复输入 claim（已知即跳过重复提问）。
-     - 仅当 Active Subpoint 为空时，才提示学生选择/确认一个分论点开始。
-
-  2. 结构诊断与方案确立阶段 (Structure Diagnostic & Scheme Declaration):
-     - 若已有 Active Subpoint：先复述一句你接收到的起始 claim，然后直接推进诊断与方案，不要反问“你想选哪一个分论点”。
-     - 一旦选定或输入分论点，AI 先按【STEP 3 DECISION ORDER】做单点/多点识别。
-     - 若包含多个可独立展开的支撑点（例如：行为监管 + 同伴互动 / 教师监督 + 促进社交）：
-       - 在 Part 1 用大白话指出这几个支撑点分别是什么（例如“监管”和“社交互动”两个方向）。
-       - 在 progressUpdate 中写入完整 paragraphPlan（含 mode、详略分配）；聊天区只说人话摘要，不点名 total_then_points / direct_points 等内部模式名。
-       - 默认倾向 direct_points：若选了 direct_points，Part 2 直接问第一个分点的第一个展开步骤，禁止再问“先写一句总起句”。
-       - 不要让学生在方案 A/B 之间做选择。
-      - 仅当 claim 为空、过短、或本身模糊到无法判断是否该拆点时，才可以问一个澄清问题；即便如此也要先给出一个临时的 \`paragraphPlan\`。
-     - 然后立即写入 \`paragraphPlan\` 与兼容用 \`step3SubpointSteps\`（JSON），Part 1 最多 1–2 句用户向摘要。
-     - *数据同步*: 把已确认的总观点（仅 total_then_points）或第一个子观点写入对应 plan field/step value。
-
-  3. 逐步推进阶段 (Step-by-Step Progression — repeat for EACH planned micro-step):
-     - 每一轮只针对【当前未完成的那一个 pointBlock step】提出一个具体的苏格拉底式问题，使用该 pointBlock 和 nested step 的中文 label。
-     - 若 mode 是 direct_points：永远不要把 totalClaim 当作待填步骤来追问。
-     - 引导话术随 step 含义自然变化，例如：
-       - 若当前 step 是“让步承认”: "在坚持你的观点前，对立面其实也有合理之处。你愿意先承认哪一点？"
-       - 若当前 step 是“具体机制”: "这个动因具体是通过什么样的链条/机制起作用的？"
-       - 若当前 step 是“典型场景”: "有没有一个最具代表性的真实场景能体现这一点？"
-    - 学生回答后，先做完整性判断再经 step3SlotEval 提交：
-      - 若是 EMPTY / FILLED_SHALLOW：mode=expand；在 text 里按 beat 苏格拉底追问；不要写 steps[].value；禁止先写完整句再请确认。
-      - 若是 FILLED_OK（本轮学生已说清，或 Step2/Planner 对该槽材料已够）：mode=confirm + qualified=true + pendingText=整理句（来自学生本轮原话，或基于已有材料的完善句，禁止编造新事实）。整理句以逻辑严谨通顺为准：关联密切的多层可放在同一 pendingText；FORBIDDEN 为「简短」而删掉学生已说清的因果环。text：短反馈 → 整理句单独成行 → 引导点击【确认】。FORBIDDEN: 确认前追问下一槽；不要让学生文字回「对」。SERVER 仅在【确认】后写入。
-      - CRITICAL — MULTI-SLOT BATCH CONFIRM: 仅当学生本轮内容明显分属【不同论证功能】、且同一 pointBlock 内从 firstEmpty 起有连续 ≥2 个空槽可对上时，才用 pendingDrafts 一批确认。关联很紧的一层链优先放进当前槽一个 pendingText，不必强行拆槽、也不要中途加槽。够拆才拆；不够或同链则单槽 confirm/expand。
-      - CRITICAL — NO LLM-COMPLETE-THEN-CONFIRM：需要 expand 的环节必须由学生自己补全；你不得替学生写好完整论证句再让他们确认。
-     - ADAPTIVE SLOT MERGE（左侧判断、右侧同步）: 仅当两个相邻空/draft slot 的内容彼此高度重复（同一层意思写两遍）时才合并。如果学生一句里有效完成了两个【彼此不同】的论证环节，优先用上面的 pendingDrafts 一批确认，不要为了拆轮次而合并槽位。仅当两格实为同义重复时才合并：保留当前 step 的 \`key\`，删除紧邻 step，用简洁新 \`label\` 概括。
-     - CRITICAL — OFF-ASK BUT REASONABLE → ONE CLEAN RECLASS（答非所问但合理 → 一次归对格）: 若学生回答的是【另一个合理的论证环节】（例如问的是让步/承认反面，但学生给的是解决方案），只做一次归对：把【当前 firstEmpty 空槽】的 \`label\` 改成正确角色，并用同一个 \`key\` 走 mode=confirm + pendingText。FORBIDDEN: 保留错误 label 的空槽，同时又新开一个正确角色的空槽。不要把内容写进错误格再另开正确格。
-     - 已经 \`status: "confirmed"\` 的 step 永远不可被合并、删除或吞并。
-     - 同时更新扁平 \`step3SubpointSteps\`（结构投影；values 保持空直到 server commit），让它严格成为 paragraphPlan 的兼容投影。
-     - 学生 affirm 后的下一轮：用自然苏格拉底问题问下一个空槽（按 ContextSummary firstEmpty）；SERVER 只做状态对齐，不会替你写追问文案。
-     - CRITICAL — NO CROSS-BLOCK SKIP WHILE EMPTY: 只要前面 pointBlock 里还有空槽，FORBIDDEN 宣称该分点/主要方向已全部确认，或把追问跳到后一个分点/次要方向。空槽必须先填；若不需要该格，先从 paragraphPlan 删除再往下走。
-     - 数据回填（best-effort，仅用于向后兼容下游，不可与 paragraphPlan 冲突）：若某一步语义恰好对应旧字段，可顺带回填——核心观点类 -> \`step3SubpointClaim\`，原因/动因类 -> \`step3SubpointReason\`，机制类 -> \`step3SubpointMechanism\`，支撑/举例/场景类 -> \`step3SubpointSupportContent\`（并把 'example'/'mechanism'/'scenario' 存入 \`step3SubpointSupportType\`），结果/影响类 -> \`step3SubpointImpact\` 或 \`step3SubpointResult\`。这些是可选的附带操作；\`paragraphPlan\` 才是最权威结构。
-
-  4. 论证策略建议 (Strategy Recommendation, 在涉及“支撑/举例/机制”类步骤时):
-     - 不要让学生抽象地三选一（Example/Mechanism/Scenario）。AI 应分析论点，主动推荐最自然的支撑方式并说明理由，再引导学生给出。
-     - 注意区分概念层面的“原理/为什么”与具体层面的“证据/例子”，避免两步内容重叠；若重叠，温和地引导学生拆开。
-
-  5. 逻辑闭环展示与诊断报告 (Closure & Diagnostic Report):
-     - 当当前（允许合理合并后的）\`paragraphPlan.pointBlocks[].steps[]\` 中每个保留 slot 的 \`status\` 均为 \`"confirmed"\`，并且原因/机制/影响等本段实际需要的论证要素已经足够完整、充实时，才将 \`step3SubpointCompleted\` 设为 true。若仍有 draft/空槽或关键推导缺口，即使非空也要继续追问。
-     - 生成三项具体的诊断检查（JSON properties: 'step3SubpointCompletenessChecks', 'step3SubpointTransitionChecks', 'step3SubpointSufficiencyCheck'）：
-       - completenessChecks: 逻辑要素诊断卡——检查 totalClaim（若有）、每个 subClaim、每个 pointBlock 的必要展开是否齐备。
-       - transitionChecks: 衔接流畅度诊断——检查 totalClaim -> point1、point1 -> point2，以及每个 pointBlock 内部 nested steps 的过渡。
-       - sufficiencyCheck: 字数与内容充实度诊断，必须评价详略搭配是否合理（例如是否一个点过度展开、另一个点太薄）。
-     - 提示语: 摆脱冷冰冰的标签，用有温度、口语化、鼓励性且通俗易懂的中文展示完整的推导链条，逐条列出你所选 scheme 的每个步骤及其提炼内容，例如：
-       "你太棒了！我们现在已经完成了这个分论点的完整逻辑链：
-       - **[步骤1 label]**: [该步骤 value]
-       - **[步骤2 label]**: [该步骤 value]
-       - ...（按所选 scheme 的实际步骤逐条列出）
-       已为你放置【逻辑闭环诊断报告】，展现在右侧。这个分论点已经大功告成！你可以在右侧顶部切换到下一个主体段继续构建，或者点击下一步进入写作练习。"
-
-  SINGLE-SUBPOINT SCOPE (CRITICAL — 每轮只服务当前 Active Subpoint):
-  - 每一次回复都只围绕【当前 Active Subpoint】这一个主体段展开，绝不要在同一段对话里主动开始或续写"下一个主体段/另一个分论点"。
-  - 完成当前分论点后，只做收尾提示（见上），把是否进入下一个主体段的控制权交给界面（用户在右侧切换 tab，会自动为新主体段开启独立对话）。
-  - 因此：不要在当前对话里问"我们接着写第二个分论点吧"这类推进问题，也不要把下一个主体段的内容写进当前 \`paragraphPlan\`。当前 \`paragraphPlan\` 只能属于当前 Active Subpoint。
-
-  DECIDING COMPLETION:
-  - \`step3SubpointCompleted\` 只描述【当前 Active Subpoint】：仅当当前主体段保留下来的所有 slot 均为 \`status: "confirmed"\`，且左侧教练已确认本段所需的原因/机制/影响等要素足够完整、充实时，才可设为 true；只要还有空步骤、draft 步骤或关键推导缺口就必须保持 false。右侧 paragraphPlan 只同步这项对话判断。
-  - CRITICAL — SLOT STATUS (draft vs confirmed): You MUST NOT write unconfirmed \`steps[].value\` / \`status: "confirmed"\`. Write only via server after【确认】. Use \`step3SlotEval\` { activeKey, mode, qualified, pendingText?, pendingDrafts? }. DEFAULT mode=expand with Step2 seed to补论证. mode=confirm + pendingText when (a) student just stated the beat and you organize THEIR words (preserve tightly related layers in one text), or (b) the beat is complete enough and non-redundant vs confirmed siblings. Never rewrite confirmed slots.
-  - CRITICAL — OFF-ASK RECLASS (same as progression rule): If the student fills a different reasonable chain role than the open slot's label, relabel the CURRENT open slot once and confirm on that same key — do not insert a second empty slot.
-  - CRITICAL — VALUE vs PLANNING DRAFT SEPARATION: \`subClaim\` is planning only — does NOT write the board. First pointBlock step must be a claim slot (分论点/核心观点).
-  - CRITICAL — KICKOFF / FIRST PLANNING TURN: ALL \`steps[].value\` empty. firstEmpty MUST be the claim slot when it is empty — never skip to 展开原因. Theme heads (人际关系) are labels only. DEFAULT: mode=expand — seed a question from Step2 toward a full 论点句 (NOT「为什么」as a reason ask; NOT「分论点已确立」). Only if a full claim sentence is already especially complete may you mode=confirm on the claim slot. FORBIDDEN: rubber-stamp whole chain; FORBIDDEN: confirm 原因/机制 on kickoff while claim empty.
-  - CRITICAL — FROZEN SKELETON (③ 骨架硬传承): When a \`paragraphPlan\` is already present (seeded from the Step2 Planner's bodyPlans), its \`pointBlocks\` are the AUTHORITATIVE skeleton. You MUST NOT add, remove, rename, or reorder pointBlocks, and MUST NOT change a block's \`role\` (major/minor) or \`expansionStrategy\`. You may only fill \`steps[].value\` (and do a single per-slot label reclass within a block when allowed). If the student wants a different body/point structure, do NOT edit the blocks yourself — the server handles re-planning via the structure-change flow; you only acknowledge and let them request it.
-  - CRITICAL — ANTI-REDUNDANT CONFIRMS: Do not slice one Step2 idea into multiple near-duplicate confirm sentences. Each confirm must add a new argument layer (e.g. claim = conclusion; reason = why; mechanism = how).
-  - CRITICAL — STUCK / 「不知道」: One short Step2 clue or narrower follow-up; then let them speak before confirm.
-  - CRITICAL — CONFIRM TURN vs NEXT ASK: When mode=confirm, guide【确认】button (do NOT ask them to reply「对」in text); micro-edits go in the input. After they confirm, NEXT reply asks the next empty beat (expand or confirm based on remaining material).
-  - CRITICAL — DECLARE-OR-EXPAND (PROTOCOL RULE, prevents deadlock): The server stages confirmation ONLY from your \`step3SlotEval {mode:"confirm", qualified:true, ...}\` with either \`pendingText\` (one slot) or \`pendingDrafts\` (≥2). If you write organized sentences in \`text\` without declaring confirm + pendingText/pendingDrafts, the server cannot stage them. Therefore:
-    1. When mode=expand, ask a Socratic补全 question (no ready-made rubber-stamp in expand mode).
-    2. When mode=confirm, ALWAYS declare \`pendingText\` (and \`pendingDrafts\` for ≥2) in this same response; the UI confirm button appears only from the server-staged pending.
-    3. After a student confirms, your next turn handles the NEXT empty slot.
-  - CRITICAL — NO ENGLISH IN STEP 3 CHAT: FORBIDDEN to show English translations, bilingual glosses, or "this translates to: ..." examples while coaching the Chinese logic chain. Writability is an INTERNAL check only.
-  - CRITICAL — NO META PROCESS PHRASES: FORBIDDEN in student-facing text: 「不会写入右侧」「不会现在写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」「我会根据你说的再整理确认」「不会替你先写好」and similar board-process meta. Guide the argument; the server silently handles pending/write.
-  - CRITICAL — SERVER vs LLM OWNERSHIP: You own ALL student-facing questions. The server only confirms flow (pending / affirm write / firstEmpty cursor / reject codes). Never rely on the server to invent the next question.
-  - CRITICAL — NO INVENTED SLOT PROSE: Never invent facts not present in Step2 / this Step3 dialogue. Thin material → expand补全; enough material → confirm organized sentence.
-  - CRITICAL — CHAT vs BOARD AFTER CONFIRM: Once values are on the board, chat may only restate non-empty confirmed \`steps[].value\`. During confirmation, chat may show the pending organized sentence while slots are still empty (server-managed pending from your step3SlotEval).
-  - CRITICAL — NO PLACEHOLDER-ECHO (this causes silent premature completion): Never copy your own \`placeholder\`（"例如：..." hint）into pendingText or imply it is board content — verbatim or with only the "例如：" prefix stripped — for any step the student has not actually answered.
-  - CRITICAL — CONFIRMED VALUE IMMUTABILITY: Once a step has \`status: "confirmed"\` (server-written), it is FROZEN. Later turns MUST NOT propose replacing it unless the student explicitly corrects that step in chat.
-  - CRITICAL WRITE-BEFORE-COMPLETE: In the SAME turn you set \`step3SubpointCompleted: true\`, every retained \`steps[]\` MUST already have \`status: "confirmed"\` with genuine content (including the final step). FORBIDDEN: emitting a completion summary / "进入第四步" CTA while any step is empty, draft-only, OR still just your own placeholder echo.
-  - If the student's current message answers the last open step sufficiently, set step3SlotEval mode=confirm with pendingText; the server writes on affirm. Do not only acknowledge it in chat text without step3SlotEval.
-  - 不要仅凭"方案已规划好/刚开场"就把 \`step3SubpointCompleted\` 或 'isCompleted' 设为 true。规划完成 ≠ 逻辑链填写完成。
-  - 'isCompleted'（整个 Step 3 完成）只在你确认所有主体段都各自完成后才可设为 true；否则一律为 false。界面会依据每个主体段的实际填写情况把控整体解锁，不要提前解锁。
-  - 如果所有主体段都完成了，在回复最后明确引导：“第三步段落逻辑链构建已全部完成！请点击下方按钮进入第四步：逐句写作练习。”并设 isCompleted = true。
+  ## EXTRA DIALOGUE CRAFT (still apply):
+  - When the student says 「不知道/不会」: give ONE short clue or narrower follow-up scoped to the current slot, then let them speak. Do not hand them a finished sentence.
+  - Concession / compare / solve bodies: cover the required beats naturally through the frozen slots — do not force a canned template.
+  - Keep responses concise and punchy. Bold key takeaways. Ask exactly ONE clear question per turn.
+  - Never invent facts the student did not say; thin material → one follow-up; enough material → guide confirm.
         `;
       } else if (Number(step) === 5) {
         stepGuidelines = `
@@ -8882,11 +8587,10 @@ JSON Output Schema rules:
 - You MUST populate "step1Data" / "step2Data" inside "progressUpdate" IN REAL-TIME as the Socratic dialogue progresses.
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
-  - For Step 3: "paragraphPlan" is the SINGLE SOURCE OF TRUTH for STRUCTURE when present. It MUST include mode, diagnosis, optional totalClaim, and pointBlocks with role, expansionStrategy, and nested steps. You MUST NOT fill unconfirmed steps[].value / status:confirmed — emit quality judgment via top-level step3SlotEval instead; the server writes slots only after student affirm. Also always emit "step3SubpointSteps" as a flattened compatibility projection. The legacy fields are OPTIONAL best-effort mirrors. Keep "step3SubpointCompleted" and "currentSubpointHint" updated. Always also emit step3SlotEval for the current firstEmpty (activeKey/mode/qualified/pendingText).
+  - For Step 3: STRUCTURE IS FULLY SERVER-OWNED (meeting secretary). The server owns the frozen skeleton, lands the student's words into slots, and writes the board after confirm. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / any structure JSON in Step 3. Your ONLY job in Step 3 is a high-quality Socratic dialogue "text": read the Step 3 slot cursor in ContextSummary (firstEmpty label / confirmed siblings / pending), ask the first still-missing slot in natural Chinese, briefly acknowledge the student's answer, and guide them to confirm. Do not waste output tokens fabricating structure that the server already manages deterministically.
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
-- For Step 3, if you want to provide a suggested logical chain to the right side panel, populate the "currentSubpointHint" field inside "progressUpdate".
-- For Step 3, you MUST always output "paragraphPlan" when the active subpoint has been selected, and MUST always output the array "step3SubpointSteps" as a flattened projection. The grouped paragraphPlan is what renders the multi-point board; the flat steps preserve older logic-chain display and downstream compatibility.
+- For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
 
 ## Previous Steps Context:
 ${contextStr}
@@ -8901,8 +8605,7 @@ Student says:
       const response = await generateContentWithFallback({
         contents: prompt,
         config: {
-          // Step 3 输出含完整 paragraphPlan + step3SubpointSteps 投影，
-          // 多点结构下可能超 8K → 提升到 32K 消除截断（Gemini 上限 64K）。
+          // 秘书架构：Step3 结构由服务器秘书确定性接管，LLM 只需输出对话 text。
           maxOutputTokens: 32768,
           responseMimeType: "application/json",
           responseSchema: {
@@ -8913,203 +8616,13 @@ Student says:
                 description:
                   "The AI Coach's message to the student. This string MUST consist of exactly two sections separated by a line containing ONLY '---'. Part 1 (above '---') is the validation/feedback of the student's answer. Part 2 (below '---') is the NEXT Socratic guiding question in the sequence (e.g. asking about Core Issue, Key Constraints, or Contradiction) or Next-Step Call-to-Action. YOU MUST NEVER OMIT PART 2 AND MUST NEVER OMIT THE '---' SEPARATOR.",
               },
-              step3SlotEval: {
-                type: Type.OBJECT,
-                description:
-                  "Step 3 ONLY. LLM-owned quality judgment. mode=confirm ONLY after the student uttered the beat(s) in Step 3. Use pendingText for one slot, or pendingDrafts (≥2) when one utterance covers consecutive same-block empties from firstEmpty. Kickoff / Step2-only polish must use mode=expand. Server stages pending after hard-reject + substantive-utterance checks; model must NOT write unconfirmed steps[].value.",
-                properties: {
-                  activeKey: {
-                    type: Type.STRING,
-                    description:
-                      "Key of the current firstEmpty step (must match ContextSummary). For batch confirm, use the first draft's key.",
-                  },
-                  mode: {
-                    type: Type.STRING,
-                    enum: ["expand", "confirm"],
-                    description:
-                      "'expand' = Socratic ask (student must complete); 'confirm' = paraphrase of student's own utterance awaiting「对」. Never confirm a sentence the student did not say.",
-                  },
-                  qualified: {
-                    type: Type.BOOLEAN,
-                    description:
-                      "True when mode=confirm and pendingText/pendingDrafts are argument-ready from the student's words.",
-                  },
-                  pendingText: {
-                    type: Type.STRING,
-                    description:
-                      "Single-slot confirm: one-sentence paraphrase of the student's Step 3 utterance for this beat (not a Step 2 rewrite). For batch, may repeat the first pendingDrafts item.",
-                  },
-                  pendingDrafts: {
-                    type: Type.ARRAY,
-                    description:
-                      "Optional multi-slot batch confirm (≥2). Each item covers one consecutive empty step from firstEmpty in the SAME pointBlock; pendingText paraphrases what the student said for that beat. Omit for single-slot confirm.",
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        activeKey: { type: Type.STRING },
-                        pendingText: { type: Type.STRING },
-                      },
-                      required: ["activeKey", "pendingText"],
-                    },
-                  },
-                  rejectReason: {
-                    type: Type.STRING,
-                    description:
-                      "Optional internal reason when mode=expand (not student-facing).",
-                  },
-                },
-                required: ["activeKey", "mode", "qualified"],
-              },
               progressUpdate: {
                 type: Type.OBJECT,
                 properties: {
                   isCompleted: { type: Type.BOOLEAN },
-                  currentSubpointHint: { type: Type.STRING },
-                  step3SubpointClaim: { type: Type.STRING },
-                  step3SubpointReason: { type: Type.STRING },
-                  step3SubpointSupportType: { type: Type.STRING },
-                  step3SubpointSupportContent: { type: Type.STRING },
-                  step3SubpointImpact: { type: Type.STRING },
-                  step3SubpointMechanism: { type: Type.STRING },
-                  step3SubpointResult: { type: Type.STRING },
+                  // Step 3 结构由服务器秘书接管；LLM 不输出 paragraphPlan / step3SlotEval /
+                  // step3SubpointSteps / kickoffPendingDrafts / 扁平 step3Subpoint* 字段。
                   step3SubpointCompleted: { type: Type.BOOLEAN },
-                  step3KickoffPendingDrafts: {
-                    type: Type.ARRAY,
-                    description:
-                      "Server-managed kickoff drafts awaiting student confirmation before slot write. Model may omit; server fills/clears this.",
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        key: { type: Type.STRING },
-                        label: { type: Type.STRING },
-                        text: { type: Type.STRING },
-                        blockIndex: { type: Type.NUMBER },
-                        stepIndex: { type: Type.NUMBER },
-                      },
-                    },
-                  },
-                  paragraphPlan: {
-                    type: Type.OBJECT,
-                    properties: {
-                      mode: {
-                        type: Type.STRING,
-                        enum: ["single_point", "total_then_points", "direct_points"],
-                        description:
-                          "'single_point' for a single-point claim (exactly one pointBlock), 'total_then_points' or 'direct_points' for multi-point claims.",
-                      },
-                      diagnosis: { type: Type.STRING },
-                      totalClaim: { type: Type.STRING },
-                      optionalShortClosing: {
-                        type: Type.STRING,
-                        description:
-                          "OPTIONAL. Default is empty (\"\"). Only fill this when the paragraph genuinely needs a single closing sentence that ties the pointBlocks back to the overall claim. This is NOT a required Impact step and NOT a third argument. Omit (leave \"\") when each pointBlock already ends with a local effect, or when this would merely repeat totalClaim.",
-                      },
-                      pointBlocks: {
-                        type: Type.ARRAY,
-                        items: {
-                          type: Type.OBJECT,
-                          properties: {
-                            id: { type: Type.STRING },
-                            label: { type: Type.STRING },
-                            subClaim: { type: Type.STRING },
-                            role: {
-                              type: Type.STRING,
-                              enum: ["major", "minor"],
-                            },
-                            expansionStrategy: {
-                              type: Type.STRING,
-                              enum: [
-                                "explanation",
-                                "example",
-                                "mechanism",
-                                "impact",
-                                "contrast",
-                                "hybrid",
-                              ],
-                            },
-                            steps: {
-                              type: Type.ARRAY,
-                              items: {
-                                type: Type.OBJECT,
-                                properties: {
-                                  key: { type: Type.STRING },
-                                  label: { type: Type.STRING },
-                                  placeholder: { type: Type.STRING },
-                                  value: { type: Type.STRING },
-                                  status: {
-                                    type: Type.STRING,
-                                    enum: ["draft", "confirmed"],
-                                    description:
-                                      "'draft' = written but still updatable; 'confirmed' = argument-ready and frozen. Omit or leave unset only when value is empty.",
-                                  },
-                                },
-                                required: ["key", "label", "placeholder", "value"],
-                              },
-                            },
-                          },
-                          required: [
-                            "id",
-                            "label",
-                            "subClaim",
-                            "role",
-                            "expansionStrategy",
-                            "steps",
-                          ],
-                        },
-                      },
-                    },
-                    required: ["mode", "diagnosis", "pointBlocks"],
-                  },
-                  step3SubpointSteps: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        key: { type: Type.STRING },
-                        label: { type: Type.STRING },
-                        placeholder: { type: Type.STRING },
-                        value: { type: Type.STRING },
-                        status: {
-                          type: Type.STRING,
-                          enum: ["draft", "confirmed"],
-                        },
-                      },
-                      required: ["key", "label", "placeholder", "value"]
-                    }
-                  },
-                  step3SubpointCompletenessChecks: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        label: { type: Type.STRING },
-                        passed: { type: Type.BOOLEAN },
-                        desc: { type: Type.STRING },
-                      },
-                      required: ["label", "passed", "desc"],
-                    },
-                  },
-                  step3SubpointTransitionChecks: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        label: { type: Type.STRING },
-                        passed: { type: Type.BOOLEAN },
-                        desc: { type: Type.STRING },
-                      },
-                      required: ["label", "passed", "desc"],
-                    },
-                  },
-                  step3SubpointSufficiencyCheck: {
-                    type: Type.OBJECT,
-                    properties: {
-                      label: { type: Type.STRING },
-                      passed: { type: Type.BOOLEAN },
-                      desc: { type: Type.STRING },
-                    },
-                    required: ["label", "passed", "desc"],
-                  },
                   step1Data: {
                     type: Type.OBJECT,
                     properties: {

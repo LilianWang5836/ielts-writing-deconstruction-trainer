@@ -21,6 +21,7 @@ import {
   demoteThemeHeadSubClaims,
   prefillClaimSlotsFromSubClaims,
 } from '../../utils/step3ClaimPrefill';
+import { toSkeleton } from '../../utils/step3Skeleton';
 import { buildFallbackBodyPlans } from './planner-fallback';
 import { parseAIResponse } from './planner-utils';
 import {
@@ -400,6 +401,11 @@ export function normalizePlannerBodyPlans(
     if (majorLabel && !isGenericLabel && !isClaimSentence(majorLabel)) {
       bp.theme = majorLabel;
     }
+
+    // 冻结骨架：Planner 产出即生成并附加到 bodyPlan，之后任何环节不得修改。
+    // 这样 Step3 的 ensureStep3SkeletonForSubpoints 可直接复用 bp.skeleton，
+    // 骨架在 Planner 阶段就冻结（消灭结构漂移的根源）。
+    bp.skeleton = toSkeleton(bp);
   }
   return hydrated;
 }

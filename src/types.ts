@@ -597,6 +597,8 @@ export interface BodyPlan {
   /** Ids into session.step2.coachEvaluation.plannerPayload.points */
   mappedPointIds?: string[];
   paragraphPlan: ParagraphPlan;
+  /** 冻结骨架：Planner 产出即生成并冻结（restructure 新架构）。任何环节不得修改。 */
+  skeleton?: Step3Skeleton;
 }
 
 // ============================================================
