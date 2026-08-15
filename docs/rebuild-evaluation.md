@@ -7,7 +7,7 @@
 
 ## 0. 结论速览
 
-**总体符合预期，P0/P1/P2/P3 的架构目标全部落地并经多轮验证。** 相比旧架构，状态漂移的死锁根因（结构被 LLM 反复改写 + 双真相源）已被架构性消灭；判断质量通过透镜 + 瘦身 + 护栏分层提升。P0「旧字段全删」的最大残留（惰性 guard）已于补完提交（`b083d62`，-473 行）清除。现存剩余差距为**小型防御性回退**（Step2 正常使用 + Step3 旧会话兼容分支）和 **1 项已知取舍**（Planner 仍输出 paragraphPlan 再转 skeleton），均不影响运行正确性，可结合「Planner skeleton 直出」最终收口。
+**总体符合预期，P0/P1/P2/P3 的架构目标全部落地并经多轮验证。** 相比旧架构，状态漂移的死锁根因（结构被 LLM 反复改写 + 双真相源）已被架构性消灭；判断质量通过透镜 + 瘦身 + 护栏分层提升。P0「旧字段全删」的最大残留（惰性 guard）已清除（`b083d62`，-473 行）；前端辅助函数已迁移 skeleton 语义（减少 paragraphPlan 依赖）。现存剩余差距为**小型防御性回退**（Step2 正常使用 + Step3 旧会话兼容分支）。Planner「直接输出 skeleton」经评估**暂不执行**（语义已达成、改造风险高于收益），记录为有据可查的架构决策（见 §6 第 2 项）。
 
 ---
 
@@ -157,16 +157,16 @@ server.ts 中旧字段引用当前约 48 处（含注释/提示词说明）：
 
 ### 一句话结论
 
-> **架构目标（状态漂移治理）已达成且可证明：-4,425 行、4 个确定性函数、三题型无死锁、看板全来自 minutes、60 个单元断言 + 多轮真实 E2E 全部通过。判断质量（P2/P3）也已落地并零误报。唯一未 100% 兑现的是 v2 字面上的「旧字段全删 / 无兼容层」——现存 ~53 处旧字段引用是惰性防御代码而非活跃依赖，不影响正确性，建议作为下一轮清理项（配合 Planner skeleton 直出一并处理）。**
+> **架构目标（状态漂移治理）已达成且可证明：-4,889 行、4 个确定性函数、三题型无死锁、看板全来自 minutes、60 个单元断言 + 多轮真实 E2E 全部通过。判断质量（P2/P3）也已落地并零误报。v2 字面的「旧字段全删 / 无兼容层」已最大程度兑现：惰性 guard 与前端辅助函数均迁移 skeleton 语义；剩余旧字段引用为 Step2 正常使用 + Step3 防御性回退（不影响正确性）。「Planner skeleton 直出」经权衡暂不执行（见 §6 第 2 项），作为有据可查的架构决策。**
 
 ---
 
 ## 6. 建议的后续工作（按优先级）
 
-> ✅ 2026-08-15 已处理：第 1 项（惰性 guard 删除，commit `b083d62`，-473 行）+ 第 4 项（旧诊断脚本归档到 `scripts/legacy/`）。
+> ✅ 2026-08-15 已处理：第 1 项（惰性 guard 删除，`b083d62`，-473 行）+ 第 4 项（旧脚本归档）+ 第 3 项（前端辅助函数迁移，见下）+ 静态检查脚本修复（`verify-step-openers.mjs` 路径 `%20` 解码 + 失效断言更新）。
 
 1. ~~**（清理）** 删除 server.ts 中惰性 paragraphPlan 兼容 guard~~ ✅ 已删（9414 回包 + 9540 投影 + mode-correction 死代码链）
-2. **（架构）** Planner prompt 改为直接输出 skeleton（去掉 paragraphPlan 中间产物），删除 `planToSkeleton` 回退 —— 注意：`planToSkeleton` 回退已保留（旧会话兼容），仅当放弃历史会话后才可删
-3. **（清理）** 前端 `resolveBodyTheme` 等辅助函数迁移到 skeleton 语义，删除 paragraphPlan 读取
+2. **（架构 · 暂不执行）** Planner prompt 改为直接输出 skeleton —— **决策：不做全量改造**。理由：① 语义已达成（`normalizePlannerBodyPlans` 产出即 `bp.skeleton = toSkeleton(bp)`，Step3 全链路只消费 skeleton，paragraphPlan 仅是 planner 内部中间产物 + Step2/旧会话兼容）；② 改动面大（prompt + 解析 + QA + normalize + Step2 侧读取），DeepSeek 输出新结构需重新验证三题型；③ 转换是确定性纯函数，无运行时风险。**渐进替代**：如需最终收口，可仅当放弃历史会话时删除 `planToSkeleton` 回退（`server.ts ~4395`），并保持 planner 内部用 paragraphPlan 作为 LLM 契约。
+3. ~~**（清理）** 前端 `resolveBodyTheme` 等辅助函数迁移到 skeleton 语义~~ ✅ 已迁：`resolveBodyClaimSentence`/`resolveBodyTheme` 优先读 `bp.skeleton.blocks`（同源 label/subClaim），`parsedSubpoints` 映射携带 `skeleton`，`kickoff` firstEmpty 优先从 skeleton 未确认槽取；paragraphPlan 仅作回退。浏览器验证 Body1/Body2 主题标签与看板正常。
 4. ~~**（维护）** 清理旧架构诊断脚本~~ ✅ 已归档（slot-reuse / step3-schemes / momentum-guard → `scripts/legacy/`）
 5. **（可选）** 将评估中的 E2E 场景固化为可回归的 replay 脚本（当前依赖真实 LLM，成本较高）

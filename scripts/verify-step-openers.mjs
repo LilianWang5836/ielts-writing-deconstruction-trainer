@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function readSrc(relPath) {
   return fs.readFileSync(path.join(repoRoot, relPath), "utf8");
@@ -48,10 +49,10 @@ assertTrue(
   "Step3Drafting.tsx still wires autoKickoff + kickoffPrompt unchanged (regression check)"
 );
 assertTrue(
-  step3.includes("mode=expand") &&
-    step3.includes("禁止 mode=confirm") &&
-    step3.includes("禁止让我一次性确认"),
-  "Step3Drafting kickoffPrompt requires expand and forbids confirm bundle"
+  step3.includes("DEFAULT：mode=expand") &&
+    step3.includes("禁止静默写入") &&
+    step3.includes("FORBIDDEN 过度缩成口号"),
+  "Step3Drafting kickoffPrompt requires expand and forbids silent writes / over-shrinking"
 );
 assertTrue(
   !step3.includes("整理成草稿") && !step3.includes("并先请我一次性确认"),

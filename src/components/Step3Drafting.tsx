@@ -38,6 +38,18 @@ function planWithClaimPrefill<T>(plan: T): T {
 
 /** Body-level 论点句: first block's confirmed/full claim, never a theme word. */
 function resolveBodyClaimSentence(bp: any): string {
+  // 秘书架构优先：冻结骨架的 subClaim 与 paragraphPlan.pointBlocks 同源。
+  const skeletonBlocks = Array.isArray(bp?.skeleton?.blocks)
+    ? bp.skeleton.blocks
+    : [];
+  if (skeletonBlocks.length > 0) {
+    for (const block of skeletonBlocks) {
+      const s = resolveBlockClaimSentence(block);
+      if (s) return s;
+    }
+    const sub = String(skeletonBlocks[0]?.subClaim || "").trim();
+    if (isClaimSentence(sub)) return sub;
+  }
   const plan = bp?.paragraphPlan;
   const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
   for (const block of blocks) {
@@ -53,6 +65,16 @@ function resolveBodyClaimSentence(bp: any): string {
 function resolveBodyTheme(bp: any): string {
   const t = String(bp?.theme || "").trim();
   if (t && isThemeHeadOnly(t)) return t;
+  // 秘书架构优先：冻结骨架的 block.label 与 paragraphPlan.pointBlocks 同源。
+  const skeletonBlocks = Array.isArray(bp?.skeleton?.blocks)
+    ? bp.skeleton.blocks
+    : [];
+  if (skeletonBlocks.length > 0) {
+    for (const block of skeletonBlocks) {
+      const head = resolveBlockThemeLabel(block);
+      if (head) return head;
+    }
+  }
   const blocks = Array.isArray(bp?.paragraphPlan?.pointBlocks)
     ? bp.paragraphPlan.pointBlocks
     : [];
@@ -181,6 +203,8 @@ export default function Step3Drafting({
         stanceRelation: bp.argumentRelation,
         layoutRationale: (session as any).step2_5?.rationale || '',
         paragraphPlan: plan,
+        // 会议秘书：Planner 冻结骨架随 bodyPlan 传入，供秘书看板/同框架恢复直接使用。
+        skeleton: bp.skeleton,
         isCompleted: false,
       };
       })
@@ -413,6 +437,28 @@ export default function Step3Drafting({
     return '分论点';
   };
 
+  // 秘书架构：优先从冻结骨架找第一个未确认槽位（label），供 kickoff 提示使用。
+  const findFirstEmptySkeletonSlotLabel = (): string => {
+    const sp = activeSubpoint as any;
+    const minutes = Array.isArray(sp?.minutes) ? sp.minutes : [];
+    const confirmedKeys = new Set(
+      minutes
+        .filter((m: any) => m.status === 'confirmed' && m.slotKey)
+        .map((m: any) => m.slotKey as string),
+    );
+    if (Array.isArray(sp?.skeleton?.blocks)) {
+      for (const block of sp.skeleton.blocks) {
+        if (!Array.isArray(block?.slots)) continue;
+        for (const slot of block.slots) {
+          if (!confirmedKeys.has(slot.key)) {
+            return String(slot.label || '当前这一环').trim();
+          }
+        }
+      }
+    }
+    return '';
+  };
+
   // 待确认草稿（服务端暂存的 pending）：右侧看板同步显示在对应槽位，
   // 让看板随聊天推进即时更新，而不是等确认后才一次性出现。
   const pendingByKey = (() => {
@@ -427,14 +473,18 @@ export default function Step3Drafting({
     return map;
   })();
 
-  const kickoffFirstLabel = activeSubpoint?.paragraphPlan
-    ? findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)
-    : "分论点";
+  // 秘书架构优先：skeleton 的第一个未确认槽；否则回退 paragraphPlan / 默认分论点。
+  const skeletonFirstLabel = findFirstEmptySkeletonSlotLabel();
+  const kickoffFirstLabel =
+    skeletonFirstLabel ||
+    (activeSubpoint?.paragraphPlan
+      ? findFirstEmptyStepLabel(activeSubpoint.paragraphPlan)
+      : "分论点");
   const kickoffTheme = String(activeSubpoint?.theme || "").trim();
   const kickoffNeedsClaimAsk =
     /分论点|核心主张|核心观点|主张|论点/.test(kickoffFirstLabel) &&
     !isClaimSentence(String(activeSubpoint?.content || ""));
-  const kickoffPrompt = activeSubpoint?.paragraphPlan
+  const kickoffPrompt = skeletonFirstLabel || activeSubpoint?.paragraphPlan
     ? kickoffNeedsClaimAsk
       ? `开场：主题「${kickoffTheme || "本段主题"}」只是标签，不是论点。firstEmpty 必须是「${kickoffFirstLabel}」（论点槽）。DEFAULT：mode=expand — 用第二步素材引导学生用完整句说出本段论点。确认时保留学生逻辑，关联紧密多层可同槽；FORBIDDEN 过度缩成口号；FORBIDDEN 说「分论点已确立」或跳到展开原因。禁止静默写入、禁止改已确认槽。`
       : `开场：对准 firstEmpty「${kickoffFirstLabel}」。DEFAULT：mode=expand。确认整理句以逻辑通顺为准（紧密多层可同槽）；仅当功能明显不同且后面有空槽时才拆多槽。禁止过度简化、禁止从零发明、禁止改 plan 骨架。`
