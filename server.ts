@@ -10127,7 +10127,58 @@ Student says:
 
       const claimRegex = /(?:^|_)(subclaim|claim)$/i;
       const claimLabelRegex = /分论点|核心观点|核心主张|主张|论点|观点|claim/i;
-      const extractBodySentences = (plan: any): string[] => {
+
+      /**
+       * 会议秘书新架构优先：从 subpoint.minutes（唯一真相源）提取已确认句子。
+       * minutes 里 status=confirmed 且带 slotKey 的文本即该 body 的完整论证内容
+       * （分论点/原因/机制/影响/例子），按骨架槽位顺序排列。
+       */
+      const extractBodySentencesFromMinutes = (sp: any): string[] => {
+        const minutes = Array.isArray(sp?.minutes) ? sp.minutes : [];
+        if (minutes.length === 0) return [];
+
+        // 骨架槽位顺序（若有）→ slotKey 排序基准；无骨架时按出现顺序。
+        const skeleton = sp?.skeleton;
+        const slotOrder = new Map<string, number>();
+        if (skeleton && Array.isArray(skeleton.blocks)) {
+          let idx = 0;
+          skeleton.blocks.forEach((b: any) => {
+            if (!Array.isArray(b?.slots)) return;
+            b.slots.forEach((s: any) => {
+              if (s?.key) slotOrder.set(String(s.key), idx++);
+            });
+          });
+        }
+
+        const confirmed = minutes
+          .filter(
+            (m: any) =>
+              m &&
+              m.status === "confirmed" &&
+              normalizeText(m.text) &&
+              normalizeText(m.text).length > 0,
+          )
+          .sort((a: any, b: any) => {
+            const ka = String(a?.slotKey || "");
+            const kb = String(b?.slotKey || "");
+            const oa = slotOrder.has(ka) ? slotOrder.get(ka)! : 999;
+            const ob = slotOrder.has(kb) ? slotOrder.get(kb)! : 999;
+            if (oa !== ob) return oa - ob;
+            return (a?.ts || 0) - (b?.ts || 0);
+          })
+          .map((m: any) => normalizeText(m.text));
+
+        // 去重：同一槽位可能有多条 confirmed（如复写），保留全部但有意义的去重。
+        return dedupeOrdered(confirmed);
+      };
+
+      const extractBodySentences = (plan: any, sp?: any): string[] => {
+        // 会议秘书新架构：内容真相源是 minutes，优先提取。
+        if (sp) {
+          const fromMinutes = extractBodySentencesFromMinutes(sp);
+          if (fromMinutes.length > 0) return fromMinutes;
+        }
+        // 旧会话回退：paragraphPlan.steps[].value（秘书路径下为空，保留兼容）。
         if (!plan || typeof plan !== "object") return [];
 
         const sentences: string[] = [];
@@ -10251,7 +10302,7 @@ Student says:
         return {
           bodyNum,
           sp,
-          sentences: extractBodySentences(plan),
+          sentences: extractBodySentences(plan, sp),
           claimContext: extractBodyClaimContext(plan, sp),
         };
       });
