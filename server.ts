@@ -876,6 +876,29 @@ function fallbackNextStep(
       return "请先确认要推进的主体段分论点（当前没有激活分论点）。确认后我会直接做单点/多点诊断并给出 paragraphPlan。";
     }
 
+    // 会议秘书：优先从冻结骨架 + minutes 投影当前槽位（与右侧看板一致）。
+    const skeleton = activeSubpoint.skeleton;
+    if (skeleton && Array.isArray(skeleton.blocks) && skeleton.blocks.length > 0) {
+      const flat = skeletonFlatSlots(skeleton);
+      const minutes = Array.isArray(activeSubpoint.minutes)
+        ? activeSubpoint.minutes
+        : [];
+      const confirmedKeys = new Set(
+        minutes
+          .filter((m: any) => m.status === "confirmed" && m.slotKey)
+          .map((m: any) => m.slotKey as string),
+      );
+      const firstEmpty = flat.find((f) => !confirmedKeys.has(f.slot.key));
+      const landed = minutes.find((m: any) => m.status === "landed");
+      if (landed) {
+        return `好的，这一步已经记下了。请点击右侧【确认】把它写入看板，然后我们继续下一步。`;
+      }
+      if (firstEmpty) {
+        return `继续推进这一步「${firstEmpty.slot.label}」：请用一两句话具体说说你的想法。`;
+      }
+      return "这个分论点的逻辑链已经完整。请确认完成后切换到下一个分论点（或完成第三步）。";
+    }
+
     const plan = activeSubpoint.paragraphPlan;
     if (plan && Array.isArray(plan.pointBlocks)) {
       for (const block of plan.pointBlocks) {
@@ -4391,7 +4414,10 @@ function enforceStep3LogicCompletion(
   userMessage: string,
   options?: { isHiddenKickoff?: boolean },
 ): void {
-  if (!data?.progressUpdate) return;
+  // 秘书架构：LLM 可能只输出 text 而不输出 progressUpdate（结构由服务器接管）。
+  // 必须兜底初始化 progressUpdate，否则秘书落槽/看板回传会被跳过 → 状态漂移死锁。
+  if (!data) return;
+  if (!data.progressUpdate) data.progressUpdate = {};
 
   const activeId = session?.step3?.activeSubpointId;
   const activeSp = (session?.step3?.subpoints || []).find(
@@ -9466,7 +9492,10 @@ Student says:
       // Step 3 completion safety net: merge prior values, backfill a missed last
       // step from the user message, and clear premature completion CTA / flags
       // while any required step value is still empty.
-      if (currentStepNum === 3 && data?.progressUpdate) {
+      // 会议秘书：LLM 可能只输出 text 而不输出 progressUpdate（结构由服务器接管），
+      // 因此这里必须无条件进入（函数内部会兜底初始化 progressUpdate），否则秘书
+      // 落槽/看板回传被跳过 → 学生内容永远无法落槽 → 状态漂移死锁。
+      if (currentStepNum === 3) {
         enforceStep3LogicCompletion(data, session, userMessage, {
           isHiddenKickoff: Boolean(isHiddenKickoff),
         });
