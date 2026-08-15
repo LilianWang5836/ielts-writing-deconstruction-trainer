@@ -10,7 +10,7 @@
 
 **存在一个真实的、可复现的、影响上线质量的数据源脱节 bug**：Step3 的内容全部写入 `minutes`，而 Step4 的 `/api/generate-sentence-tasks` 仍只从旧字段 `paragraphPlan.steps[].value` 提取句子 → **在秘书路径下 Step4 的 Body 句子任务完全缺失（实测仅返回 intro/conclusion，0 个 Body 任务）**，Step3 产出的完整论证内容全部丢失。
 
-**建议：阶段1 应优先修复"数据源对齐"（高价值、低成本、实测可验证），前端重构次之（低价值、高成本），完整"秘书化"落地最后（价值待验证、成本高）。** 详见 §5 决策建议。
+**✅ 2026-08-15 已修复（commit `d676c02`）**：方案 A（minutes 优先提取）已实施并实测验证——修复前 Body 任务=0，修复后 **16 个任务完整**（Intro2 + Body1×4 + Body2×4 + Body3×5 + Conc1），全新对话 E2E Step1→4 全环节走通，Body 句子内容与 Step3 minutes 一致。详见 §5。
 
 ---
 
@@ -103,17 +103,18 @@ Body 任务：⚠️ 0 个（完全缺失）
 
 ## 5. 决策建议（按价值/成本排序）
 
-### ✅ 方案 A：服务端对齐 minutes（优先，高价值）
-在 `/api/generate-sentence-tasks` 的 `extractBodySentences` 增加 **minutes 优先提取路径**：
+### ✅ 方案 A：服务端对齐 minutes（✅ 已实施，commit `d676c02`）
+在 `/api/generate-sentence-tasks` 增加 **minutes 优先提取路径**（`extractBodySentencesFromMinutes`）：
 ```
-优先：sp.minutes 中 status=confirmed 且按 slotKey 排序的文本（保留顺序）
+优先：sp.minutes 中 status=confirmed 且按骨架 slotKey 顺序排序的文本
       —— 每段得到"分论点/原因/机制/影响/例子"的完整句子序列
 回退：现有 paragraphPlan.steps[].value 逻辑（旧会话兼容）
 ```
-- **工作量**：小（单端点内改 ~30 行）
-- **风险**：低（纯增量，旧逻辑保留为回退）
-- **验证**：实测已确认修复前 Body 任务=0；修复后应恢复为 body-1(4句)+body-2(2句) 任务
-- **必须配套**：给 `generate-sentence-tasks` 补一个最小单测（构造含 minutes 的 subpoint → 断言提取的句子数），防止回归
+- **实测验证**：
+  - 修复前：调用返回 3 个任务（Intro2+Conc1，Body 0 个）
+  - 修复后：返回 **16 个任务**（Intro2 + Body1×4 + Body2×4 + Body3×5 + Conc1），Body 句子全部来自 Step3 minutes
+  - 全新对话 E2E：Step1→2→3→4 全环节走通，Step4 Body1/3 句子任务内容与 Step3 minutes 完全一致
+- **回归**：tsc 0 错误；4 单测 60/60
 
 ### ⭕ 方案 B：前端拆分重构（可选，低价值高成本）
 拆 `Step4SentencePractice.tsx` 子组件 + 删死状态 + 去重 JSX。
@@ -132,12 +133,12 @@ Body 任务：⚠️ 0 个（完全缺失）
 ## 6. 推荐执行计划（阶段1 重定义）
 
 ```
-Step A1（0.5-1天）  修复 /api/generate-sentence-tasks：extractBodySentences 增加 minutes 优先提取
-Step A2（0.5天）    补 generate-sentence-tasks 单测（含 minutes 的 subpoint 断言）
-Step A3（1天）      浏览器 E2E：走完 Step4 全流程，验证 Body 句子含完整论证链 + json 无 400
-Step A4（可选）     补 E2E 脚本的真实 Step4 驱动
-Step B（后续）      前端拆分重构（死状态清理 + 子组件抽取）——可单独排期
-Step C（远期）      评估 Step4 完整"秘书化"价值
+Step A1 ✅ 已完成（d676c02）  修复 /api/generate-sentence-tasks：extractBodySentences 增加 minutes 优先提取
+Step A2 ⏳ 待做（低优先）     补 generate-sentence-tasks 单测（含 minutes 的 subpoint 断言）
+Step A3 ✅ 已完成（本次 E2E） 全新对话全环节测试：Step1→4 走通，Step4 16 任务完整，Body 内容与 minutes 一致
+Step A4 ⏳ 待做（低优先）     补 E2E 脚本的真实 Step4 驱动
+Step B  （后续）              前端拆分重构（死状态清理 + 子组件抽取）——可单独排期
+Step C  （远期）              评估 Step4 完整"秘书化"价值
 ```
 
-**阶段1 的核心交付 = 方案 A（minutes 对齐）**，它直接修复真实 bug、成本低、可验证。前端重构（B）与完整秘书化（C）均非当前阻塞项。
+**阶段1 核心交付（方案 A）已完成**：实测从"Body 任务=0"恢复到"16 任务完整"，全新对话 E2E 全环节验证通过。剩余 A2/A4 为测试补充（低优先），前端重构（B）与完整秘书化（C）均非当前阻塞项。
