@@ -532,3 +532,80 @@ function replayFromMinutes(subpoint: Step3Subpoint): LandingReplayReport {
     auditDriven: false,
   };
 }
+
+// ------------------------------------------------------------
+// 6. 教练卡死检测（P3 — 只拦确定性无进展）
+// ------------------------------------------------------------
+//
+// 确定性信号：一个 body 里，学生在【同一个槽】连续多次给出实质回答，
+// 但始终没有任何一条被确认写板（confirmed 数不增长）→ 对话在该槽原地打转。
+// 这通常意味着教练反复问同一槽（或学生始终答不对 / 教练不引导确认）。
+//
+// 护栏只报警 + 给前端信号，不做"替教练改结构"（护栏不充当模板校验器）。
+
+export interface StallReport {
+  stalled: boolean;
+  slotKey: string | null;
+  slotLabel: string | null;
+  /** 该槽连续未确认的实质回答条数。 */
+  attempts: number;
+  /** 卡死等级：warn=需关注；hard=明确卡死。 */
+  level: 'warn' | 'hard';
+}
+
+/**
+ * 检测当前 subpoint 是否在某个槽上原地打转（连续 landed 未 confirmed）。
+ *
+ * @param maxAttempts 判为卡死的连续条数（默认 4）
+ */
+export function detectStall(
+  subpoint: Step3Subpoint,
+  maxAttempts = 4,
+): StallReport {
+  const minutes = Array.isArray(subpoint.minutes) ? subpoint.minutes : [];
+  const confirmedCount = minutes.filter(
+    (m) => m.status === 'confirmed' && m.slotKey,
+  ).length;
+
+  // 连续未确认的实质回答，取最近一条 landed 的槽作为"打转槽"。
+  // 统计该槽在 minutes 中 landed 但从未 confirmed 的条数。
+  const landedOnly = minutes.filter(
+    (m) => m.status === 'landed' && m.slotKey,
+  );
+  if (landedOnly.length === 0) {
+    return { stalled: false, slotKey: null, slotLabel: null, attempts: 0, level: 'warn' };
+  }
+
+  // 找最近的 landed 槽
+  const last = landedOnly[landedOnly.length - 1];
+  const slotKey = String(last.slotKey || '');
+  const attempts = minutes.filter(
+    (m) => m.slotKey === slotKey && m.status === 'landed',
+  ).length;
+
+  // 同一槽被多次落槽但从未确认，且整体 confirmed 没增长 → 卡死。
+  // 允许 1-2 次正常往返；≥maxAttempts 判卡死。
+  const stalled = attempts >= maxAttempts && confirmedCount === 0
+    ? true
+    : attempts >= maxAttempts;
+
+  // 找槽 label
+  let slotLabel: string | null = null;
+  const skeleton = subpoint.skeleton;
+  if (skeleton) {
+    for (const f of skeletonFlatSlots(skeleton)) {
+      if (f.slot.key === slotKey) {
+        slotLabel = f.slot.label;
+        break;
+      }
+    }
+  }
+
+  return {
+    stalled,
+    slotKey: stalled ? slotKey : null,
+    slotLabel: stalled ? slotLabel : null,
+    attempts,
+    level: attempts >= maxAttempts + 2 ? 'hard' : 'warn',
+  };
+}

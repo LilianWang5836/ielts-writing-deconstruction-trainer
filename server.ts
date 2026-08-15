@@ -105,6 +105,7 @@ import {
   renderBoard,
   activeSlotLabel,
   isSkeletonComplete,
+  detectStall,
 } from "./src/server/step3/secretary";
 import {
   evaluateMinute,
@@ -4603,6 +4604,24 @@ function enforceStep3SecretaryPath(
     }
   } catch (e: any) {
     console.warn(`[Lens] error: ${e?.message || e}`);
+  }
+
+  // P3 教练卡死检测：同一槽连续 landed 未 confirmed → 无进展报警（只拦确定性）。
+  try {
+    const stall = detectStall(sp);
+    if (stall.stalled) {
+      data.progressUpdate.secretaryStall = {
+        slotKey: stall.slotKey,
+        slotLabel: stall.slotLabel,
+        attempts: stall.attempts,
+        level: stall.level,
+      };
+      console.warn(
+        `[StallGuard] ${stall.level} 卡死疑似：槽「${stall.slotLabel}」连续 ${stall.attempts} 次未确认（confirmed 未推进）。`,
+      );
+    }
+  } catch (e: any) {
+    console.warn(`[StallGuard] error: ${e?.message || e}`);
   }
 
   data.progressUpdate.secretaryBoard = renderBoard(sp);

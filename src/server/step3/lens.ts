@@ -102,8 +102,8 @@ export const LENS_CHAIN_CONSTRAINTS: Record<
 // ============================================================
 
 export interface LensVerdict {
-  /** ok=放行；thin=太薄需追问；off_target=贴错槽；duplicate=复读/近似。 */
-  verdict: 'ok' | 'thin' | 'off_target' | 'duplicate';
+  /** ok=放行；thin=太薄需追问；off_target=贴错槽；duplicate=复读/近似；off_topic=完全跑题。 */
+  verdict: 'ok' | 'thin' | 'off_target' | 'duplicate' | 'off_topic';
   reason: string;
   /** 建议给教练的追问方向（不作为模板，教练自由措辞）。 */
   hint?: string;
@@ -118,6 +118,35 @@ const OFF_SIGNAL_RE: Record<Step3SlotSemantic, RegExp[]> = {
   scenario: LENS_OFF_SIGNAL.scenario || [],
   solution: LENS_OFF_SIGNAL.solution || [],
 };
+
+/**
+ * P3 切题预检：学生回答是否完全脱离本题 / 当前槽位（确定性强信号，只拦明确跑题）。
+ *
+ * 拦截条件（任一命中）：
+ * 1. 明显在谈无关话题（如"我们去吃饭吧""这道题我不会""换个题目"…）
+ * 2. 纯元对话（"你能再说一遍吗""什么意思""怎么操作"…）—— 这是请求澄清，不落槽
+ *
+ * 原则（护栏不充当模板校验器）：只拦 100% 确定的非内容回答；
+ * 任何可能是有内容（哪怕偏薄/偏题）的回答一律放行，交给 lens/教练判断。
+ */
+const OFF_TOPIC_RE: RegExp[] = [
+  // 无关话题 / 离开任务（容忍"我们/我先/要不"等口语前缀）
+  /^(我们|我先|要不|那|咱们|我)?(去吃|去玩|去喝|去睡觉|今天天气|聊聊|换个话题|不谈这个|先不聊|算了不写|不想写了|放弃|不写了|换题|换个题目|跳过这题|下一题|别的题|无关|跑题了|你跑题|去吃饭|去逛街|去休息)/,
+  // 纯元对话（请求澄清 / 反问过程）—— 不产生内容
+  /^(什么意思|你说什么|没听懂|没明白|再说一遍|重复一下|举个例子说明你|怎么操作|怎么用|怎么弄|步骤是什么|能不能简单|为什么这么问|你问的什么)/,
+  // 答非所问到荒谬（与任务完全无关的完整句）
+  /^(我饿了|我困了|我累了|我要走了|今天先到这|明天再写)/,
+];
+
+/** 判定是否完全跑题（确定性；不命中一律放行）。 */
+export function isOffTopic(text: string): boolean {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  for (const re of OFF_TOPIC_RE) {
+    if (re.test(t)) return true;
+  }
+  return false;
+}
 
 /**
  * 评估一次学生回答的质量（确定性纯函数）。
@@ -138,6 +167,15 @@ export function evaluateMinute(
   // 1. 太短 / 空 → thin
   if (!t) {
     return { verdict: 'thin', reason: '回答为空', hint: '请用一两句话具体说说你的想法。' };
+  }
+
+  // 1.5 P3 切题预检：完全跑题 → off_topic（确定性强信号，只拦明确跑题）
+  if (isOffTopic(t)) {
+    return {
+      verdict: 'off_topic',
+      reason: '回答与当前写作任务完全无关',
+      hint: '我们还在讨论这个主体段的论证。请回到这一步（当前槽），说一个具体想法。',
+    };
   }
 
   // 2. 与已 confirmed 兄弟槽重复（子串包含 或 LCS 相似度≥0.6，与秘书 dup 一致）
