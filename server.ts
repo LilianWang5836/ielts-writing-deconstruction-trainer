@@ -4496,7 +4496,7 @@ function enforceStep3SecretaryPath(
     data.progressUpdate.secretaryBoard = renderBoard(sp);
     data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
     console.warn(
-      `[Secretary] AFFIRM landed slotKey=${landed.slotKey} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
+      `[Secretary] AFFIRM minute=${landed.id} slotKey=${landed.slotKey} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
     );
     return;
   }
@@ -4504,6 +4504,9 @@ function enforceStep3SecretaryPath(
   if (isRej) {
     // 拒绝 → 该条 landed 回退为 recorded，不写板
     if (landed) {
+      console.warn(
+        `[Secretary] REJECT minute=${landed.id} slotKey=${landed.slotKey} → reverted to recorded`,
+      );
       landed.status = "recorded";
       landed.slotKey = undefined;
     }
@@ -4519,15 +4522,17 @@ function enforceStep3SecretaryPath(
     // 已落为 landed（draft），等学生确认
     data.progressUpdate.step3SubpointCompleted = false;
     console.warn(
-      `[Secretary] LANDED ok slotKey=${land.slotKey} activeSlotIndex=${sp.activeSlotIndex}`,
+      `[Secretary] LANDED minute=${minute.id} slotKey=${land.slotKey} activeSlotIndex=${sp.activeSlotIndex}`,
     );
   } else {
     // rejected / 无空槽 / 无骨架 → 记录但看板不变
     data.progressUpdate.step3SubpointCompleted = false;
     if (land.reason) {
       data.progressUpdate.secretaryRejectReason = land.reason;
+      console.warn(
+        `[Secretary] LANDED reject minute=${minute.id} reason=${land.reason}`,
+      );
     }
-    console.warn(`[Secretary] LANDED reject reason=${land.reason}`);
   }
   data.progressUpdate.secretaryBoard = renderBoard(sp);
   data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);

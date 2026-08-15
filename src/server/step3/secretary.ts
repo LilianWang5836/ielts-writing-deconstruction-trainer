@@ -11,6 +11,7 @@
  */
 
 import type {
+  Step3LandingAuditEntry,
   Step3Minute,
   Step3Skeleton,
   Step3Subpoint,
@@ -183,12 +184,14 @@ export function landMinuteToSlot(
   if (dup) {
     minute.status = 'rejected';
     minute.rejectReason = dup;
+    appendAudit(subpoint, minute.id, 'rejected', undefined, dup);
     return { ok: false, minuteId: minute.id, reason: dup };
   }
 
   minute.status = 'landed';
   minute.slotKey = target.slot.key;
   subpoint.activeSlotIndex = targetIndex;
+  appendAudit(subpoint, minute.id, 'landed', target.slot.key);
   return {
     ok: true,
     minuteId: minute.id,
@@ -211,9 +214,11 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
   if (dup) {
     minute.status = 'rejected';
     minute.rejectReason = dup;
+    appendAudit(subpoint, minute.id, 'rejected', minute.slotKey, dup);
     return;
   }
   minute.status = 'confirmed';
+  appendAudit(subpoint, minute.id, 'confirmed', minute.slotKey);
   // 推进到下一个未填槽
   if (subpoint.skeleton) {
     const flat = skeletonFlatSlots(subpoint.skeleton);
@@ -226,6 +231,24 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
     );
     if (next !== -1) subpoint.activeSlotIndex = next;
   }
+}
+
+/** 记录一条落槽审计事件（P1）。确定性：追加到 subpoint.landingLog。 */
+function appendAudit(
+  subpoint: Step3Subpoint,
+  minuteId: string,
+  event: Step3LandingAuditEntry['event'],
+  slotKey?: string,
+  reason?: string,
+): void {
+  if (!Array.isArray(subpoint.landingLog)) subpoint.landingLog = [];
+  subpoint.landingLog.push({
+    minuteId,
+    event,
+    slotKey,
+    reason,
+    ts: Date.now(),
+  });
 }
 
 // ------------------------------------------------------------
@@ -329,4 +352,183 @@ export function activeSlotLabel(subpoint: Step3Subpoint): string {
 export function isSkeletonComplete(subpoint: Step3Subpoint): boolean {
   const board = renderBoard(subpoint);
   return board.isComplete;
+}
+
+// ------------------------------------------------------------
+// 5. 可审计落槽：从 minutes 流水重放（P1 — 可重放 / 诊断）
+// ------------------------------------------------------------
+//
+// 原则：minutes 是唯一真相源，落槽是确定性纯函数。给定相同的 skeleton +
+// 相同的学生消息序列（按 ts 顺序），landMinuteToSlot / commitPendingMinute
+// 必须复现出与运行时完全一致的落槽结果（slotKey / status / rejectReason）。
+// replayLanding 在干净的 subpoint 副本上重放，逐条对比，返回一致性报告。
+// 用途：诊断"看板为何如此"、验证未来改动不改变确定性、为审计提供逐槽证据。
+
+export interface LandingReplayRow {
+  minuteId: string;
+  text: string;
+  recorded: {
+    slotKey?: string;
+    status: Step3Minute['status'];
+    rejectReason?: string;
+  };
+  replayed: {
+    slotKey?: string;
+    status: Step3Minute['status'];
+    rejectReason?: string;
+  };
+  consistent: boolean;
+}
+
+export interface LandingReplayReport {
+  rows: LandingReplayRow[];
+  allConsistent: boolean;
+  board: BoardView;
+  /** 审计事件驱动的重放（true）或 minutes 推断驱动（false）。 */
+  auditDriven: boolean;
+}
+
+/**
+ * 从 subpoint 重放落槽决策，验证与运行一致。
+ *
+ * 优先走 landingLog（P1 审计事件）：按事件顺序精确重放 landed/confirmed/rejected，
+ * 不依赖推断，天然一致。旧 session 无 landingLog 时回退到 minutes 推断（近似）。
+ */
+export function replayLanding(subpoint: Step3Subpoint): LandingReplayReport {
+  const skeleton = subpoint.skeleton;
+  const minutes = Array.isArray(subpoint.minutes) ? subpoint.minutes : [];
+  if (!skeleton || skeleton.blocks.length === 0 || minutes.length === 0) {
+    return {
+      rows: [],
+      allConsistent: true,
+      board: renderBoard(subpoint),
+      auditDriven: false,
+    };
+  }
+
+  const log = Array.isArray(subpoint.landingLog) ? subpoint.landingLog : [];
+  if (log.length > 0) {
+    return replayFromAuditLog(subpoint, log);
+  }
+  return replayFromMinutes(subpoint);
+}
+
+/** 审计日志驱动：按事件顺序精确重放，与运行完全一致。 */
+function replayFromAuditLog(
+  subpoint: Step3Subpoint,
+  log: Step3LandingAuditEntry[],
+): LandingReplayReport {
+  const minutes = subpoint.minutes || [];
+  const sorted = [...log].sort(
+    (a, b) => a.ts - b.ts || String(a.minuteId).localeCompare(String(b.minuteId)),
+  );
+
+  // 每条 minute 取最终审计事件（last-write-wins：rejected > confirmed > landed 按时间后者胜）。
+  const finalByMinute = new Map<string, Step3LandingAuditEntry>();
+  for (const entry of sorted) {
+    finalByMinute.set(String(entry.minuteId), entry);
+  }
+
+  const rows: LandingReplayRow[] = [];
+  for (const [minuteId, entry] of finalByMinute) {
+    const rec = minutes.find((m) => m.id === minuteId);
+    if (!rec) continue;
+    const replayed: LandingReplayRow['replayed'] = {
+      slotKey: entry.event === 'rejected' ? undefined : entry.slotKey,
+      status:
+        entry.event === 'confirmed'
+          ? 'confirmed'
+          : entry.event === 'landed'
+            ? 'landed'
+            : 'rejected',
+      rejectReason: entry.reason,
+    };
+    const recorded: LandingReplayRow['recorded'] = {
+      slotKey: rec.slotKey,
+      status: rec.status,
+      rejectReason: rec.rejectReason,
+    };
+    const consistent =
+      replayed.status === recorded.status &&
+      String(replayed.slotKey || '') === String(recorded.slotKey || '') &&
+      String(replayed.rejectReason || '') === String(recorded.rejectReason || '');
+    rows.push({
+      minuteId: rec.id,
+      text: String(rec.text || '').trim(),
+      recorded,
+      replayed,
+      consistent,
+    });
+  }
+
+  // 重放看板：以当前 skeleton + minutes 为准（已是运行结果）。
+  return {
+    rows,
+    allConsistent: rows.every((r) => r.consistent),
+    board: renderBoard(subpoint),
+    auditDriven: true,
+  };
+}
+
+/** minutes 推断驱动（兼容无 landingLog 的旧 session）：近似重放，尽力还原顺序。 */
+function replayFromMinutes(subpoint: Step3Subpoint): LandingReplayReport {
+  const skeleton = subpoint.skeleton!;
+  const minutes = subpoint.minutes || [];
+
+  // 干净的 subpoint 副本（复刻运行时状态机）。
+  const replay: Step3Subpoint = {
+    ...subpoint,
+    minutes: [],
+    activeSlotIndex: 0,
+  };
+
+  // 只重放学生实质发言（确认/拒绝本身不产生 minute，反映在落槽结果里）。
+  // 按 ts 排序；同一秒内按 minuteId 序号保持相对顺序（id 形如 m-<ts>-<seq>）。
+  const studentMinutes = minutes
+    .filter((m) => m.role === 'student')
+    .sort((a, b) => {
+      if (a.ts !== b.ts) return a.ts - b.ts;
+      const seqA = Number(String(a.id).split('-').pop() || 0);
+      const seqB = Number(String(b.id).split('-').pop() || 0);
+      return seqA - seqB;
+    });
+
+  const rows: LandingReplayRow[] = [];
+  for (const rec of studentMinutes) {
+    const text = String(rec.text || '').trim();
+    const minute = appendMinute(replay, 'student', text);
+    const land = landMinuteToSlot(replay, minute);
+    // 若原记录最终是 confirmed，则重放确认写板（推进 activeSlotIndex）。
+    if (rec.status === 'confirmed' && land.ok) {
+      commitPendingMinute(replay, minute);
+    }
+    const replayed = {
+      slotKey: minute.slotKey,
+      status: minute.status,
+      rejectReason: minute.rejectReason,
+    };
+    const recorded = {
+      slotKey: rec.slotKey,
+      status: rec.status,
+      rejectReason: rec.rejectReason,
+    };
+    const consistent =
+      replayed.status === recorded.status &&
+      String(replayed.slotKey || '') === String(recorded.slotKey || '') &&
+      String(replayed.rejectReason || '') === String(recorded.rejectReason || '');
+    rows.push({
+      minuteId: rec.id,
+      text,
+      recorded,
+      replayed,
+      consistent,
+    });
+  }
+
+  return {
+    rows,
+    allConsistent: rows.every((r) => r.consistent),
+    board: renderBoard(replay),
+    auditDriven: false,
+  };
 }

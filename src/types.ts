@@ -265,6 +265,23 @@ export interface Step3Subpoint {
   minutes?: Step3Minute[];
   /** 当前推进到第几个槽（skeleton 展开后的全局槽下标）。 */
   activeSlotIndex?: number;
+  /** 落槽审计事件日志（P1）：每次落槽/确认/拒绝的决策轨迹。
+   *  分钟级可审计 + 支持从 minutes/日志重放落槽结果。 */
+  landingLog?: Step3LandingAuditEntry[];
+}
+
+/** 落槽审计事件（P1 — 纪要双层 + 可审计）。 */
+export interface Step3LandingAuditEntry {
+  /** 触发该决策的学生纪要 id（确认事件沿用被确认的 minuteId）。 */
+  minuteId: string;
+  /** 决策类型：landed=落槽待确认；confirmed=确认写板；rejected=重复/无效拦截。 */
+  event: 'landed' | 'confirmed' | 'rejected';
+  /** 落到的槽 key（rejected 无）。 */
+  slotKey?: string;
+  /** 拦截原因（仅 rejected）。 */
+  reason?: string;
+  /** 决策时刻（ms）。 */
+  ts: number;
 }
 
 export interface LogicStep {
