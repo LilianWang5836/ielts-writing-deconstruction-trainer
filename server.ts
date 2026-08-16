@@ -7696,7 +7696,6 @@ async function startServer() {
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an elite IELTS Writing Task 2 Examiner.
         Analyze the following IELTS Writing Task 2 prompt:
@@ -8702,7 +8701,7 @@ JSON Output Schema rules:
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
   - For Step 3: STRUCTURE IS FULLY SERVER-OWNED (meeting secretary). The server owns the frozen skeleton, lands the student's words into slots, and writes the board after confirm. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / any structure JSON in Step 3. Your ONLY job in Step 3 is a high-quality Socratic dialogue "text": read the Step 3 slot cursor in ContextSummary (firstEmpty label / confirmed siblings / pending), ask the first still-missing slot in natural Chinese, briefly acknowledge the student's answer, and guide them to confirm. Do not waste output tokens fabricating structure that the server already manages deterministically.
-  - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint?, polishedText?, intent?, beats? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. Optionally include "polishedText": a LIGHT language-only polish of the student's answer for the board display (remove filler, smooth word order, supply elided subject) — NEVER add any fact/claim/meaning the student did not say; empty when no polish is needed. Optionally include "beats": when ONE student message covers MULTIPLE consecutive empty slots of the same body (e.g. claim + its reason), list the segments (each a substring of the message, in order) so the server batch-lands them for a single confirm — omit when the answer covers one slot only. Optionally include "intent" ONLY when the message is semantically ambiguous (meta/question/correction); the server's deterministic rules already cover clear affirm/reject/meta. These fields are INTERNAL (server uses them for landing/audit/hints) — never echo them in "text". Keep them optional; "text" remains your priority.
+  - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint?, polishedText?, intent?, beats? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. Optionally include "polishedText": a LIGHT language-only polish of the student's answer for the board display — ONLY allowed operations: delete filler words (那个/然后/就是/嗯), smooth word order without changing meaning, supply an elided subject/connector. KEEP ≥80% of the student's original words: do NOT swap words for synonyms, do NOT compress or drop content words, do NOT add any fact/claim/meaning the student did not say. When in doubt, return the original verbatim; empty when no polish is needed. Optionally include "beats": when ONE student message covers MULTIPLE consecutive empty slots of the same body (e.g. claim + its reason), list the segments (each a substring of the message, in order) so the server batch-lands them for a single confirm — omit when the answer covers one slot only. Optionally include "intent" ONLY when the message is semantically ambiguous (meta/question/correction); the server's deterministic rules already cover clear affirm/reject/meta. These fields are INTERNAL (server uses them for landing/audit/hints) — never echo them in "text". Keep them optional; "text" remains your priority.
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
@@ -8758,7 +8757,7 @@ Student says:
                   polishedText: {
                     type: Type.STRING,
                     description:
-                      "Step 3 ONLY, optional. A LIGHT language-only polish of the student's latest answer for board display: remove filler words, smooth word order, supply elided subject. FORBIDDEN: adding any new fact/claim/meaning the student did not say. The server validates (similarity/length/keyword coverage) and falls back to the original text if invalid. Empty when no polish is needed.",
+                      "Step 3 ONLY, optional. A LIGHT language-only polish of the student's latest answer for board display. ONLY allowed: delete filler words (那个/然后/就是/嗯), smooth word order, supply elided subject/connector. MUST keep ≥80% of the student's original words — do NOT use synonyms, do NOT compress or drop content words, NEVER add any fact/claim/meaning the student did not say. When in doubt return the original verbatim. The server validates (similarity/length/keyword coverage) and falls back to the original if invalid. Empty when no polish is needed.",
                   },
                   intent: {
                     type: Type.STRING,
@@ -9499,14 +9498,26 @@ Student says:
         res.status(400).json({ error: "decision must be confirm|reject" });
         return;
       }
+      // 完成标志回传：本 body 是否填满 + 整个 Step3 是否全部完成（前端据此解锁 Step4）。
+      // 实时按各 body 骨架完整度计算（不依赖存储的 isCompleted，兼容历史已确认 body）。
+      sp.isCompleted = isSkeletonComplete(sp);
+      const step3Subpoints = Array.isArray(session?.step3?.subpoints)
+        ? session.step3.subpoints
+        : [];
+      const step3Done =
+        step3Subpoints.length > 0
+          ? step3Subpoints.every((s: any) => isSkeletonComplete(s))
+          : sp.isCompleted;
+      if (step3Done) session.step3.isCompleted = true;
       res.json({
         subpoint: sp,
         board: renderBoard(sp),
         activeSlotLabel: activeSlotLabel(sp),
-        isComplete: isSkeletonComplete(sp),
+        isComplete: sp.isCompleted,
         confirmedCount: sp.minutes.filter(
           (m: any) => m.status === "confirmed",
         ).length,
+        step3Done,
       });
     } catch (error: any) {
       console.error("Error in /api/step3/decision:", error?.message || error);
@@ -9525,7 +9536,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an elite IELTS Writing AI Coach.
         Evaluate the user's self-written Topic Analysis Notes for the following IELTS Task 2 prompt:
@@ -9610,7 +9620,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an elite IELTS Writing AI Coach.
         Evaluate the user's overall stance and paragraph sub-arguments for the following IELTS Task 2 prompt:
@@ -9691,7 +9700,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are a Feedback Coach focusing purely on "Reasoning Diagnosis" (Logic > Structure > Language) rather than academic tone/clarity.
         Analyze the user's drafted paragraph:
@@ -9825,7 +9833,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       let userNotesInstructions = "";
       if (userNotes && userNotes.trim().length > 0) {
         userNotesInstructions = `
@@ -9929,7 +9936,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const dimensionListStr = selectedDimensions
         .map((d: any) => d.prompt)
         .join(", ");
@@ -10015,7 +10021,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const seedsStr = JSON.stringify(seeds);
       const prompt = `
         You are an IELTS Writing Tutor.
@@ -10128,7 +10133,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an IELTS Writing Specialist.
         Analyzing the IELTS Topic: "${question}" (Type: ${questionType})
@@ -10219,7 +10223,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an IELTS Writing Tutor specializing in logical coherence.
         Analyze this user's drafted paragraph:
@@ -10356,7 +10359,6 @@ Student says:
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an elite IELTS Writing Editor.
         Optimize this selected sentence from an essay draft:
@@ -11043,7 +11045,6 @@ CRITICAL — REDUCE OVERLAP / EASE PARAPHRASE (introStance + conclusion):
         return;
       }
 
-      const ai = getAI();
       const prompt = `
         You are an expert IELTS Writing Tutor.
         Analyze the user's sentence and return precise inline annotations for errors.
@@ -11256,7 +11257,6 @@ CRITICAL — REDUCE OVERLAP / EASE PARAPHRASE (introStance + conclusion):
         return;
       }
 
-      const ai = getAI();
       const isStartSentence = normalizedIntent === "start_sentence";
       const isLeftQuickAsk =
         !normalizedScopeText &&

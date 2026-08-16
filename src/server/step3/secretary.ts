@@ -236,10 +236,11 @@ export function landMinuteToSlot(
 
 /**
  * 校验 LLM 整理稿（防代写/加料）：不达标回退原文。
- *  - 相似度下限：LCS similarity(raw, polished) ≥ 0.45（下限防代写，无上限——整理本就该变美）
+ *  - 相似度下限：LCS similarity(raw, polished) ≥ 0.35（下限防代写，无上限——整理本就该变美）
  *  - 长度上限：polished.length ≤ raw.length × 2 + 8
- *  - 关键内容覆盖：polished 中 2+ 字中文片段 ≥60% 须出现在 raw 或槽位 label 中（防新增事实/语义）
- * 阈值先松后紧；误杀合理润色的安全回退是返回 null（看板显示原文）。
+ *  - 关键内容覆盖：polished 中 2+ 字中文片段 ≥50% 须出现在 raw 或槽位 label 中（防新增事实/语义）
+ * 阈值先松后紧（v0.5.2.1 松侧微调：相似度 0.45→0.35、覆盖率 0.55→0.50，接纳轻压缩润色，仍拦加料/整句重写）；
+ * 误杀合理润色的安全回退是返回 null（看板显示原文）。
  */
 export function validatePolishedText(
   raw: string,
@@ -251,8 +252,8 @@ export function validatePolishedText(
   if (!rawT || polT.length < 4) return null;
   if (polT === rawT) return rawT; // 无需整理，直接等同
   if (polT.length > rawT.length * 2 + 8) return null;
-  // 相似度下限（≥0.45）：2-gram Dice 对轻润色鲁棒，LCS 兜底（防词序打乱）。
-  if (bigramDice(rawT, polT) < 0.45 && similarity(polT, rawT) < 0.45) return null;
+  // 相似度下限（≥0.35）：2-gram Dice 对轻润色鲁棒，LCS 兜底（防词序打乱）。
+  if (bigramDice(rawT, polT) < 0.35 && similarity(polT, rawT) < 0.35) return null;
   const rawNorm = normalizeForCompare(rawT);
   const labelNorm = normalizeForCompare(slotLabel || '');
   // 新颖内容控制（防加料）：polished 的 2 字中文 bigram 中，出现在 raw 或槽位 label
@@ -265,7 +266,7 @@ export function validatePolishedText(
     const covered = bigrams.filter(
       (b) => rawNorm.includes(b) || labelNorm.includes(b),
     ).length;
-    if (covered / bigrams.length < 0.55) return null;
+    if (covered / bigrams.length < 0.5) return null;
   }
   return polT;
 }

@@ -144,7 +144,11 @@ export default function Step3Drafting({
             (s: any) => String(s.id) === String(targetSubpointId),
           );
           if (idx >= 0) subpoints[idx] = data.subpoint;
-          return { step3: { ...prev.step3, subpoints } } as Partial<PracticeSession>;
+          // 决策通道回传完成标志：本 body 已填满 / 整个 Step3 已完成（解锁 Step4）。
+          const isCompleted = data.step3Done || prev.step3?.isCompleted || false;
+          return {
+            step3: { ...prev.step3, subpoints, isCompleted },
+          } as Partial<PracticeSession>;
         });
       } else {
         fallback();
