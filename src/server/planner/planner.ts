@@ -133,6 +133,7 @@ export function collectPlannerInput(session: any, question: string, questionType
     plannerPayload,
     materials: {
       points,
+      layoutPreference: plannerPayload?.layoutPreference,
       stance: String(
         plannerPayload.stance?.text ||
           eval2.blueprint?.position ||

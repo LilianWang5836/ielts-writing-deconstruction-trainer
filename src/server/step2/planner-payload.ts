@@ -4132,6 +4132,11 @@ export function normalizeStep2PlannerPayload(args: {
     sideSettled: Array.isArray(prev?.sideSettled)
       ? [...prev.sideSettled]
       : undefined,
+    layoutPreference:
+      step2?.layoutPreference ||
+      step2?.plannerPayload?.layoutPreference ||
+      prev?.layoutPreference ||
+      undefined,
     stance: {
       text: stanceText,
       polarity,

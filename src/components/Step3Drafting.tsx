@@ -114,11 +114,46 @@ export default function Step3Drafting({
   // 同步 CoachChat 的 loading 状态（ref 更新不触发父组件重渲染，故用回调存本地 state）。
   const [coachLoading, setCoachLoading] = useState(false);
 
-  /** 确认当前 landed 待写板内容（发送纯「对」，由服务器秘书 commitPendingMinute）。 */
-  const confirmLanded = (targetSubpointId: string) => {
-    coachChatRef.current?.sendUserMessage("对", {
-      targetSubpointId,
-    });
+  /**
+   * 确认/拒绝当前 landed 待写板内容：优先走确定性 decision 通道（零 LLM 调用），
+   * 失败时回退原聊天路径（"对"/"不对"）。
+   */
+  const confirmLanded = async (
+    targetSubpointId: string,
+    decision: 'confirm' | 'reject' = 'confirm',
+  ) => {
+    const fallback = () =>
+      coachChatRef.current?.sendUserMessage(
+        decision === 'confirm' ? '对' : '不对',
+        { targetSubpointId },
+      );
+    try {
+      setCoachLoading(true);
+      const res = await fetch('/api/step3/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session, subpointId: targetSubpointId, decision }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.subpoint) {
+        onUpdateSession((prev) => {
+          const subpoints = Array.isArray(prev.step3?.subpoints)
+            ? [...prev.step3.subpoints]
+            : [];
+          const idx = subpoints.findIndex(
+            (s: any) => String(s.id) === String(targetSubpointId),
+          );
+          if (idx >= 0) subpoints[idx] = data.subpoint;
+          return { step3: { ...prev.step3, subpoints } } as Partial<PracticeSession>;
+        });
+      } else {
+        fallback();
+      }
+    } catch {
+      fallback();
+    } finally {
+      setCoachLoading(false);
+    }
   };
 
   const subpointsStr =
@@ -564,9 +599,11 @@ export default function Step3Drafting({
     const landedBySlot = new Map<string, string>();
     for (const m of sp.minutes || []) {
       if (!m?.slotKey) continue;
-      if (m.status === 'confirmed') confirmedBySlot.set(m.slotKey, m.text);
+      const view = (m as any).displayText || m.text;
+      const tagged = (m as any).thinTag ? `${view}（偏薄待补）` : view;
+      if (m.status === 'confirmed') confirmedBySlot.set(m.slotKey, tagged);
       else if (m.status === 'landed' && !confirmedBySlot.has(m.slotKey)) {
-        landedBySlot.set(m.slotKey, m.text);
+        landedBySlot.set(m.slotKey, tagged);
       }
     }
     const flatSlots: { key: string; label: string; placeholder: string; semantic: string }[] = [];

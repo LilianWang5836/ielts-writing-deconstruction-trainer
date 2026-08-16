@@ -14,6 +14,7 @@ import type {
   Step3LandingAuditEntry,
   Step3Minute,
   Step3Skeleton,
+  Step3Slot,
   Step3Subpoint,
 } from '../../types';
 import {
@@ -59,6 +60,21 @@ function similarity(a: string, b: string): number {
   // 最长公共子串长度 / 较长者长度（对中文口语近似重复足够敏感）
   const maxLen = longestCommonSubstr(a, b).length;
   return maxLen / longer.length;
+}
+
+/** 2-gram Dice 相似度（0-1）：对中文“加虚词/顺语序”的轻润色比 LCS 更鲁棒。 */
+function bigramDice(a: string, b: string): number {
+  const ga = (String(a).match(/[\u4e00-\u9fa5]/g) || []).join('');
+  const gb = (String(b).match(/[\u4e00-\u9fa5]/g) || []).join('');
+  if (ga.length < 2 || gb.length < 2) return 0;
+  const ba: string[] = [];
+  const bb: string[] = [];
+  for (let i = 0; i < ga.length - 1; i++) ba.push(ga.slice(i, i + 2));
+  for (let i = 0; i < gb.length - 1; i++) bb.push(gb.slice(i, i + 2));
+  const setB = new Set(bb);
+  let inter = 0;
+  for (const x of ba) if (setB.has(x)) inter++;
+  return (2 * inter) / (ba.length + bb.length);
 }
 
 function longestCommonSubstr(a: string, b: string): string {
@@ -117,7 +133,14 @@ export function appendMinute(
   subpoint: Step3Subpoint,
   role: 'student' | 'coach',
   text: string,
-  opts?: { slotKey?: string; status?: Step3Minute['status']; fromCoachAsk?: string; rejectReason?: string },
+  opts?: {
+    slotKey?: string;
+    status?: Step3Minute['status'];
+    fromCoachAsk?: string;
+    rejectReason?: string;
+    displayText?: string;
+    thinTag?: boolean;
+  },
 ): Step3Minute {
   const ts = Date.now();
   const minute: Step3Minute = {
@@ -127,6 +150,8 @@ export function appendMinute(
     ts,
     slotKey: opts?.slotKey,
     status: opts?.status || 'recorded',
+    ...(opts?.displayText ? { displayText: opts.displayText } : {}),
+    ...(opts?.thinTag ? { thinTag: true } : {}),
     ...(opts?.fromCoachAsk ? { fromCoachAsk: opts.fromCoachAsk } : {}),
     ...(opts?.rejectReason ? { rejectReason: opts.rejectReason } : {}),
   };
@@ -184,20 +209,157 @@ export function landMinuteToSlot(
   if (dup) {
     minute.status = 'rejected';
     minute.rejectReason = dup;
-    appendAudit(subpoint, minute.id, 'rejected', undefined, dup);
+    appendAudit(subpoint, minute.id, 'rejected', undefined, dup, {
+      verdict: 'duplicate',
+      source: 'content',
+    });
     return { ok: false, minuteId: minute.id, reason: dup };
   }
 
   minute.status = 'landed';
   minute.slotKey = target.slot.key;
   subpoint.activeSlotIndex = targetIndex;
-  appendAudit(subpoint, minute.id, 'landed', target.slot.key);
+  appendAudit(subpoint, minute.id, 'landed', target.slot.key, undefined, {
+    source: 'content',
+  });
   return {
     ok: true,
     minuteId: minute.id,
     slotKey: target.slot.key,
     blockIndex: target.blockIndex,
   };
+}
+
+// ------------------------------------------------------------
+// 2.5 整理稿校验 / 游标辅助（P0 — 恢复整理层 + 质量门控）
+// ------------------------------------------------------------
+
+/**
+ * 校验 LLM 整理稿（防代写/加料）：不达标回退原文。
+ *  - 相似度下限：LCS similarity(raw, polished) ≥ 0.45（下限防代写，无上限——整理本就该变美）
+ *  - 长度上限：polished.length ≤ raw.length × 2 + 8
+ *  - 关键内容覆盖：polished 中 2+ 字中文片段 ≥60% 须出现在 raw 或槽位 label 中（防新增事实/语义）
+ * 阈值先松后紧；误杀合理润色的安全回退是返回 null（看板显示原文）。
+ */
+export function validatePolishedText(
+  raw: string,
+  polished: string | undefined | null,
+  slotLabel?: string,
+): string | null {
+  const rawT = String(raw || '').trim();
+  const polT = String(polished || '').trim();
+  if (!rawT || polT.length < 4) return null;
+  if (polT === rawT) return rawT; // 无需整理，直接等同
+  if (polT.length > rawT.length * 2 + 8) return null;
+  // 相似度下限（≥0.45）：2-gram Dice 对轻润色鲁棒，LCS 兜底（防词序打乱）。
+  if (bigramDice(rawT, polT) < 0.45 && similarity(polT, rawT) < 0.45) return null;
+  const rawNorm = normalizeForCompare(rawT);
+  const labelNorm = normalizeForCompare(slotLabel || '');
+  // 新颖内容控制（防加料）：polished 的 2 字中文 bigram 中，出现在 raw 或槽位 label
+  // 中的比例 ≥0.55，否则认为引入了过多新词（很可能新增事实/语义）。用 2-gram 而非
+  // 完整片段，避免对“顺语序/加连词”这类合理润色产生误杀（先松后紧）。
+  const cjk = polT.replace(/[^\u4e00-\u9fa5]/g, '');
+  if (cjk.length >= 4) {
+    const bigrams: string[] = [];
+    for (let i = 0; i < cjk.length - 1; i++) bigrams.push(cjk.slice(i, i + 2));
+    const covered = bigrams.filter(
+      (b) => rawNorm.includes(b) || labelNorm.includes(b),
+    ).length;
+    if (covered / bigrams.length < 0.55) return null;
+  }
+  return polT;
+}
+
+/** 当前第一个未确认的空槽 key（与 landMinuteToSlot 的游标一致）。 */
+export function firstEmptySlotKey(subpoint: Step3Subpoint): string | null {
+  const skeleton = subpoint.skeleton;
+  if (!skeleton || skeleton.blocks.length === 0) return null;
+  const flat = skeletonFlatSlots(skeleton);
+  if (flat.length === 0) return null;
+  const confirmedKeys = new Set(
+    (subpoint.minutes || [])
+      .filter((m) => m.status === 'confirmed' && m.slotKey)
+      .map((m) => m.slotKey as string),
+  );
+  const start = Math.min(Math.max(subpoint.activeSlotIndex || 0, 0), flat.length - 1);
+  for (let i = start; i < flat.length; i++) {
+    if (!confirmedKeys.has(flat[i].slot.key)) return flat[i].slot.key;
+  }
+  return null;
+}
+
+/** 某槽已被质量门控 held（thin 等待追问）的次数，用于"至多 1 次追问后放行"。 */
+export function countHeldForSlot(subpoint: Step3Subpoint, slotKey: string): number {
+  return Array.isArray(subpoint.landingLog)
+    ? subpoint.landingLog.filter(
+        (e) => e.event === 'held' && e.slotKey === slotKey,
+      ).length
+    : 0;
+}
+
+/**
+ * P0-4 批量落槽：一条学生消息覆盖多个连续空槽时，拆成多条 minute 分别 landed。
+ * 必须满足：从 firstEmpty 起的连续空前缀、不跨 block、≤3 条；任一段 dup 预检失败
+ * → 整批不落（调用方回退单槽），保证确定性。source=batch 供评估闭环统计。
+ */
+export function landBatchToSlots(
+  subpoint: Step3Subpoint,
+  segments: string[],
+): { ok: boolean; landed: { slotKey: string; minuteId: string }[]; reason?: string } {
+  const skeleton = subpoint.skeleton;
+  if (!skeleton || skeleton.blocks.length === 0) {
+    return { ok: false, landed: [], reason: 'no_skeleton' };
+  }
+  if (!segments || segments.length < 2 || segments.length > 3) {
+    return { ok: false, landed: [], reason: 'bad_segments' };
+  }
+  const flat = skeletonFlatSlots(skeleton);
+  if (flat.length === 0) return { ok: false, landed: [], reason: 'no_slots' };
+
+  const occupied = new Set(
+    (subpoint.minutes || [])
+      .filter((m) => m.status === 'confirmed' || m.status === 'landed')
+      .map((m) => m.slotKey as string)
+      .filter(Boolean),
+  );
+
+  // 从 firstEmpty 起取连续 N 个空槽（同 block 内）。
+  let start = -1;
+  for (let i = 0; i < flat.length; i++) {
+    if (!occupied.has(flat[i].slot.key)) { start = i; break; }
+  }
+  if (start === -1) return { ok: false, landed: [], reason: 'all_slots_filled' };
+  const startBlock = flat[start].blockIndex;
+  const targets: { slot: Step3Slot; blockIndex: number; flatIndex: number }[] = [];
+  for (let i = start; i < flat.length && targets.length < segments.length; i++) {
+    const f = flat[i];
+    if (f.blockIndex !== startBlock) break; // 不跨 pointBlock
+    if (occupied.has(f.slot.key)) continue;
+    targets.push({ slot: f.slot, blockIndex: f.blockIndex, flatIndex: i });
+  }
+  if (targets.length < segments.length) {
+    return { ok: false, landed: [], reason: 'insufficient_consecutive_slots' };
+  }
+
+  // 逐段 dup 预检（对已 confirmed 兄弟）。
+  for (const seg of segments) {
+    const dup = checkDuplicate(subpoint.minutes || [], seg);
+    if (dup) return { ok: false, landed: [], reason: dup };
+  }
+
+  const landed: { slotKey: string; minuteId: string }[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const minute = appendMinute(subpoint, 'student', segments[i]);
+    minute.status = 'landed';
+    minute.slotKey = targets[i].slot.key;
+    // 游标语义与 landMinuteToSlot 一致：存展开后的槽位下标（非 blockIndex）。
+    subpoint.activeSlotIndex = targets[i].flatIndex;
+    appendAudit(subpoint, minute.id, 'landed', targets[i].slot.key, undefined, {
+      source: 'batch',
+    });
+    landed.push({ slotKey: targets[i].slot.key, minuteId: minute.id });
+  }
+  return { ok: true, landed };
 }
 
 // ------------------------------------------------------------
@@ -214,11 +376,16 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
   if (dup) {
     minute.status = 'rejected';
     minute.rejectReason = dup;
-    appendAudit(subpoint, minute.id, 'rejected', minute.slotKey, dup);
+    appendAudit(subpoint, minute.id, 'rejected', minute.slotKey, dup, {
+      verdict: 'duplicate',
+      source: 'affirm',
+    });
     return;
   }
   minute.status = 'confirmed';
-  appendAudit(subpoint, minute.id, 'confirmed', minute.slotKey);
+  appendAudit(subpoint, minute.id, 'confirmed', minute.slotKey, undefined, {
+    source: 'affirm',
+  });
   // 推进到下一个未填槽
   if (subpoint.skeleton) {
     const flat = skeletonFlatSlots(subpoint.skeleton);
@@ -234,12 +401,13 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
 }
 
 /** 记录一条落槽审计事件（P1）。确定性：追加到 subpoint.landingLog。 */
-function appendAudit(
+export function appendAudit(
   subpoint: Step3Subpoint,
   minuteId: string,
   event: Step3LandingAuditEntry['event'],
   slotKey?: string,
   reason?: string,
+  opts?: { verdict?: string; source?: string },
 ): void {
   if (!Array.isArray(subpoint.landingLog)) subpoint.landingLog = [];
   subpoint.landingLog.push({
@@ -248,6 +416,8 @@ function appendAudit(
     slotKey,
     reason,
     ts: Date.now(),
+    ...(opts?.verdict ? { verdict: opts.verdict } : {}),
+    ...(opts?.source ? { source: opts.source } : {}),
   });
 }
 
@@ -295,13 +465,18 @@ export function renderBoard(subpoint: Step3Subpoint): BoardView {
     const confirmed = minutes.find(
       (m) => m.status === 'confirmed' && m.slotKey === slotKey,
     );
+    const viewText = (m?: Step3Minute): string => {
+      if (!m) return '';
+      const base = m.displayText || m.text;
+      return m.thinTag ? `${base}（偏薄待补）` : base;
+    };
     return {
       key: slotKey,
       label: '',
       placeholder: '',
       semantic: '',
-      content: confirmed ? confirmed.text : '',
-      pending: landed ? landed.text : '',
+      content: viewText(confirmed),
+      pending: viewText(landed),
       status: confirmed ? 'confirmed' : landed ? 'draft' : 'empty',
     };
   };
@@ -352,6 +527,53 @@ export function activeSlotLabel(subpoint: Step3Subpoint): string {
 export function isSkeletonComplete(subpoint: Step3Subpoint): boolean {
   const board = renderBoard(subpoint);
   return board.isComplete;
+}
+
+// ------------------------------------------------------------
+// P1 结构透明：方案汇报 / 本段使命（纯文本投影，供教练开讲点题）
+// ------------------------------------------------------------
+
+/** 把 body 角色映射为自然中文（供方案汇报/点题，禁内部字段名）。 */
+export function formatBodyRoleZh(role: string): string {
+  const r = String(role || '').toLowerCase();
+  if (/conced/.test(r)) return '让步段';
+  if (/solution|solve/.test(r)) return '解决段';
+  if (/problem/.test(r)) return '问题段';
+  if (/view_a|viewa/.test(r)) return '观点A段';
+  if (/view_b|viewb/.test(r)) return '观点B段';
+  if (/evaluation|eval/.test(r)) return '评价段';
+  if (/main_argument|support|main/.test(r)) return '主论证段';
+  if (/opposite|against/.test(r)) return '对立面段';
+  return '论证段';
+}
+
+/**
+ * P1 方案汇报（纯文本投影，仅教练内部参考）：大白话列出各主体段的角色与论证主题。
+ * 教练开讲时用自己的话向学生自然汇报，不照抄、不每轮重复。
+ */
+export function renderPlanRecap(subpoints: Step3Subpoint[]): string {
+  if (!Array.isArray(subpoints) || subpoints.length === 0) return '';
+  const lines = subpoints.map((sp, i) => {
+    const role = String(sp?.argumentRelation || sp?.theme || '').trim();
+    const block = Array.isArray(sp?.skeleton?.blocks)
+      ? sp.skeleton.blocks[0]
+      : null;
+    const topic =
+      String(block?.subClaim || sp?.content || block?.label || sp?.theme || '').trim() ||
+      '（论点待定）';
+    return `- 第 ${i + 1} 段（${formatBodyRoleZh(role)}）：围绕「${topic}」展开`;
+  });
+  return `这一篇计划分 ${subpoints.length} 段：\n${lines.join('\n')}`;
+}
+
+/** P1 本段使命：当前 body 在方案中的角色 + 论证目标（开讲点题用）。 */
+export function formatActiveBodyMission(sp: Step3Subpoint | null | undefined): string {
+  if (!sp) return '（无活动主体段）';
+  const role = String(sp?.argumentRelation || sp?.theme || '').trim();
+  const block = Array.isArray(sp?.skeleton?.blocks) ? sp.skeleton.blocks[0] : null;
+  const target = String(block?.label || sp?.theme || '').trim();
+  const subClaim = String(block?.subClaim || sp?.content || '').trim();
+  return `本段（${formatBodyRoleZh(role)}）：论证「${subClaim || target || '（论点待定）'}」。`;
 }
 
 // ------------------------------------------------------------
@@ -434,14 +656,20 @@ function replayFromAuditLog(
     const rec = minutes.find((m) => m.id === minuteId);
     if (!rec) continue;
     const replayed: LandingReplayRow['replayed'] = {
-      slotKey: entry.event === 'rejected' ? undefined : entry.slotKey,
+      slotKey:
+        entry.event === 'rejected' || entry.event === 'held'
+          ? undefined
+          : entry.slotKey,
       status:
         entry.event === 'confirmed'
           ? 'confirmed'
           : entry.event === 'landed'
             ? 'landed'
-            : 'rejected',
-      rejectReason: entry.reason,
+            : entry.event === 'held'
+              ? 'recorded'
+              : 'rejected',
+      // 仅 rejected 事件把原因映射到 minute.rejectReason；held 只记在审计（recorded 无 rejectReason）。
+      rejectReason: entry.event === 'rejected' ? entry.reason : undefined,
     };
     const recorded: LandingReplayRow['recorded'] = {
       slotKey: rec.slotKey,

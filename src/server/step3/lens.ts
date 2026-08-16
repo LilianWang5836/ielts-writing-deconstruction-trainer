@@ -266,6 +266,53 @@ export function findSlotDef(
   return null;
 }
 
+// ------------------------------------------------------------
+// P0 质量门控：LLM 评估优先、确定性透镜兜底 → 落槽动作
+// ------------------------------------------------------------
+
+export interface LandingGate {
+  /** land=落槽；hold=暂不落槽（thin/off_target/off_topic）；reject=拒绝（duplicate）。 */
+  action: 'land' | 'hold' | 'reject';
+  verdict: string;
+  reason: string;
+  hint: string;
+}
+
+/**
+ * 质量门控决策（纯函数，可测试）。thin 的"至多 1 次追问后放行"由调用方按
+ * countHeldForSlot 处理——本函数只判定本条回答本身该 land/hold/reject。
+ *
+ * @param llmVerdict   LLM step3Assessment.verdict（仅当 slotKey 匹配当前槽时传入）
+ * @param llmReason    LLM reason（内部，不进学生文本）
+ * @param llmHint      LLM nextHint（给教练的追问方向，非模板）
+ */
+export function resolveLandingGate(params: {
+  text: string;
+  slot: Step3Slot | null;
+  confirmed: Step3Minute[];
+  chainType?: Step3Skeleton['chainType'];
+  llmVerdict?: string;
+  llmReason?: string;
+  llmHint?: string;
+}): LandingGate {
+  const { text, slot, confirmed, chainType, llmVerdict, llmReason, llmHint } = params;
+  if (!slot) {
+    // 无槽（骨架缺失/已满）：放行交 landMinuteToSlot 处理（no_slots / all_slots_filled 等）。
+    return { action: 'land', verdict: 'ok', reason: 'no_slot', hint: '' };
+  }
+  const lens = evaluateMinute(text, slot, confirmed, chainType);
+  const verdict = llmVerdict && slot ? llmVerdict : lens.verdict;
+  const reason = String(llmReason || lens.reason || '');
+  const hint = String(lens.hint || llmHint || '');
+  if (verdict === 'duplicate') {
+    return { action: 'reject', verdict, reason, hint };
+  }
+  if (verdict === 'off_target' || verdict === 'off_topic' || verdict === 'thin') {
+    return { action: 'hold', verdict, reason, hint };
+  }
+  return { action: 'land', verdict, reason, hint };
+}
+
 /** 汇总某 subpoint 已 confirmed 的 minutes。 */
 export function confirmedMinutes(subpoint: any): Step3Minute[] {
   return Array.isArray(subpoint?.minutes)

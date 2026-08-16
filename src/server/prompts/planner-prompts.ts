@@ -210,6 +210,13 @@ export function buildPlannerPrompt(input: {
       leanTags?: string[];
       retentionRole?: 'detail' | 'brief' | 'dropped' | string;
     }>;
+    /** P2 学生结构偏好（软参考，非硬约束）。 */
+    layoutPreference?: {
+      bodyCountPref?: number;
+      concessionOrder?: 'first' | 'last';
+      expansionPref?: string;
+      note?: string;
+    };
     stanceMeta?: { polarity?: string; strength?: string };
     coverage?: {
       requiredBuckets?: string[];
@@ -255,6 +262,7 @@ export function buildPlannerPrompt(input: {
 2. 题型：${input.questionType}
 3. 是否需要明确立场：${input.requiresStance ? '是' : '否'}
 4. 立场：${input.materials.stance || '（未明确）'}（polarity=${stanceMeta.polarity || 'unknown'}, strength=${stanceMeta.strength || 'unknown'}）
+${input.materials.layoutPreference ? `4.5 学生结构偏好（软参考，非硬约束；与下方材料硬约束冲突时以材料为准，并在 rationale 注明）：${JSON.stringify(input.materials.layoutPreference)}` : ''}
 5. 材料覆盖：required=${(coverage.requiredBuckets || []).join(',') || '无硬性双桶'}; filled=${(coverage.filledBuckets || []).join(',') || '无'}; missing=${(coverage.missingBuckets || []).join(',') || '无'}
 6. 材料摘要（供 bodyCount 动态判断，非死公式）：
 ${digest}

@@ -199,7 +199,15 @@ export interface Step3Skeleton {
 export interface Step3Minute {
   id: string;
   role: 'student' | 'coach';
+  /** 学生原话（唯一真相源；landingLog / replayLanding 一律以本字段为准）。 */
   text: string;
+  /**
+   * 校验通过后的 LLM 整理稿（仅看板显示；缺失或未通过校验则看板回退显示 text）。
+   * 整理稿绝不进真相源/重放——重放必须确定性，不重新调 LLM 生成。
+   */
+  displayText?: string;
+  /** 偏薄待补标记：thin 追问后仍薄而放行落槽时置 true（看板显示「（偏薄待补）」）。 */
+  thinTag?: boolean;
   ts: number;
   slotKey?: string;
   status: 'recorded' | 'landed' | 'confirmed' | 'rejected';
@@ -265,7 +273,7 @@ export interface Step3Subpoint {
   minutes?: Step3Minute[];
   /** 当前推进到第几个槽（skeleton 展开后的全局槽下标）。 */
   activeSlotIndex?: number;
-  /** 落槽审计事件日志（P1）：每次落槽/确认/拒绝的决策轨迹。
+  /** 落槽审计事件日志（P1）：每次落槽/确认/拒绝/held 的决策轨迹。
    *  分钟级可审计 + 支持从 minutes/日志重放落槽结果。 */
   landingLog?: Step3LandingAuditEntry[];
 }
@@ -274,14 +282,21 @@ export interface Step3Subpoint {
 export interface Step3LandingAuditEntry {
   /** 触发该决策的学生纪要 id（确认事件沿用被确认的 minuteId）。 */
   minuteId: string;
-  /** 决策类型：landed=落槽待确认；confirmed=确认写板；rejected=重复/无效拦截。 */
-  event: 'landed' | 'confirmed' | 'rejected';
-  /** 落到的槽 key（rejected 无）。 */
+  /**
+   * 决策类型：landed=落槽待确认；confirmed=确认写板；rejected=重复/无效拦截；
+   * held=质量门控暂不落槽（thin/off_target/off_topic/meta，等待教练追问或指回）。
+   */
+  event: 'landed' | 'confirmed' | 'rejected' | 'held';
+  /** 落到的槽 key（rejected / held 通常无）。 */
   slotKey?: string;
-  /** 拦截原因（仅 rejected）。 */
+  /** 拦截原因（仅 rejected / held）。 */
   reason?: string;
   /** 决策时刻（ms）。 */
   ts: number;
+  /** 决策时的质量 verdict（ok/thin/off_target/duplicate/off_topic/meta），供评估闭环统计。 */
+  verdict?: string;
+  /** 决策来源（affirm/reject/meta/content/batch/single），供评估闭环统计。 */
+  source?: string;
 }
 
 export interface LogicStep {
@@ -824,6 +839,16 @@ export interface Step2PlannerPayload {
   pendingProposal?: Step2Proposal | null;
   /** Side keys that already completed side_settle (详略+裁剪). */
   sideSettled?: string[];
+  /**
+   * P2 学生结构偏好（软参考，非硬约束）：Planner 优先采纳，但与材料硬约束
+   * 冲突时以材料为准（rationale 注明）。由 Step2 教练可选的结构问答捕获。
+   */
+  layoutPreference?: {
+    bodyCountPref?: number;
+    concessionOrder?: 'first' | 'last';
+    expansionPref?: string;
+    note?: string;
+  };
   stance: {
     text: string;
     polarity: Step2StancePolarity;
@@ -990,6 +1015,8 @@ export interface PlannerInput {
     coverage?: Step2PlannerPayload['coverage'];
     /** Soft one-line digest for dynamic bodyCount (not a hard lock). */
     materialDigest?: string;
+    /** P2 学生结构偏好（软参考，非硬约束）。 */
+    layoutPreference?: Step2PlannerPayload['layoutPreference'];
     /** @deprecated legacy text sides — compatibility only */
     aSide: string;
     bSide: string;

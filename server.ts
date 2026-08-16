@@ -99,18 +99,25 @@ import { buildCoachPrompt, parseCoachResponse } from "./src/server/coach/coach-a
 import { buildIntentPrompt, parseIntentResponse } from "./src/server/coach/intent-agent";
 import {
   appendMinute,
+  appendAudit,
   landMinuteToSlot,
+  landBatchToSlots,
   commitPendingMinute,
   renderBoard,
   activeSlotLabel,
   isSkeletonComplete,
   detectStall,
+  firstEmptySlotKey,
+  countHeldForSlot,
+  validatePolishedText,
+  renderPlanRecap,
+  formatActiveBodyMission,
 } from "./src/server/step3/secretary";
 import {
-  evaluateMinute,
   findSlotDef,
   confirmedMinutes,
   formatLensAnchor,
+  resolveLandingGate,
 } from "./src/server/step3/lens";
 import { toSkeleton, planToSkeleton, skeletonFlatSlots } from "./src/utils/step3Skeleton";
 import { log } from "./src/server/logger";
@@ -3609,6 +3616,12 @@ function formatStep3SlotCursorForPrompt(activeSp: any): string {
     }`,
     `- skeleton completion: ${confirmedKeys.size}/${flat.length} slots confirmed`,
   ];
+  const gateHint = activeSp?.lastGateHint;
+  if (gateHint && gateHint.hint) {
+    lines.push(
+      `- 上轮门控提示（学生回答被判 ${gateHint.verdict}，供你自然措辞，勿照抄）：${String(gateHint.hint).slice(0, 140)}`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -4231,6 +4244,75 @@ function enforceStep3LogicCompletion(
 }
 
 /**
+ * meta 发言（"我前面已经说过了啊"等）：不落槽，指回历史。
+ * 先宽后紧——宁判不定交 LLM，也不把抱怨当内容落槽（产品反馈④）。
+ */
+const META_PATTERNS: RegExp[] = [
+  /^我(前面|刚才|之前|上面|刚|早就|不是)?(已经)?(说|讲|答|写|提)(过|了)/,
+  /^已经(说|写|确认|答)(过|了)/,
+  /^这个(刚才|之前)?(说|答|写)(过|了)/,
+  /^刚才(已经)?(说|答|写)(过|了)/,
+  /^上面(已经)?(说|答|写)(过|了)/,
+  /^(重复了|重复啊|说过啊|说过了呀)/,
+  /^问过了/,
+  /再说一遍/,
+];
+
+function isMetaComment(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return META_PATTERNS.some((re) => re.test(t));
+}
+
+/**
+ * meta 发言的教练指回提示：引用该 subpoint 最近一条学生原话，让教练"接得住"
+ * 而不是失忆式重问；若原话与当前槽不匹配，明确指出还缺哪一环。
+ */
+function buildMetaHint(sp: any): string {
+  const minutes = Array.isArray(sp?.minutes) ? sp.minutes : [];
+  const slotLabel = activeSlotLabel(sp);
+  // 当前槽已有 landed 草稿 → 引导确认写入，而不是重新问（"失忆"最常见形态）。
+  const pending = minutes.find((m: any) => m.status === "landed");
+  if (pending) {
+    return `学生认为已说过。当前槽（${slotLabel || "未知"}）已有待确认草稿「${String(
+      pending.text || "",
+    ).slice(0, 60)}」：请引导学生点【确认】写入，或明确指出还缺哪一环——不要再重复问同一个问题。`;
+  }
+  const lastStudent = [...minutes]
+    .reverse()
+    .find((m: any) => m.role === "student");
+  const lastText = lastStudent ? String(lastStudent.text || "").trim() : "";
+  if (lastText) {
+    return `学生认为已说过。最近一条学生原话「${lastText.slice(
+      0,
+      60,
+    )}」：若与当前槽（${slotLabel || "未知"}）匹配，引用它回填并请确认；否则明确指出还缺哪一环，不要原样重问。`;
+  }
+  return `学生认为已说过。请引用历史原话回填当前槽（${slotLabel || "未知"}）并请确认，或明确指出还缺哪一环。`;
+}
+
+/**
+ * P0-4 批量分段校验：LLM 声明的 beats 必须是 msg 的子串（按序、不重叠、覆盖主体≥60%）。
+ * 校验失败返回 null（回退单槽落槽）。
+ */
+function parseBatchBeats(msg: string, beats: unknown): string[] | null {
+  if (!Array.isArray(beats)) return null;
+  const segs = beats
+    .map((b: any) => String(b || "").trim())
+    .filter((s) => s.length >= 4);
+  if (segs.length < 2 || segs.length > 3) return null;
+  let pos = 0;
+  for (const s of segs) {
+    const idx = msg.indexOf(s, pos);
+    if (idx < 0) return null;
+    pos = idx + s.length;
+  }
+  const covered = segs.join("").length;
+  if (covered / msg.length < 0.6) return null;
+  return segs;
+}
+
+/**
  * 会议秘书路径（restructure 新架构）。
  *
  * 学生说什么 → 记 minutes（真相源）→ 确定性落槽 → 确认写板。
@@ -4269,48 +4351,218 @@ function enforceStep3SecretaryPath(
   const isAff = /^(对|好|是|嗯|可以|同意|采纳|确认|行|就按|确认写入|点击确认|确认提交)[。.!！?？]?$/.test(msg) || /确认写入|点击确认/.test(msg);
   const isRej = /^(不对|不好|不是|重说|重写|换一个|去掉|不要|改一下|重新说)[。.!！?？]?$/.test(msg) || /拒绝|否决|撤销/.test(msg);
 
-  // 找当前 landed 待确认纪要（若有）
-  const landed = (sp.minutes || []).find((m: any) => m.status === "landed");
+  // 当前 landed 待确认纪要（单条或批量多条）
+  const landedList = (sp.minutes || []).filter((m: any) => m.status === "landed");
 
-  if (isAff && landed) {
-    // 确认 → 写板
-    commitPendingMinute(sp, landed);
+  if (isAff && landedList.length > 0) {
+    // 确认 → 写板（支持批量：一条消息覆盖多槽时一次全过）。
+    const confirmedIds: string[] = [];
+    for (const lm of landedList) {
+      commitPendingMinute(sp, lm);
+      if (lm.status === "confirmed") confirmedIds.push(lm.id);
+    }
     data.progressUpdate.step3SubpointCompleted = isSkeletonComplete(sp);
     data.progressUpdate.isCompleted = data.progressUpdate.step3SubpointCompleted;
     data.progressUpdate.secretaryBoard = renderBoard(sp);
     data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
     console.warn(
-      `[Secretary] AFFIRM minute=${landed.id} slotKey=${landed.slotKey} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
+      `[Secretary] AFFIRM x${confirmedIds.length} minutes=${confirmedIds.join(",")} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
     );
     return;
   }
 
   if (isRej) {
-    // 拒绝 → 该条 landed 回退为 recorded，不写板
-    if (landed) {
+    // 拒绝 → 全部 landed 回退为 recorded，不写板（支持批量）
+    for (const lm of landedList) {
       console.warn(
-        `[Secretary] REJECT minute=${landed.id} slotKey=${landed.slotKey} → reverted to recorded`,
+        `[Secretary] REJECT minute=${lm.id} slotKey=${lm.slotKey} → reverted to recorded`,
       );
-      landed.status = "recorded";
-      landed.slotKey = undefined;
+      lm.status = "recorded";
+      lm.slotKey = undefined;
     }
     data.progressUpdate.secretaryBoard = renderBoard(sp);
     data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
     return;
   }
 
-  // 实质回答 → 记纪要并尝试落槽
-  const minute = appendMinute(sp, "student", msg);
-  const land = landMinuteToSlot(sp, minute);
-  if (land.ok) {
-    // 已落为 landed（draft），等学生确认
+  // ---- 实质回答 / 元评论：记纪要并按质量门控落槽（P0）----
+  // 本地渲染辅助：统一回传看板 + 未完成标记。
+  const renderNow = (): void => {
     data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    data.progressUpdate.secretaryBoard = renderBoard(sp);
+    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+  };
+
+  // 元评论（"我前面已经说过了啊"）→ 不落槽，记录 + 审计 + 给教练指回提示。
+  if (isMetaComment(msg)) {
+    const metaMinute = appendMinute(sp, "student", msg);
+    appendAudit(sp, metaMinute.id, "held", undefined, "meta 发言，不落槽", {
+      verdict: "meta",
+      source: "meta",
+    });
+    const metaHint = buildMetaHint(sp);
+    data.progressUpdate.secretaryMetaHint = metaHint;
+    sp.lastGateHint = { verdict: "meta", hint: metaHint, slotKey: null };
     console.warn(
-      `[Secretary] LANDED minute=${minute.id} slotKey=${land.slotKey} activeSlotIndex=${sp.activeSlotIndex}`,
+      `[Secretary] META minute=${metaMinute.id} 不落槽（学生指回历史）。`,
     );
+    renderNow();
+    return;
+  }
+
+  // LLM 意图解析（模糊情形兜底，P0-3 后半）：确定性正则已覆盖清晰的 确认/拒绝/meta，
+  // 这里只处理正则漏网的 meta / question。intent 是消息级判断，不要求 slotKey 匹配。
+  // 失败不对称原则：宁可把可疑发言 hold 一轮（学生下轮可澄清），也不把抱怨/提问当内容落槽。
+  const llmIntent =
+    data.step3Assessment && typeof data.step3Assessment === "object"
+      ? String(data.step3Assessment.intent || "").trim()
+      : "";
+  if (llmIntent === "meta") {
+    const metaMinute = appendMinute(sp, "student", msg);
+    appendAudit(sp, metaMinute.id, "held", undefined, "meta 发言（LLM 意图判定），不落槽", {
+      verdict: "meta",
+      source: "meta",
+    });
+    const metaHint = buildMetaHint(sp);
+    data.progressUpdate.secretaryMetaHint = metaHint;
+    sp.lastGateHint = { verdict: "meta", hint: metaHint, slotKey: null };
+    console.warn(
+      `[Secretary] META(llm) minute=${metaMinute.id} 不落槽（学生指回历史）。`,
+    );
+    renderNow();
+    return;
+  }
+  if (llmIntent === "question") {
+    const qMinute = appendMinute(sp, "student", msg);
+    appendAudit(sp, qMinute.id, "held", undefined, "学生反问（LLM 意图判定），不落槽", {
+      verdict: "question",
+      source: "question",
+    });
+    const qHint =
+      "学生在向你提问，不是回答当前槽。请先用 1–2 句直接回答学生的问题，再自然回到当前槽的引导——不要把这个问题当内容处理。";
+    data.progressUpdate.secretaryLensHint = qHint;
+    sp.lastGateHint = { verdict: "question", hint: qHint, slotKey: null };
+    console.warn(`[Secretary] QUESTION(llm) minute=${qMinute.id} 不落槽。`);
+    renderNow();
+    return;
+  }
+
+  // 目标槽 + 质量门控（LLM 评估优先，确定性透镜兜底）。
+  const targetKey = firstEmptySlotKey(sp);
+  const slotDef = targetKey ? findSlotDef(sp.skeleton, targetKey) : null;
+  const llmAssess =
+    data.step3Assessment &&
+    typeof data.step3Assessment === "object" &&
+    data.step3Assessment.slotKey === targetKey
+      ? data.step3Assessment
+      : null;
+  const gate = resolveLandingGate({
+    text: msg,
+    slot: slotDef,
+    confirmed: confirmedMinutes(sp),
+    chainType: sp.skeleton?.chainType,
+    llmVerdict: llmAssess?.verdict,
+    llmReason: llmAssess?.reason,
+    llmHint: llmAssess?.nextHint,
+  });
+  const displayText = llmAssess?.polishedText
+    ? validatePolishedText(msg, llmAssess.polishedText, slotDef?.label)
+    : null;
+
+  console.warn(
+    `[SecretaryGate] slot=${targetKey} verdict=${gate.verdict} llm=${llmAssess ? "yes" : "no"} polished=${displayText ? "yes" : "no"} reason=${String(gate.reason).slice(0, 40)}`,
+  );
+
+  // reject（duplicate）→ 不 landed。
+  if (gate.action === "reject") {
+    const minute = appendMinute(sp, "student", msg, {
+      status: "rejected",
+      rejectReason: gate.reason || "duplicate",
+    });
+    appendAudit(sp, minute.id, "rejected", undefined, minute.rejectReason, {
+      verdict: gate.verdict,
+      source: "content",
+    });
+    data.progressUpdate.secretaryRejectReason = minute.rejectReason;
+    sp.lastGateHint = {
+      verdict: gate.verdict,
+      hint: gate.hint || "这一点已记录过了，请引导学生换一个新的角度或环节，不要复读。",
+      slotKey: targetKey,
+    };
+    renderNow();
+    return;
+  }
+
+  // hold（off_target / off_topic / thin 首轮）→ 不 landed，等教练追问/指回。
+  const firstThin =
+    gate.verdict === "thin" &&
+    !!targetKey &&
+    countHeldForSlot(sp, targetKey) === 0;
+  if (gate.action === "hold" && (gate.verdict !== "thin" || firstThin)) {
+    const minute = appendMinute(sp, "student", msg);
+    appendAudit(
+      sp,
+      minute.id,
+      "held",
+      targetKey ?? undefined,
+      gate.reason || gate.verdict,
+      { verdict: gate.verdict, source: "content" },
+    );
+    const holdHint =
+      gate.hint ||
+      (gate.verdict === "thin"
+        ? "这一步还偏薄，请再补一句具体内容。"
+        : "这一步回答的是其他环节，请回到当前槽。");
+    data.progressUpdate.secretaryLensHint = holdHint;
+    sp.lastGateHint = { verdict: gate.verdict, hint: holdHint, slotKey: targetKey };
+    console.warn(
+      `[Secretary] HELD minute=${minute.id} verdict=${gate.verdict}（不落槽，等教练追问/指回）。`,
+    );
+    renderNow();
+    return;
+  }
+
+  // land（ok，或 thin 追问后仍薄 → 带「偏薄待补」标记）。
+  // P0-4 批量：LLM 声明覆盖多个连续空槽时优先批量落槽（一次确认），校验失败回退单槽。
+  if (gate.verdict === "ok" && llmAssess?.beats) {
+    const segs = parseBatchBeats(msg, llmAssess.beats);
+    if (segs) {
+      const batch = landBatchToSlots(sp, segs);
+      if (batch.ok) {
+        data.progressUpdate.step3SubpointCompleted = false;
+        console.warn(
+          `[Secretary] BATCH-LANDED x${batch.landed.length} minutes=${batch.landed.map((x) => x.minuteId).join(",")} slots=${batch.landed.map((x) => x.slotKey).join(",")}`,
+        );
+        renderNow();
+        return;
+      }
+      console.warn(`[Secretary] BATCH fallback single (${batch.reason})`);
+    }
+  }
+
+  const minute = appendMinute(sp, "student", msg, {
+    displayText: displayText || undefined,
+    thinTag: gate.verdict === "thin",
+  });
+  const land = landMinuteToSlot(sp, minute);
+  data.progressUpdate.step3SubpointCompleted = false;
+  if (land.ok) {
+    console.warn(
+      `[Secretary] LANDED minute=${minute.id} slotKey=${land.slotKey} thinTag=${minute.thinTag ? 1 : 0} activeSlotIndex=${sp.activeSlotIndex}`,
+    );
+    if (gate.verdict === "thin") {
+      const thinAcceptHint =
+        gate.hint || "这一步已带「偏薄待补」标记，可先确认，后续再补充具体内容。";
+      data.progressUpdate.secretaryLensHint = thinAcceptHint;
+      sp.lastGateHint = {
+        verdict: "thin_accepted",
+        hint: thinAcceptHint,
+        slotKey: land.slotKey,
+      };
+    }
   } else {
     // rejected / 无空槽 / 无骨架 → 记录但看板不变
-    data.progressUpdate.step3SubpointCompleted = false;
     if (land.reason) {
       data.progressUpdate.secretaryRejectReason = land.reason;
       console.warn(
@@ -4319,35 +4571,7 @@ function enforceStep3SecretaryPath(
     }
   }
 
-  // P2 判断透镜：对本次实质回答做确定性质量评估（审计 + 记录 LLM 评估）。
-  try {
-    const landedSlotKey = land.ok ? land.slotKey : minute.slotKey;
-    const slotDef = findSlotDef(sp.skeleton, String(landedSlotKey || ""));
-    if (slotDef) {
-      const lens = evaluateMinute(
-        msg,
-        slotDef,
-        confirmedMinutes(sp),
-        sp.skeleton?.chainType,
-      );
-      const llmAssessment = data.step3Assessment &&
-        typeof data.step3Assessment === "object" &&
-        data.step3Assessment.slotKey === landedSlotKey
-        ? data.step3Assessment
-        : null;
-      console.warn(
-        `[Lens] minute=${minute.id} slotKey=${landedSlotKey} verdict=${lens.verdict} reason=${lens.reason}${llmAssessment ? ` | llm=${llmAssessment.verdict} (${String(llmAssessment.reason || '').slice(0, 30)})` : ""}`,
-      );
-      // 太薄 / 跑题：给教练一个可选的追问提示（不作为模板，由教练自由措辞）。
-      if (lens.verdict === "thin" || lens.verdict === "off_target") {
-        data.progressUpdate.secretaryLensHint = lens.hint || "";
-      }
-    }
-  } catch (e: any) {
-    console.warn(`[Lens] error: ${e?.message || e}`);
-  }
-
-  // P3 教练卡死检测：同一槽连续 landed 未 confirmed → 无进展报警（只拦确定性）。
+  // P3 教练卡死检测：同一槽连续 landed 未 confirmed → 报警 + 向下一轮注入强制行为约束。
   try {
     const stall = detectStall(sp);
     if (stall.stalled) {
@@ -4357,8 +4581,16 @@ function enforceStep3SecretaryPath(
         attempts: stall.attempts,
         level: stall.level,
       };
+      // stall 升级（终版方案 P0-3）：不再只报警——下一轮教练必须换策略，
+      // 禁止原样重问。经 lastGateHint 注入下一轮上下文（formatStep3SlotCursorForPrompt）。
+      const stallHint = `检测到当前槽「${stall.slotLabel || "未知"}」已连续 ${stall.attempts} 次未确认（原地打转）。下一轮禁止原样重问同一问题，必须二选一：(a) 换角度/降维重问（举别的例子示范这一环长什么样）；(b) 若已有待确认草稿或学生此前已给出可用内容，直接引用原话并请学生点【确认】写入。`;
+      sp.lastGateHint = {
+        verdict: "stall",
+        hint: stallHint,
+        slotKey: stall.slotKey,
+      };
       console.warn(
-        `[StallGuard] ${stall.level} 卡死疑似：槽「${stall.slotLabel}」连续 ${stall.attempts} 次未确认（confirmed 未推进）。`,
+        `[StallGuard] ${stall.level} 卡死疑似：槽「${stall.slotLabel}」连续 ${stall.attempts} 次未确认（confirmed 未推进）。已注入强制换策略提示。`,
       );
     }
   } catch (e: any) {
@@ -7915,6 +8147,10 @@ ${step2Summary}
 - Paragraph Drafts: ${step3Draft || "Not provided"}
 - Body 摘要（各主体段主题 + 已确认槽数；不展开 minutes）:
 ${formatStep3SubpointsBrief(step3Subpoints)}
+- Essay Plan Recap (INTERNAL — 大白话整体方案，仅供开讲时向学生自然汇报，不要照抄、不要每轮重复):
+${renderPlanRecap(step3Subpoints) || "（暂无）"}
+- Active Body Mission (INTERNAL — 本段在方案中的角色与论证目标，开讲点题用；勿报字段名):
+${formatActiveBodyMission(activeStep3Subpoint)}
 - Active Subpoint (= starting claim for this turn): ${activeStep3Claim || "Not selected / not provided"}
 - Active Subpoint belongs to: ${activeStep3Subpoint?.targetBody || "Unknown"}
 - Step 2 Body Framework for Active Subpoint (INTERNAL — the frozen skeleton for this body; do not echo field names to student):
@@ -8250,6 +8486,11 @@ ${memoryDigestStr}
 
   4. Stage "summary": Confirm flat material pool (NOT paragraph layout)
      - Allowed Actions: List the parallel points + confirmed stance; check each point is concrete enough (scene/mechanism) or tagged 待补例子.
+     - P2 STRUCTURE PREFERENCE (可选结构问答，软参考，≤1 轮): After stance is locked, you MAY ask ONE optional, plain-language structure question whose answer genuinely helps the Planner pick a layout. Pick at most ONE of:
+         · 段数：material could go 2 or 3 bodies → e.g. "这两个点都够扎实，你希望分成两段各写一段，还是并成一段主次分明？"
+         · 让步段位置：stance needs a concession → e.g. "让步放在最后收尾，还是放前面先承认再反驳？"
+         · 展开角度：a point can be argued several ways → e.g. "这个点你想用具体场景讲（举例），还是把因果机制讲透？"
+       Rules: 至多 1 轮；学生可答「你定/随便」或直接进入下一步（**软参考，非硬门禁**）；问题必须基于学生自己的材料，禁止用内部字段名；材料无明显两可时就跳过不问。把学生答案写入 progressUpdate.step2Data.plannerPayload.layoutPreference = { bodyCountPref?, concessionOrder?, expansionPref?, note? }（软参数，Planner 优先采纳、与材料硬约束冲突时以材料为准）。这一步只补充偏好，不改材料池/立场。
      - FORBIDDEN in Step2 (HARD): deciding Body Paragraph 1/2/3, assigning points into bodies, evaluating "写作难度/篇幅" per body, or telling the student the essay skeleton. That is Step 2.5 Planner's job after isCompleted.
      - Student-facing summary: numbered FLAT points (①②③…), each one claim; do NOT label them as 主体段 / Body Paragraph.
      - Retention tags in userPoints (已选详写/已选略写/用户放弃/待补例子) still matter for which points to keep — record dropped/merged in clustering.outliers only if needed; do NOT build clusters.targetBody.
@@ -8339,6 +8580,8 @@ ${memoryDigestStr}
   - Keep it human: vary openers, no filler superlatives, no meta-commentary about the board/write process (「确认前不会写入右侧」类禁止), no English translations.
   - SINGLE-SUBPOINT SCOPE: each reply serves ONLY the current Active Subpoint. Do not start the next body or ask "我们接着写第二个分论点吧" — switching bodies is the UI's job.
   - No-spoiler acknowledgment: Part 1 may name WHICH slot the answer fills, but must NOT explain why it works or spell out the reasoning chain for the student (that reasoning is their own thinking practice).
+  - P1 OPENING RECAP (开讲点题，CRITICAL): When this turn is a BODY OPENING (kickoff / first question of a body), open with ONE plain sentence stating THIS body's mission — use "Active Body Mission" in ContextSummary (e.g. "这一段我们论证线上学习的优势——你通勤/午休碎片化学习的材料最具体。"). If this is the FIRST body of the essay, also present the overall plan briefly (see "Essay Plan Recap") in 1–2 plain sentences in your own words (e.g. "这一篇我们写两段：第一段展开优势，第二段让步收尾。"), then immediately ask the first empty slot. Do NOT repeat the plan recap in later turns.
+  - P3 JUDGMENT IN DIALOGUE (判断进对话): When the PREVIOUS turn's answer was judged thin/off_target/duplicate (see "上轮门控提示" in the slot cursor), Part 1 should give the student ONE short professional reason WHY, phrased in your own words — e.g. thin → "这句还停在'很灵活'，没落到具体场景或机制"; off_target → "你答的是展开原因，这一步要的是分论点"; duplicate → "这一点刚才已经记下了". Then ask the ONE follow-up / guide to confirm. Never read the hint verbatim, never open with empty praise, never just repeat "请再说具体一点".
   - CRITICAL — NO INTERNAL JARGON IN CHAT TEXT: never quote slot/field names like paragraphPlan / pointBlock / mode / step / slot / firstEmpty / skeleton in student-facing text. Use natural Chinese (这一步 / 展开原因 / 举个例子 / 影响).
   - If every slot in the current body's skeleton is confirmed (server tells you via the board), give a one-line closure and let the UI handle body switching / Step 4 CTA. Do not fabricate completion yourself.
   - FORBIDDEN in student-facing text: 「不会写入右侧」「确认前不会写入右侧」「说清楚后我们再整理确认」and similar board-process meta. Guide the argument; the server silently handles pending/write.
@@ -8459,7 +8702,7 @@ JSON Output Schema rules:
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
   - For Step 3: STRUCTURE IS FULLY SERVER-OWNED (meeting secretary). The server owns the frozen skeleton, lands the student's words into slots, and writes the board after confirm. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / any structure JSON in Step 3. Your ONLY job in Step 3 is a high-quality Socratic dialogue "text": read the Step 3 slot cursor in ContextSummary (firstEmpty label / confirmed siblings / pending), ask the first still-missing slot in natural Chinese, briefly acknowledge the student's answer, and guide them to confirm. Do not waste output tokens fabricating structure that the server already manages deterministically.
-  - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. This is INTERNAL (server uses it for audit + hints) — never echo it in "text". Keep it optional; "text" remains your priority.
+  - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint?, polishedText?, intent?, beats? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. Optionally include "polishedText": a LIGHT language-only polish of the student's answer for the board display (remove filler, smooth word order, supply elided subject) — NEVER add any fact/claim/meaning the student did not say; empty when no polish is needed. Optionally include "beats": when ONE student message covers MULTIPLE consecutive empty slots of the same body (e.g. claim + its reason), list the segments (each a substring of the message, in order) so the server batch-lands them for a single confirm — omit when the answer covers one slot only. Optionally include "intent" ONLY when the message is semantically ambiguous (meta/question/correction); the server's deterministic rules already cover clear affirm/reject/meta. These fields are INTERNAL (server uses them for landing/audit/hints) — never echo them in "text". Keep them optional; "text" remains your priority.
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
@@ -8491,7 +8734,7 @@ Student says:
               step3Assessment: {
                 type: Type.OBJECT,
                 description:
-                  "Step 3 ONLY. Optional structured quality assessment of the student's latest answer against the current slot (judgment lens). Server uses it for audit + next-turn lens hints. Omit or emit minimal when not Step 3.",
+                  "Step 3 ONLY. Optional structured quality assessment of the student's latest answer against the current slot (judgment lens). Server uses it for landing gate + audit + next-turn lens hints. Omit or emit minimal when not Step 3.",
                 properties: {
                   slotKey: {
                     type: Type.STRING,
@@ -8511,6 +8754,23 @@ Student says:
                     type: Type.STRING,
                     description:
                       "Optional one-line coaching direction for the next question (NOT a template; the coach phrases it naturally). Empty when verdict=ok.",
+                  },
+                  polishedText: {
+                    type: Type.STRING,
+                    description:
+                      "Step 3 ONLY, optional. A LIGHT language-only polish of the student's latest answer for board display: remove filler words, smooth word order, supply elided subject. FORBIDDEN: adding any new fact/claim/meaning the student did not say. The server validates (similarity/length/keyword coverage) and falls back to the original text if invalid. Empty when no polish is needed.",
+                  },
+                  intent: {
+                    type: Type.STRING,
+                    enum: ["content", "affirm", "reject", "meta", "question", "correction"],
+                    description:
+                      "Step 3 ONLY, optional. Semantic intent of the student's latest message when the server's deterministic regex cannot classify it (ambiguous only). content=real answer; affirm=agreeing/confirming; reject=rejecting; meta=complaint like 'I already said this earlier'; question=student asks a question; correction=revising/correcting prior content.",
+                  },
+                  beats: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description:
+                      "Step 3 ONLY, optional. When ONE student message covers MULTIPLE consecutive empty slots of the same body (e.g. both the claim and its reason), list the segments here — each a substring of the student's message, in order. The server validates (consecutive empties from firstEmpty, same block, ≤3) and batch-lands them for one confirm; invalid input falls back to single-slot landing. Omit when the answer covers only one slot.",
                   },
                 },
                 required: ["slotKey", "verdict", "reason"],
@@ -9197,6 +9457,60 @@ Student says:
       res
         .status(500)
         .json({ error: error.message || "Failed to generate chat response" });
+    }
+  });
+
+  // P0-5 会议秘书决策通道：Step3「确认写板/拒绝」按钮走确定性 decision，零 LLM 调用。
+  app.post("/api/step3/decision", async (req, res) => {
+    try {
+      const { session, subpointId, decision } = req.body;
+      if (!session || !subpointId || !decision) {
+        res
+          .status(400)
+          .json({ error: "Missing session, subpointId, or decision" });
+        return;
+      }
+      const step3 = session?.step3;
+      const sp = Array.isArray(step3?.subpoints)
+        ? step3.subpoints.find((s: any) => String(s.id) === String(subpointId))
+        : null;
+      if (!sp || !Array.isArray(sp.skeleton?.blocks)) {
+        res
+          .status(400)
+          .json({ error: "subpoint not found or no frozen skeleton" });
+        return;
+      }
+      if (!Array.isArray(sp.minutes)) sp.minutes = [];
+      const landedList = sp.minutes.filter((m: any) => m.status === "landed");
+      if (decision === "confirm") {
+        for (const lm of landedList) commitPendingMinute(sp, lm);
+        console.warn(
+          `[Step3Decision] confirm subpoint=${subpointId} x${landedList.length} → confirmed=${sp.minutes.filter((m: any) => m.status === "confirmed").length}`,
+        );
+      } else if (decision === "reject") {
+        for (const lm of landedList) {
+          lm.status = "recorded";
+          lm.slotKey = undefined;
+        }
+        console.warn(
+          `[Step3Decision] reject subpoint=${subpointId} x${landedList.length}（回退 recorded）`,
+        );
+      } else {
+        res.status(400).json({ error: "decision must be confirm|reject" });
+        return;
+      }
+      res.json({
+        subpoint: sp,
+        board: renderBoard(sp),
+        activeSlotLabel: activeSlotLabel(sp),
+        isComplete: isSkeletonComplete(sp),
+        confirmedCount: sp.minutes.filter(
+          (m: any) => m.status === "confirmed",
+        ).length,
+      });
+    } catch (error: any) {
+      console.error("Error in /api/step3/decision:", error?.message || error);
+      res.status(500).json({ error: error?.message || "Failed to commit decision" });
     }
   });
 
