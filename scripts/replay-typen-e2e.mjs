@@ -411,7 +411,9 @@ async function runQuestionType(cfg) {
     archiveLines.push(`[学生] ${user}`);
     if (p1) archiveLines.push(`[教练P1] ${p1}`);
     if (p2) archiveLines.push(`[教练P2] ${p2}`);
-    const pl = data?.progressUpdate?.paragraphPlan;
+    // 真实契约：paragraphPlan 挂在客户端构建的 subpoint 上（随 step3SecretarySubpoints 往返），
+    // 而非 progressUpdate 顶层。服务端秘书路径不保证回显 progressUpdate.paragraphPlan。
+    const pl = data?.progressUpdate?.paragraphPlan || sp.paragraphPlan;
     if (pl && Array.isArray(pl.pointBlocks)) {
       archiveLines.push(
         `[plan] mode=${pl.mode} blocks=${pl.pointBlocks
@@ -461,7 +463,10 @@ async function runQuestionType(cfg) {
     if (/^对$/.test(reply.trim())) break;
   }
 
-  const plan = resp.progressUpdate?.paragraphPlan;
+  // 断言：① 守卫应保证 paragraphPlan 存在且 active body mapped 点被覆盖
+  // 真实契约：paragraphPlan 在客户端构建的 subpoint 上（sp.paragraphPlan），
+  // 服务端秘书路径以 step3SecretarySubpoints 回显；progressUpdate 顶层不保证。
+  const plan = resp.progressUpdate?.paragraphPlan || sp.paragraphPlan || null;
   const blocks = Array.isArray(plan?.pointBlocks) ? plan.pointBlocks : [];
   const jargon = chatJargonHits(resp.text);
 

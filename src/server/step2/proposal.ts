@@ -289,7 +289,8 @@ export function commitProposal(params: {
       if (p.supersededBy) return p;
       const role = roleById.get(p.id);
       if (!role) return p;
-      return { ...p, retentionRole: role };
+      // PM 需求：side_settle 一次采纳 = 该侧点位全部确认入池 + 详略锁定。
+      return { ...p, retentionRole: role, confirmed: true };
     });
     if (!sideSettled.includes(side)) sideSettled.push(side);
     // Capacity trim merged into settle — dismiss this side
@@ -332,6 +333,8 @@ export function commitProposal(params: {
       fromDimension: claim,
       leanTags,
       quality: scorePointQuality(claim, body),
+      // PM 需求：slot_add 通道确认的点直接视为已确认。
+      confirmed: true,
     };
     points = [...points, np];
     if (!extraClaims.some((c) => c === claim || headsCompatible(c, claim))) {
@@ -1003,6 +1006,7 @@ export function buildAskFromProposal(
       (briefs.length ? `，**略写**${briefs.join('、')}` : '') +
       (drops.length ? `，**放下**${drops.join('、')}` : '') +
       `。${rationale}略写即控制单段篇幅。\n\n${lines.join('\n')}\n\n` +
+      `采纳后将把这 ${lines.length} 条论点确认写入材料池（未采纳前为待确认）。\n` +
       `请点击下方「采纳」或「拒绝」；也可直接回复「都详写」或「①详写，②略写」。`
     );
   }

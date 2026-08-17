@@ -795,6 +795,29 @@ ${topic.question}
                   </div>
 
                   {(() => {
+                    const sideSettled: string[] = Array.isArray(
+                      (evalData as any)?.plannerPayload?.sideSettled,
+                    )
+                      ? (evalData as any).plannerPayload.sideSettled
+                      : [];
+                    const pointSideKeyUi = (p: any): string => {
+                      const tags = Array.isArray(p.leanTags) ? p.leanTags : [];
+                      const order = [
+                        'part_1', 'part_2', 'view_a', 'view_b', 'advantage',
+                        'disadvantage', 'cause', 'solution', 'positive', 'negative',
+                        'support_main', 'oppose_or_qualify',
+                      ];
+                      for (const b of order) if (tags.includes(b)) return b;
+                      return 'general';
+                    };
+                    const isPointConfirmedUi = (p: any): boolean => {
+                      if (p.confirmed === true) return true;
+                      if (p.confirmed === undefined) {
+                        // 旧会话读取侧迁移：无 confirmed 字段时，若其侧已 sideSettled 视为已确认。
+                        return sideSettled.includes(pointSideKeyUi(p));
+                      }
+                      return false;
+                    };
                     const payloadPts = Array.isArray((evalData as any)?.plannerPayload?.points)
                       ? (evalData as any).plannerPayload.points.filter(
                           (p: any) => p && !p.supersededBy && String(p.claim || '').trim(),
@@ -842,6 +865,7 @@ ${topic.question}
                               elaboration: displayElaboration(claim, elaboration),
                               quality,
                               retentionRole,
+                              confirmed: isPointConfirmedUi(p),
                               tags: displayLeanTags(
                                 Array.isArray(p.leanTags) ? p.leanTags : [],
                               ),
@@ -860,6 +884,7 @@ ${topic.question}
                                   c,
                                   roleCorpus,
                                 ),
+                                confirmed: false,
                                 tags: [] as string[],
                               };
                             },
@@ -893,6 +918,7 @@ ${topic.question}
                       if (item.retentionRole && !prev.retentionRole) {
                         prev.retentionRole = item.retentionRole;
                       }
+                      if (item.confirmed) prev.confirmed = true;
                       prev.tags = [...new Set([...(prev.tags || []), ...(item.tags || [])])];
                     }
 
@@ -932,6 +958,15 @@ ${topic.question}
                                   <div className="min-w-0 space-y-0.5">
                                     <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-900 font-semibold">
                                       {item.claim}
+                                      {item.confirmed ? (
+                                        <span className="ml-1.5 text-[10px] font-bold text-emerald-600">
+                                          已确认
+                                        </span>
+                                      ) : (
+                                        <span className="ml-1.5 text-[10px] font-bold text-amber-600">
+                                          待确认
+                                        </span>
+                                      )}
                                       {item.retentionRole === 'detail' ? (
                                         <span className="ml-1.5 text-[10px] font-bold text-indigo-600">
                                           详写

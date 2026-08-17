@@ -2,6 +2,43 @@ import React from 'react';
 import { BookOpen, RefreshCw, Layers, ArrowLeft, Share2, History } from 'lucide-react';
 import { Topic } from '../types';
 
+/** 轻量格式化：12345 → 12.3k */
+function fmtTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+/** LLM token 用量徽标：每 20s 轮询 /api/token-usage（进程内存累计）。 */
+function TokenUsageBadge() {
+  const [usage, setUsage] = React.useState<{
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+  } | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    const tick = () =>
+      fetch('/api/token-usage')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (alive && d) setUsage(d); })
+        .catch(() => {});
+    tick();
+    const t = setInterval(tick, 20000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  if (!usage || usage.calls === 0) return null;
+  return (
+    <span
+      className="rounded-full bg-slate-50 px-2 py-0.5 font-mono text-[10px] font-medium text-slate-500"
+      title={`LLM 调用 ${usage.calls} 次 · 输入 ${usage.inputTokens} · 输出 ${usage.outputTokens} · 缓存命中 ${usage.cachedInputTokens}（自服务启动累计）`}
+    >
+      Token 入{fmtTokens(usage.inputTokens)} · 出{fmtTokens(usage.outputTokens)}
+      {usage.cachedInputTokens > 0 ? ` · 缓存${fmtTokens(usage.cachedInputTokens)}` : ''}
+    </span>
+  );
+}
+
 interface HeaderProps {
   activeTopic: Topic | null;
   currentStep: number;
@@ -42,6 +79,7 @@ export default function Header({
               <span className="rounded-full bg-indigo-50 px-2 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
                 MVP v1.0
               </span>
+              <TokenUsageBadge />
             </div>
             <p className="text-xs text-slate-500">IELTS Writing Task 2 Deconstruction Trainer</p>
           </div>

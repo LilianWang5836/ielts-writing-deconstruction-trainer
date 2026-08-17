@@ -208,6 +208,17 @@ export interface Step3Minute {
   displayText?: string;
   /** 偏薄待补标记：thin 追问后仍薄而放行落槽时置 true（看板显示「（偏薄待补）」）。 */
   thinTag?: boolean;
+  /**
+   * P4（D4）润色回退标记：LLM 提供了 polishedText 但未通过反代写校验时置 true，
+   * 看板显示原话并提示「已保持你的原话」。
+   */
+  polishReverted?: boolean;
+  /**
+   * 打转熔断的暂略标记：学生在某槽连续答不出、明确说「跳过」时，服务端以
+   * confirmed 占位分钟暂略该槽（游标/完成判定天然兼容），看板显示「暂略」，
+   * 学生可之后点「修改」reopen 回补。
+   */
+  skippedTag?: boolean;
   ts: number;
   slotKey?: string;
   status: 'recorded' | 'landed' | 'confirmed' | 'rejected';
@@ -276,6 +287,11 @@ export interface Step3Subpoint {
   /** 落槽审计事件日志（P1）：每次落槽/确认/拒绝/held 的决策轨迹。
    *  分钟级可审计 + 支持从 minutes/日志重放落槽结果。 */
   landingLog?: Step3LandingAuditEntry[];
+  /**
+   * P3（D5 后半）结构异议重规划要约：LLM 判为学生想改结构时武装，
+   * 学生确认后服务端清空 Step3 并重跑 planner；拒绝则关闭。
+   */
+  pendingStructureOffer?: { askedAt: number };
 }
 
 /** 落槽审计事件（P1 — 纪要双层 + 可审计）。 */
@@ -284,9 +300,10 @@ export interface Step3LandingAuditEntry {
   minuteId: string;
   /**
    * 决策类型：landed=落槽待确认；confirmed=确认写板；rejected=重复/无效拦截；
-   * held=质量门控暂不落槽（thin/off_target/off_topic/meta，等待教练追问或指回）。
+   * held=质量门控暂不落槽（thin/off_target/off_topic/meta，等待教练追问或指回）；
+   * reopened=已确认槽被用户重新打开修订（P2）。
    */
-  event: 'landed' | 'confirmed' | 'rejected' | 'held';
+  event: 'landed' | 'confirmed' | 'rejected' | 'held' | 'reopened';
   /** 落到的槽 key（rejected / held 通常无）。 */
   slotKey?: string;
   /** 拦截原因（仅 rejected / held）。 */
@@ -533,6 +550,8 @@ export interface PracticeSession {
     subpoints: Step3Subpoint[];
     activeSubpointId?: string;
     isCompleted: boolean;
+    /** P3（D5 后半）结构重规划已确认：前端据此重跑 planner 并重建 Step3。 */
+    structureReplanned?: boolean;
     chatHistory?: ChatMessage[];
   };
   step4: {
@@ -678,6 +697,12 @@ export interface Step2Point {
   quality: 'thin' | 'ready';
   /** 详写 / 略写 / 放下 — mirrored from userPoints retention tags */
   retentionRole?: Step2RetentionRole;
+  /**
+   * 该点是否已确认入池（PM 需求：点经确认后才进入 planner 输入）。
+   * 新点默认 false；side_settle/slot_add 采纳后置 true；undefined = 旧会话
+   * （读取侧迁移：若其侧已 sideSettled 视为已确认）。
+   */
+  confirmed?: boolean;
   /**
    * Elaboration came only from Step1 seed / kickoff model rewrite — not yet
    * expanded in a Step2 student content turn. Walk gates treat seedOnly as thin.

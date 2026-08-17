@@ -35,6 +35,7 @@ import {
   formatSideRetentionPendingMarker,
   headsCompatible,
   isExplicitSlotAddConfirm,
+  isPointConfirmed,
   isPointExpandedForWalk,
   isStep2ChecklistWalkDone,
   listUnwalkedChecklistPoints,
@@ -73,6 +74,7 @@ import {
   buildBareDimensionProbeAsk,
   countUnprobedStep1Dimensions,
   earliestUnprobedDimension,
+  isStep1DimensionUnprobed,
   preserveStep1ProbeTags,
   resolvePendingProbeAnswer,
   stampUnprobedQualityPending,
@@ -103,6 +105,8 @@ import {
   landMinuteToSlot,
   landBatchToSlots,
   commitPendingMinute,
+  reopenSlot,
+  skipSlot,
   renderBoard,
   activeSlotLabel,
   isSkeletonComplete,
@@ -121,6 +125,7 @@ import {
 } from "./src/server/step3/lens";
 import { toSkeleton, planToSkeleton, skeletonFlatSlots } from "./src/utils/step3Skeleton";
 import { log } from "./src/server/logger";
+import { recordTokenUsage, getTokenUsageSnapshot } from "./src/server/usage";
 
 dotenv.config();
 // 本地覆盖：.env.local 优先（便于本地测试时切换 LLM 提供商/Key，而不影响共享 .env）
@@ -186,6 +191,30 @@ function parseAIResponse(text: string | undefined, defaultData: any = {}): any {
       return defaultData;
     }
   }
+}
+
+/**
+ * part1/part2 结构化字段优先（根治 openai-compatible 通道模型不写 "---" 分隔符：
+ * 实机 77/77 缺分隔符，但 JSON 字段级遵从良好）。模型给出 part1/part2 时服务端
+ * 组装 text，下游 splitTwoParts 及所有守卫零改动；part2 缺失时留单段 text，
+ * 由 P1 修复路径挂程序化 P2。part1 内残留的 "---" 会被剥掉。
+ */
+function assembleCoachTextFromParts(data: any): void {
+  if (!data || typeof data !== "object") return;
+  const has1 = typeof data.part1 === "string" && data.part1.trim();
+  const has2 = typeof data.part2 === "string" && data.part2.trim();
+  if (!has1 && !has2) return;
+  const strip = (s: string) =>
+    String(s)
+      .replace(/\n\s*---\s*\n/g, "\n\n")
+      .trim();
+  const p1 = has1 ? strip(data.part1) : "";
+  const p2 = has2 ? strip(data.part2) : "";
+  if (p1) {
+    data.text = p2 ? `${p1}\n\n---\n\n${p2}` : p1;
+  }
+  delete data.part1;
+  delete data.part2;
 }
 
 function splitTwoParts(
@@ -861,16 +890,27 @@ function fallbackNextStep(
   stepNum: number,
   session: any,
   step2Data?: any,
+  step1Data?: any,
 ): string {
   if (stepNum === 1) {
-    const eval1 = session?.step1?.coachEvaluation || {};
-    if (!eval1.correctType) {
+    // 本轮数据优先：当轮刚填的槽（correctType/constraints 等）必须可见，否则
+    // 会出现"P1 说题型判断正确、P2 又问题型"的自相矛盾（实机录制证实）。
+    const eval1 = {
+      ...(session?.step1?.coachEvaluation || {}),
+      ...(step1Data && typeof step1Data === "object" ? step1Data : {}),
+    };
+    if (!String(eval1.correctType || "").trim()) {
       return "先完成题型识别：这道 Task 2 题属于哪一类（如 Agree/Disagree、Discussion、Advantages/Disadvantages）？请直接给出你的判断。";
     }
-    if (!eval1.coreIssue) {
+    if (!String(eval1.coreIssue || "").trim()) {
       return "请用一句话说出这道题真正要你完成的写作任务（不要直译或复述背景）？";
     }
-    if (!Array.isArray(eval1.constraints) || eval1.constraints.length === 0) {
+    // constraintsSkipped（题目无硬性限定词，闸门已判可跳过）时不得再追问限定词，
+    // 否则学生对"没有极端表达"的有效回答永远关不掉这个槽（实机录制：连问 10+ 轮）。
+    const hasConstraints =
+      (Array.isArray(eval1.constraints) && eval1.constraints.length > 0) ||
+      eval1.constraintsSkipped === true;
+    if (!hasConstraints) {
       return "再补一步：这道题有哪些关键限定词（人群、场景、程度、时间）必须在论证中回应？请列 1-3 个。";
     }
     return "很好。请把你的审题结论整合成一句写作任务说明：你准备如何回应题目、覆盖哪些限定并给出什么立场？";
@@ -1137,6 +1177,8 @@ function normalizeQuestionTypeLabel(raw: string): string {
   const lower = t.toLowerCase().replace(/[／]/g, "/").replace(/\s+/g, " ");
   if (/^agree\s*(or|\/)\s*disagree$/.test(lower)) return "Agree / Disagree";
   if (/^discuss\s*both(\s*views)?$/.test(lower)) return "Discuss Both Views";
+  // "Discussion" 是 IELTS 常见同义标签，归一到 Discuss Both Views。
+  if (/^discuss(ion)?$/.test(lower)) return "Discuss Both Views";
   if (/^positive\s*(or|\/)\s*negative$/.test(lower)) return "Positive / Negative";
   if (/^advantages?\s*(and|\/|&)\s*disadvantages?$/.test(lower)) {
     return "Advantages / Disadvantages";
@@ -1214,15 +1256,17 @@ function inferQuestionTypeFromQuestion(question: string, knownType?: string): st
       q,
     );
 
-  // Cause + solution is Problem/Solution (not Two-part).
-  if (hasCauses && hasSolutions) return "Problem / Solution";
-  // Cause + positive/negative (or pure P/N) maps to Positive / Negative for stage mapping.
-  if (hasPosNeg) return "Positive / Negative";
-  if (hasCauses && !hasSolutions && !hasPosNeg) return "Problem / Solution";
-  if (hasAgree) return "Agree / Disagree";
+  // 显式题型标记优先：含 "discuss both views" / "agree or disagree" 等明确信号时，
+  // 不得被 cause/reason 等词带偏（实测 "…will cause widespread unemployment.
+  // Discuss both views…" 被 hasCauses 误判为 Problem/Solution）。
   if (hasBothViews) return "Discuss Both Views";
+  if (hasAgree) return "Agree / Disagree";
   if (hasAdvDis) return "Advantages / Disadvantages";
+  if (hasPosNeg) return "Positive / Negative";
   if (hasOther) return "Other";
+  // 无显式题型标记 → 才走因果启发式（真实 P/S / 单问因果题）。
+  if (hasCauses && hasSolutions) return "Problem / Solution";
+  if (hasCauses) return "Problem / Solution";
   // Two distinct question marks / "and" dual tasks without the above → Two-part.
   const qMarks = (String(question || "").match(/\?/g) || []).length;
   if (qMarks >= 2) return "Two-part Question";
@@ -1382,7 +1426,9 @@ function buildStep1Digest(session: any, question: string): any {
   } else {
     openGaps.push("constraints");
   }
-  if (countEffectiveStep1Dimensions(dimensions) >= STEP1_DIM_MIN_EFFECTIVE) {
+  if (
+    step1PerSideStatus(dimensions.map(String), questionType, false).pass
+  ) {
     filled.push("suggestedDimensions");
   } else {
     openGaps.push("suggestedDimensions");
@@ -2516,21 +2562,94 @@ const STEP1_DIM_QUALITY_PENDING_TAG = "质量待确认";
 const STEP1_DIM_PROBED_TAG = "已探测";
 const STEP1_DIM_EXIT_OFFERED_TAG = "已询退出";
 const STEP1_DIM_MAX = 6;
-const STEP1_DIM_MIN_EFFECTIVE = 3;
+/** PM 需求：每个问题/每一侧至少 2 个有效讨论维度。 */
+const STEP1_DIM_MIN_PER_SIDE = 2;
+/** 维度侧别标签（服务端解析，PM 每问/每侧 ≥2 计数用）。G=通用（双侧适用）。 */
+const STEP1_DIM_SIDE_TAG_RE = /[（(]\s*侧[：:]\s*([ABG])\s*[）)]/;
 
-/** Standalone status tags only — not mixed inside explanatory parentheses. */
+/** Standalone status tags only — not mixed inside explanatory parentheses.
+ *  含模型的伪戳变体「待探测」（实机观测：DeepSeek 自造此戳，语义等同裸标签，剥掉）。 */
 const STEP1_DIM_STATUS_TAG_RE =
-  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出)\s*[）)]/g;
+  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测)\s*[）)]/g;
 
 function stripStep1DimensionTags(dim: string): string {
   return String(dim || "")
     .replace(STEP1_DIM_STATUS_TAG_RE, "")
+    .replace(STEP1_DIM_SIDE_TAG_RE, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 function hasStandaloneStep1Tag(dim: string, tag: string): boolean {
   return new RegExp(`[（(]\\s*${tag}\\s*[）)]`).test(String(dim || ""));
+}
+
+/** 维度的侧别归属（PM 需求：每问/每侧 ≥2）。G=通用（双侧适用）；无标签=未归属。 */
+/** 侧别前缀习语（实机观测：模型常把侧别写进标签文本而非 dimensionSides/侧签，
+ *  如 "角度A（…）"、"A面…"、"第1问…"）。只在词首匹配，避免误伤正常标签。 */
+const STEP1_DIM_SIDE_PREFIX_RES: [RegExp, "A" | "B"][] = [
+  [/^(?:角度|观点|方面|立场|侧面|侧)\s*[:：]?\s*A(?=[（(：:、\s]|$)/i, "A"],
+  [/^(?:角度|观点|方面|立场|侧面|侧)\s*[:：]?\s*B(?=[（(：:、\s]|$)/i, "B"],
+  [/^A\s*(?:面|侧|方)(?=[（(：:、\s]|$)/i, "A"],
+  [/^B\s*(?:面|侧|方)(?=[（(：:、\s]|$)/i, "B"],
+  [/^第\s*(?:1|一)\s*问/, "A"],
+  [/^第\s*(?:2|二|两)\s*问/, "B"],
+];
+
+function step1DimensionSide(dim: string): "A" | "B" | "G" | null {
+  const m = STEP1_DIM_SIDE_TAG_RE.exec(String(dim || ""));
+  if (m) return m[1] as "A" | "B" | "G";
+  const t = String(dim || "").trim();
+  for (const [re, side] of STEP1_DIM_SIDE_PREFIX_RES) {
+    if (re.test(t)) return side;
+  }
+  return null;
+}
+
+/**
+ * 结构化侧别注入（F1 修复）：实测 DeepSeek 对文内 （侧：X） 标签遵从度为零
+ * （recorded e2e：侧签 0 次），但对 JSON schema 字段遵从度高。LLM 在
+ * step1Data.dimensionSides 里按 { dimension, side } 声明归属，服务端在此把归属
+ * 确定性翻译成现有 （侧：X） 标签约定——下游 step1PerSideStatus / T1 恢复逻辑不变。
+ * 已带侧签（文内或 T1 恢复）的维度不覆盖；标签文本不完全一致时按唯一包含关系兜底。
+ */
+function applyStep1DimensionSides(dims: string[], sideMap: unknown): string[] {
+  if (!Array.isArray(sideMap) || sideMap.length === 0) return dims;
+  const byCore = new Map<string, "A" | "B" | "G">();
+  for (const entry of sideMap) {
+    if (!entry || typeof entry !== "object") continue;
+    const label = String(
+      (entry as any).dimension ?? (entry as any).label ?? "",
+    ).trim();
+    const side = String((entry as any).side ?? "")
+      .trim()
+      .toUpperCase();
+    if (!label || !/^[ABG]$/.test(side)) continue;
+    const core = stripStep1DimensionTags(label).toLowerCase();
+    if (core && !byCore.has(core)) byCore.set(core, side as "A" | "B" | "G");
+  }
+  if (byCore.size === 0) return dims;
+  const cores = [...byCore.keys()];
+  const matchSide = (core: string): "A" | "B" | "G" | undefined => {
+    const exact = byCore.get(core);
+    if (exact) return exact;
+    const hits = cores.filter((c) => core.includes(c) || c.includes(core));
+    return hits.length === 1 ? byCore.get(hits[0]) : undefined;
+  };
+  let changed = false;
+  const next = dims.map((d) => {
+    const raw = String(d || "");
+    if (!raw.trim() || STEP1_DIM_SIDE_TAG_RE.test(raw)) return raw;
+    const side = matchSide(stripStep1DimensionTags(raw).toLowerCase());
+    if (!side) return raw;
+    changed = true;
+    const bare = stripStep1DimensionTags(raw);
+    // 侧签紧跟核心文案（状态戳保持在其后），与 prompt 示例格式一致。
+    return bare && raw.startsWith(bare)
+      ? raw.replace(bare, `${bare}（侧：${side}）`)
+      : `${raw}（侧：${side}）`;
+  });
+  return changed ? next : dims;
 }
 
 /** Effective = probed AND explicitly tagged expandable (no legacy untagged shortcut). */
@@ -2639,7 +2758,10 @@ function step1HasNewlyIntroducedDimension(
   return false;
 }
 
-function isStep1SlotsComplete(step1Eval: Record<string, any>): boolean {
+function isStep1SlotsComplete(
+  step1Eval: Record<string, any>,
+  options?: { exhausted?: boolean },
+): boolean {
   const hasType = String(step1Eval.correctType || "").trim().length > 0;
   const hasIssue = String(step1Eval.coreIssue || "").trim().length > 0;
   const hasConstraints =
@@ -2648,29 +2770,144 @@ function isStep1SlotsComplete(step1Eval: Record<string, any>): boolean {
   const dims = Array.isArray(step1Eval.suggestedDimensions)
     ? step1Eval.suggestedDimensions.map(String)
     : [];
-  const effectiveCount = countEffectiveStep1Dimensions(dims);
-  const capDone = step1CapProbeComplete(dims, STEP1_DIM_MAX);
-  return (
-    hasType &&
-    hasIssue &&
-    hasConstraints &&
-    (effectiveCount >= STEP1_DIM_MIN_EFFECTIVE || capDone)
-  );
+  const questionType = String(step1Eval.correctType || "").trim();
+  const perSide = step1PerSideStatus(dims, questionType, !!options?.exhausted);
+  return hasType && hasIssue && hasConstraints && perSide.pass;
 }
 
 /**
- * AI/server sufficiency: enough probed+expandable dimensions to stop diverging.
- * Cap-full + all probed is a deadlock relief even when effective < 3.
+ * AI/server sufficiency: per-side ≥2 effective dimensions (PM 需求).
+ * 逃生：学生已表示无法补充时按侧降级放行，避免死锁。
  */
-function computeStep1DimensionsSufficient(step1Eval: Record<string, any>): boolean {
+function computeStep1DimensionsSufficient(
+  step1Eval: Record<string, any>,
+  options?: { exhausted?: boolean },
+): boolean {
   const dims = Array.isArray(step1Eval?.suggestedDimensions)
     ? step1Eval.suggestedDimensions.map(String)
     : [];
-  if (step1CapProbeComplete(dims, STEP1_DIM_MAX)) return true;
-  const effective = countEffectiveStep1Dimensions(dims);
-  if (effective < STEP1_DIM_MIN_EFFECTIVE) return false;
+  const questionType = String(step1Eval.correctType || "").trim();
+  if (!step1PerSideStatus(dims, questionType, !!options?.exhausted).pass) {
+    return false;
+  }
   if (step1Eval?.dimensionsSufficient === false) return false;
   return true;
+}
+
+/**
+ * PM 需求：每个问题/每一侧至少 2 个有效讨论维度。
+ * 按题型确定所需侧数：
+ *  - 双边讨论 → 观点A / 观点B；利弊 → 优点/利 / 缺点/弊；
+ *  - 两问 / 问题解决 / 正负评价 → 第1问 / 第2问；
+ *  - 同意与否等单任务 → 单一侧（全部维度计入）。
+ */
+function step1RequiredSides(
+  questionType: string,
+): { sideKey: "A" | "B"; labelZh: string }[] {
+  const t = normalizeQuestionTypeLabel(questionType);
+  if (t === "Discuss Both Views") {
+    return [
+      { sideKey: "A", labelZh: "观点A" },
+      { sideKey: "B", labelZh: "观点B" },
+    ];
+  }
+  if (t === "Advantages / Disadvantages") {
+    return [
+      { sideKey: "A", labelZh: "优点/利" },
+      { sideKey: "B", labelZh: "缺点/弊" },
+    ];
+  }
+  if (t === "Problem / Solution") {
+    return [
+      { sideKey: "A", labelZh: "原因/成因" },
+      { sideKey: "B", labelZh: "解决措施" },
+    ];
+  }
+  if (t === "Two-part Question" || t === "Positive / Negative") {
+    return [
+      { sideKey: "A", labelZh: "第1问" },
+      { sideKey: "B", labelZh: "第2问" },
+    ];
+  }
+  // 同意与否 / Other / 未知 → 单一侧
+  return [{ sideKey: "A", labelZh: "整体角度" }];
+}
+
+/**
+ * 每侧有效维度达标判定。
+ *  - 单侧题型：全部有效维度计入唯一侧（未归属也计入，避免无意义死锁）；
+ *  - 双侧题型：按侧别标签统计（G 计入两侧；未归属不计入任何侧）；
+ *  - 逃生：exhausted 时某侧维度已全部探测（或该侧无标签）即降级放行（“质量待确认”式降级）。
+ */
+function step1PerSideStatus(
+  dims: string[],
+  questionType: string,
+  exhausted: boolean,
+): {
+  pass: boolean;
+  sides: {
+    sideKey: string;
+    labelZh: string;
+    effective: number;
+    labelCount: number;
+    pass: boolean;
+  }[];
+} {
+  const sides = step1RequiredSides(questionType);
+  const meaningful = dims.filter(
+    (d) =>
+      String(d || "").trim() && stripStep1DimensionTags(d).trim().length > 0,
+  );
+  const status = sides.map((s) => {
+    const sideLabels =
+      sides.length === 1
+        ? meaningful
+        : meaningful.filter((d) => {
+            const side = step1DimensionSide(d);
+            return side === s.sideKey || side === "G";
+          });
+    const seen = new Set<string>();
+    let effective = 0;
+    for (const d of sideLabels) {
+      if (!isStep1DimensionExpandable(d)) continue;
+      const core = stripStep1DimensionTags(d).toLowerCase();
+      if (!core || seen.has(core)) continue;
+      seen.add(core);
+      effective += 1;
+    }
+    const allProbed = sideLabels.every((d) => !isStep1DimensionUnprobed(d));
+    const pass =
+      effective >= STEP1_DIM_MIN_PER_SIDE || (exhausted && allProbed);
+    return {
+      sideKey: s.sideKey,
+      labelZh: s.labelZh,
+      effective,
+      labelCount: sideLabels.length,
+      pass,
+    };
+  });
+  return { pass: status.every((s) => s.pass), sides: status };
+}
+
+/** 提示薄弱侧（PM：每问/每侧 ≥2 有效维度）。 */
+function formatStep1MissingSideHint(
+  questionType: string,
+  dims: string[],
+  exhausted: boolean,
+): string {
+  const { sides } = step1PerSideStatus(dims, questionType, exhausted);
+  const weak = sides.filter((s) => !s.pass);
+  if (weak.length === 0) {
+    return "目前可展开的角度还不够，请再补充一个不同的中性角度（不要和已有角度重复）。";
+  }
+  const parts = weak.map(
+    (s) =>
+      `「${s.labelZh}」当前 ${s.effective} 个有效角度，还差至少 ${Math.max(
+        STEP1_DIM_MIN_PER_SIDE - s.effective,
+        1,
+      )} 个`,
+  );
+  return `${parts.join("；")}。请在该侧再补充至少 1 个不同的中性角度，并说明有没有具体场景苗头。`;
 }
 
 function textSuggestsStep1Complete(text: string): boolean {
@@ -4320,6 +4557,35 @@ function parseBatchBeats(msg: string, beats: unknown): string[] | null {
  *
  * 本路径在 activeSp 带冻结 skeleton 时启用（秘书唯一路径）。
  */
+
+/**
+ * P3（D5 后半）结构重规划执行（确定性）：清空 Step3 全部 body 的秘书进度，
+ * 将 step2_5 标记为 stale（复用 plannerPayloadFingerprint 的 stale 机制），
+ * 由前端重跑 planner 后用新 bodyPlans 重建 Step3。
+ */
+function applyStep3StructureReplan(session: any): void {
+  const step3 = session?.step3;
+  if (step3 && Array.isArray(step3.subpoints)) {
+    for (const sp of step3.subpoints) {
+      sp.minutes = [];
+      sp.skeleton = undefined;
+      sp.activeSlotIndex = undefined;
+      sp.landingLog = [];
+      sp.isCompleted = false;
+      sp.pendingStructureOffer = undefined;
+      sp.step3SlotEval = undefined;
+      sp.kickoffPendingDrafts = undefined;
+      sp.paragraphPlan = undefined;
+      sp.structureSteps = undefined;
+    }
+    step3.activeSubpointId = undefined;
+    step3.isCompleted = false;
+  }
+  if (session?.step2_5) {
+    session.step2_5 = { ...session.step2_5, status: "stale" };
+  }
+}
+
 function enforceStep3SecretaryPath(
   data: any,
   session: any,
@@ -4350,6 +4616,71 @@ function enforceStep3SecretaryPath(
   // ---- 常规轮：分类学生发言 ----
   const isAff = /^(对|好|是|嗯|可以|同意|采纳|确认|行|就按|确认写入|点击确认|确认提交)[。.!！?？]?$/.test(msg) || /确认写入|点击确认/.test(msg);
   const isRej = /^(不对|不好|不是|重说|重写|换一个|去掉|不要|改一下|重新说)[。.!！?？]?$/.test(msg) || /拒绝|否决|撤销/.test(msg);
+
+  // ---- P3（D5 后半）结构异议：已武装重规划要约时，本轮优先处理 确认/拒绝 ----
+  if (sp.pendingStructureOffer) {
+    if (isAff) {
+      applyStep3StructureReplan(session);
+      data.progressUpdate.step3StructureReplanned = true;
+      data.progressUpdate.step3SubpointCompleted = false;
+      data.progressUpdate.isCompleted = false;
+      data.progressUpdate.secretaryBoard = renderBoard(sp);
+      data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+      // 学生已明确确认 → 固定 P1，避免复用 LLM 在确认前生成的“是否确认”反问文案
+      // 与已执行的重规划动作自相矛盾。
+      data.text = `好的，已确认。\n\n---\n\n好的，我们重新规划段落结构。已清空第三步的当前进度，正在重新整理段落结构，请稍候…`;
+      console.warn(
+        "[Secretary] STRUCTURE-REPLAN confirmed → Step3 cleared, step2_5 stale",
+      );
+      return;
+    }
+    if (isRej) {
+      sp.pendingStructureOffer = undefined;
+      const part1 = safeOverridePart1(String(data.text || ""));
+      data.text = `${part1 || "好的。"}\n\n---\n\n好的，保留当前的段落结构，我们继续推进这一步。`;
+      data.progressUpdate.secretaryBoard = renderBoard(sp);
+      data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+      console.warn("[Secretary] STRUCTURE-REPLAN rejected → offer closed");
+      return;
+    }
+    // 非确认/拒绝的回复：解除要约，继续按普通内容处理。
+    // 不得跨轮次保持武装——否则学生对后续落槽内容的裸确认（"对/好"等，isAff 很宽）
+    // 会被误吞为重规划确认，不可逆清空全部 Step3 进度。
+    // 学生若本轮仍在表达结构变更，下方 structure_change 分支会重新武装要约。
+    sp.pendingStructureOffer = undefined;
+    if (sp.lastGateHint?.verdict === "structure_change") {
+      sp.lastGateHint = undefined;
+    }
+    console.warn(
+      "[Secretary] STRUCTURE-REPLAN offer disarmed (non-confirm reply) → 按普通内容处理",
+    );
+  }
+
+  // ---- 打转熔断出口：stall 已触发时，学生明确说「跳过」→ 确定性暂略当前槽 ----
+  // 场景：学生在某槽连续给出 duplicate/off_target 内容被拒绝，教练换措辞重问仍无解
+  //（UI 实机录制：同槽重复追问 10+ 轮）。跳过只在 stall 状态下生效，避免误伤正常流程。
+  const isSkipAsk =
+    /^(跳过|先跳过|略过|先略过|暂时跳过|这拍先跳过|这步先跳过|先不填|暂时不填|先过|暂时过)[。.!！]?$/.test(
+      msg,
+    );
+  if (isSkipAsk) {
+    const stallNow = detectStall(sp);
+    const skipTarget = firstEmptySlotKey(sp);
+    if (stallNow.stalled && skipTarget) {
+      const r = skipSlot(sp, skipTarget);
+      if (r.ok) {
+        const part1 = safeOverridePart1(String(data.text || ""));
+        data.text = `${part1 || "好的。"}\n\n---\n\n好的，这一拍我们先跳过——看板上标了「暂略」，之后随时可以点「修改」回来补。我们继续下一拍。`;
+        data.progressUpdate.secretaryBoard = renderBoard(sp);
+        data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+        console.warn(
+          `[Secretary] SKIP slot=${skipTarget}（打转熔断，attempts=${stallNow.attempts}）`,
+        );
+        return;
+      }
+    }
+    // 非 stall 状态下的「跳过」：不落任何分支，按普通内容继续处理。
+  }
 
   // 当前 landed 待确认纪要（单条或批量多条）
   const landedList = (sp.minutes || []).filter((m: any) => m.status === "landed");
@@ -4414,6 +4745,40 @@ function enforceStep3SecretaryPath(
   // LLM 意图解析（模糊情形兜底，P0-3 后半）：确定性正则已覆盖清晰的 确认/拒绝/meta，
   // 这里只处理正则漏网的 meta / question。intent 是消息级判断，不要求 slotKey 匹配。
   // 失败不对称原则：宁可把可疑发言 hold 一轮（学生下轮可澄清），也不把抱怨/提问当内容落槽。
+
+  // ---- P3（D5 后半）确定性 structure_change 兜底 ----
+  // 实测发现：assess LLM（deepseek）把「我想换第二个论点 / 结构不合适 / 想重新规划」
+  // 等明确结构变更发言误判为 content 并落槽，导致重规划要约永远无法武装、该特性实际
+  // 不可达（学生「对」只会写板，永不重规划）。这里用明确句式确定性武装要约——
+  // 只武装要约、不直接改结构，仍需学生确认/拒绝，符合「代码管状态」红线。
+  const STRUCTURE_CHANGE_RE =
+    /(换(掉|成|一个|一下|成别的)|不要|去掉|重写|改(成|掉)).{0,12}(论点|分论点|主体段|段落|结构|这两段)|(论点|分论点|主体段|段落|结构).{0,10}(换(掉|成|一个|一下|成别的)|不要|去掉|重写|不合适|有问题|重新规划|重排|想改|要改)/;
+  if (STRUCTURE_CHANGE_RE.test(msg)) {
+    const scMinute = appendMinute(sp, "student", msg);
+    appendAudit(
+      sp,
+      scMinute.id,
+      "held",
+      undefined,
+      "学生表达结构变更意图（确定性兜底），待确认重规划",
+      { verdict: "structure_change", source: "deterministic" },
+    );
+    sp.pendingStructureOffer = { askedAt: Date.now() };
+    const scHint =
+      "学生想调整段落结构/换分论点。请向学生解释：确认后当前第三步进度会被清空并重新规划段落，然后请学生明确确认或拒绝——不要自己改任何结构。";
+    data.progressUpdate.secretaryStructureOfferHint = scHint;
+    sp.lastGateHint = {
+      verdict: "structure_change",
+      hint: scHint,
+      slotKey: null,
+    };
+    console.warn(
+      `[Secretary] STRUCTURE_CHANGE(deterministic) minute=${scMinute.id} → 要约已武装，待学生确认。`,
+    );
+    renderNow();
+    return;
+  }
+
   const llmIntent =
     data.step3Assessment && typeof data.step3Assessment === "object"
       ? String(data.step3Assessment.intent || "").trim()
@@ -4447,6 +4812,32 @@ function enforceStep3SecretaryPath(
     renderNow();
     return;
   }
+  if (llmIntent === "structure_change") {
+    // P3（D5 后半）：学生表达改结构/换分论点意图 → 武装重规划要约，不落槽、不改结构。
+    const scMinute = appendMinute(sp, "student", msg);
+    appendAudit(
+      sp,
+      scMinute.id,
+      "held",
+      undefined,
+      "学生表达结构变更意图，待确认重规划",
+      { verdict: "structure_change", source: "structure_change" },
+    );
+    sp.pendingStructureOffer = { askedAt: Date.now() };
+    const scHint =
+      "学生想调整段落结构/换分论点。请向学生解释：确认后当前第三步进度会被清空并重新规划段落，然后请学生明确确认或拒绝——不要自己改任何结构。";
+    data.progressUpdate.secretaryStructureOfferHint = scHint;
+    sp.lastGateHint = {
+      verdict: "structure_change",
+      hint: scHint,
+      slotKey: null,
+    };
+    console.warn(
+      `[Secretary] STRUCTURE_CHANGE minute=${scMinute.id} → 要约已武装，待学生确认。`,
+    );
+    renderNow();
+    return;
+  }
 
   // 目标槽 + 质量门控（LLM 评估优先，确定性透镜兜底）。
   const targetKey = firstEmptySlotKey(sp);
@@ -4469,6 +4860,8 @@ function enforceStep3SecretaryPath(
   const displayText = llmAssess?.polishedText
     ? validatePolishedText(msg, llmAssess.polishedText, slotDef?.label)
     : null;
+  // P4（D4）：LLM 提供了整理稿但未通过反代写校验 → 回退原话，并对用户可见。
+  const polishReverted = !!llmAssess?.polishedText && !displayText;
 
   console.warn(
     `[SecretaryGate] slot=${targetKey} verdict=${gate.verdict} llm=${llmAssess ? "yes" : "no"} polished=${displayText ? "yes" : "no"} reason=${String(gate.reason).slice(0, 40)}`,
@@ -4544,6 +4937,7 @@ function enforceStep3SecretaryPath(
   const minute = appendMinute(sp, "student", msg, {
     displayText: displayText || undefined,
     thinTag: gate.verdict === "thin",
+    polishReverted: polishReverted || undefined,
   });
   const land = landMinuteToSlot(sp, minute);
   data.progressUpdate.step3SubpointCompleted = false;
@@ -4583,7 +4977,13 @@ function enforceStep3SecretaryPath(
       };
       // stall 升级（终版方案 P0-3）：不再只报警——下一轮教练必须换策略，
       // 禁止原样重问。经 lastGateHint 注入下一轮上下文（formatStep3SlotCursorForPrompt）。
-      const stallHint = `检测到当前槽「${stall.slotLabel || "未知"}」已连续 ${stall.attempts} 次未确认（原地打转）。下一轮禁止原样重问同一问题，必须二选一：(a) 换角度/降维重问（举别的例子示范这一环长什么样）；(b) 若已有待确认草稿或学生此前已给出可用内容，直接引用原话并请学生点【确认】写入。`;
+      // hard 级（连续打转更多轮）追加「跳过」出口说明：学生说「跳过」即可暂略该槽
+      //（服务端 skipSlot 确定性执行，看板标「暂略」，可点后修改回补）。
+      const stallHint =
+        `检测到当前槽「${stall.slotLabel || "未知"}」已连续 ${stall.attempts} 次未确认（原地打转）。下一轮禁止原样重问同一问题，必须二选一：(a) 换角度/降维重问（举别的例子示范这一环长什么样）；(b) 若已有待确认草稿或学生此前已给出可用内容，直接引用原话并请学生点【确认】写入。` +
+        (stall.level === "hard"
+          ? `(c) 同时明确告诉学生：如果实在想不到，可以回复「跳过」先略过这一拍，之后还能回来补。`
+          : "");
       sp.lastGateHint = {
         verdict: "stall",
         hint: stallHint,
@@ -4668,17 +5068,13 @@ function applyStepCompletionHeuristic(data: any, stepNum: number, session?: any)
   let shouldForceComplete = false;
 
   if (stepNum === 1) {
-    if (data.text && textSuggestsStep1Complete(data.text)) {
-      shouldForceComplete = true;
-    }
-    // Anti-drift: Step 2 payload must not appear while Step 1 is active.
-    if (
-      data.progressUpdate?.step2Data &&
-      typeof data.progressUpdate.step2Data === "object"
-    ) {
-      shouldForceComplete = true;
-    }
-  } else if (stepNum === 2) {
+    // Step 1 完成判定由 enforceStep1SlotCompletion 独占（按侧门禁 + 探针协议 +
+    // 出口仪式）。此启发式曾因 CTA 文案或模型顺带输出的 step2Data 强行放行、
+    // 绕过按侧门禁（实机观测：双侧 0 有效角度仍被 force-complete）。Step 1 在此
+    // 不做任何强制完成；模型顺带输出的 step2Data 由最终解锁路径自行清理。
+    return;
+  }
+  if (stepNum === 2) {
     const driftedToStep3 =
       !!data.progressUpdate?.paragraphPlan ||
       (Array.isArray(data.progressUpdate?.step3SubpointSteps) &&
@@ -5515,11 +5911,201 @@ function enforceStep2Completion(data: any, session: any): void {
   }
 }
 
+/**
+ * F3：Step2 summary 阶段模型缺 blueprint 时的确定性补全。
+ * 材料来自 plannerPayload 已确认点：详写点各自成段、略写点合并一段；立场取已锁定立场。
+ * 返回 null 表示材料不足，调用方走原有修复重试。
+ */
+function synthesizeStep2BlueprintFromPayload(session: any): any | null {
+  const payload = normalizeStep2PlannerPayload(
+    session?.step2?.coachEvaluation?.plannerPayload ||
+      session?.step2?.plannerPayload,
+  );
+  const pts = Array.isArray(payload?.points)
+    ? payload.points.filter(
+        (p: any) =>
+          p &&
+          !p.supersededBy &&
+          String(p.claim || "").trim() &&
+          isPointConfirmed(payload, p),
+      )
+    : [];
+  if (pts.length === 0) return null;
+  const detail = pts.filter((p: any) => p.retentionRole === "detail");
+  const brief = pts.filter((p: any) => p.retentionRole !== "detail");
+  const bodies: any[] = [];
+  for (const p of detail) {
+    bodies.push({
+      title: String(p.claim),
+      content: String(p.elaboration || p.claim),
+    });
+  }
+  if (brief.length > 0) {
+    bodies.push({
+      title: brief.map((p: any) => String(p.claim)).join("；"),
+      content: brief
+        .map((p: any) => String(p.elaboration || p.claim))
+        .join("；"),
+    });
+  }
+  if (bodies.length === 0) {
+    // 无详略标记（侧未 settle）：首点一段、其余并一段兜底。
+    bodies.push({
+      title: String(pts[0].claim),
+      content: String(pts[0].elaboration || pts[0].claim),
+    });
+    if (pts.length > 1) {
+      bodies.push({
+        title: pts
+          .slice(1)
+          .map((p: any) => String(p.claim))
+          .join("；"),
+        content: pts
+          .slice(1)
+          .map((p: any) => String(p.elaboration || p.claim))
+          .join("；"),
+      });
+    }
+  }
+  const position = String(
+    session?.step2?.coachEvaluation?.blueprint?.position ||
+      session?.step2?.blueprint?.position ||
+      session?.step2?.coachEvaluation?.suggestedStance ||
+      session?.step2?.userStance ||
+      "",
+  ).trim();
+  return { bodies, bodyCount: bodies.length, position };
+}
+
 function ensureStep1DataBucket(data: any, merged: Record<string, any>): any {
   if (!data.progressUpdate.step1Data || typeof data.progressUpdate.step1Data !== "object") {
     data.progressUpdate.step1Data = { ...merged };
   }
   return data.progressUpdate.step1Data;
+}
+
+/**
+ * F1 兜底：双侧/两问题型下维度侧别归属的聚焦小调用。
+ * 大教练调用里模型的侧别编码方式逐场漂移（dimensionSides 字段 / 文内侧签 /
+ * 标签前缀三种都实测出现过）；前缀正则与 dimensionSides 注入先跑，仍无归属的
+ * 维度才走这个聚焦小调用（任务小、模型遵从度高）。按维度集合指纹缓存，避免每轮重复调用。
+ */
+async function classifyStep1DimensionSidesWithLLM(
+  question: string,
+  questionType: string,
+  dims: string[],
+): Promise<{ dimension: string; side: "A" | "B" | "G" }[] | null> {
+  const labels = dims
+    .map((d) => stripStep1DimensionTags(d))
+    .filter((s) => s.length > 0);
+  if (labels.length === 0) return null;
+  const prompt = `You are classifying IELTS Task 2 brainstorm dimensions by which side/question of the essay they belong to.
+
+Essay question: "${question}"
+Question type: ${questionType}
+
+Dimensions (one per line):
+${labels.map((l, i) => `${i + 1}. ${l}`).join("\n")}
+
+For EACH dimension above, decide its side:
+- "A" = the FIRST view / advantages / question 1 / causes side of the prompt
+- "B" = the SECOND view / disadvantages / question 2 / solutions side
+- "G" = genuinely covers both sides (rare)
+
+Return ONLY JSON of this exact shape, covering every dimension:
+{"sides":[{"dimension":"<exact label as given above>","side":"A"}]}`;
+  try {
+    const response = await generateContentWithFallback({
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 2048,
+        temperature: 0.1,
+      },
+    });
+    const raw = String(
+      response?.text ??
+        response?.candidates?.[0]?.content?.parts?.[0]?.text ??
+        "",
+    );
+    const parsed = parseAIResponse(raw, {});
+    const sides = Array.isArray(parsed?.sides) ? parsed.sides : [];
+    const clean = sides
+      .map((e: any) => ({
+        dimension: String(e?.dimension || "").trim(),
+        side: String(e?.side || "").trim().toUpperCase(),
+      }))
+      .filter((e: any) => e.dimension && /^[ABG]$/.test(e.side));
+    return clean.length > 0 ? clean : null;
+  } catch (e: any) {
+    console.warn(`[Step1SideClassify] LLM call failed: ${e?.message || e}`);
+    return null;
+  }
+}
+
+/**
+ * 决定是否发起侧别小调用，并把结果写进 step1Data.dimensionSides
+ * （当轮即被 applyStep1DimensionSides 注入生效，并随 step1Data 持久化供后续轮复用）。
+ */
+async function maybeClassifyStep1DimensionSides(
+  data: any,
+  session: any,
+  question: string,
+): Promise<void> {
+  try {
+    const merged = mergeStep1Evaluation(data.progressUpdate, session);
+    const questionType = String(
+      merged.correctType || session?.topic?.questionType || "",
+    ).trim();
+    if (step1RequiredSides(questionType).length < 2) return;
+    const rawDims = merged.suggestedDimensions;
+    const dims = (Array.isArray(rawDims) ? rawDims : [])
+      .map((d: any) =>
+        d && typeof d === "object"
+          ? String(d.dimension ?? d.label ?? "").trim()
+          : String(d || "").trim(),
+      )
+      .filter((d: string) => d.length > 0);
+    if (dims.length === 0) return;
+    // 已有归属（dimensionSides 注入 + 侧签 + 前缀习语）全覆盖 → 无需调用。
+    const withExisting = applyStep1DimensionSides(
+      dims,
+      data.progressUpdate?.step1Data?.dimensionSides ??
+        session?.step1?.coachEvaluation?.dimensionSides,
+    );
+    if (withExisting.every((d) => step1DimensionSide(d))) return;
+    // 指纹缓存：维度集合未变且已有分类结果 → 注入路径自会兜底，不重复调 LLM。
+    const fp = dims
+      .map((d) => stripStep1DimensionTags(d).toLowerCase())
+      .sort()
+      .join("|");
+    const eval1 = session?.step1?.coachEvaluation || {};
+    if (
+      String(eval1.dimSideClassifyKey || "") === fp &&
+      Array.isArray(eval1.dimensionSides)
+    ) {
+      return;
+    }
+    const sides = await classifyStep1DimensionSidesWithLLM(
+      question,
+      questionType,
+      dims,
+    );
+    if (!sides) return;
+    if (
+      !data.progressUpdate.step1Data ||
+      typeof data.progressUpdate.step1Data !== "object"
+    ) {
+      data.progressUpdate.step1Data = {};
+    }
+    data.progressUpdate.step1Data.dimensionSides = sides;
+    data.progressUpdate.step1Data.dimSideClassifyKey = fp;
+    console.warn(
+      `[Step1SideClassify] 聚焦小调用归属 ${sides.length} 个维度（dims=${dims.length}）。`,
+    );
+  } catch (e: any) {
+    console.warn(`[Step1SideClassify] skipped: ${e?.message || e}`);
+  }
 }
 
 function enforceStep1SlotCompletion(
@@ -5532,9 +6118,38 @@ function enforceStep1SlotCompletion(
   sanitizeStep1ConstraintMarkers(data.progressUpdate);
 
   const merged = mergeStep1Evaluation(data.progressUpdate, session);
-  let dims = Array.isArray(merged.suggestedDimensions)
-    ? [...merged.suggestedDimensions]
-    : [];
+  // 防御：模型可能把 suggestedDimensions 返回为字符串或 {dimension, side} 对象数组
+  // （新增 dimensionSides 字段后实机观测到形状漂移）——统一归一为字符串数组。
+  const rawDims = merged.suggestedDimensions;
+  let dims = Array.isArray(rawDims)
+    ? rawDims
+        .map((d: any) =>
+          d && typeof d === "object"
+            ? String(d.dimension ?? d.label ?? "").trim()
+            : String(d || "").trim(),
+        )
+        .filter((d: string) => d.length > 0)
+    : typeof rawDims === "string" && rawDims.trim()
+      ? [rawDims.trim()]
+      : [];
+
+  // F1：结构化侧别注入（文内侧签实测不可靠；dimensionSides 字段是可信通道）。
+  // 优先用本轮模型输出，缺失时回退到会话中已持久化的声明。
+  const dimSideMap =
+    data.progressUpdate?.step1Data?.dimensionSides ??
+    session?.step1?.coachEvaluation?.dimensionSides;
+  const sidedDims = applyStep1DimensionSides(
+    dims.map(String),
+    dimSideMap,
+  );
+  if (sidedDims.some((d, i) => d !== String(dims[i] ?? ""))) {
+    dims = sidedDims;
+    const target = ensureStep1DataBucket(data, merged);
+    target.suggestedDimensions = dims;
+    console.warn(
+      "[Step1Guard] Applied structured dimensionSides → 侧签注入（按侧计数生效）",
+    );
+  }
 
   // Confirmed probe stamps: prior session tags win over model rewrite.
   const priorDims =
@@ -5626,18 +6241,21 @@ function enforceStep1SlotCompletion(
   if (step1New) step1New.suggestedDimensions = dims;
 
   const effectiveCount = countEffectiveStep1Dimensions(dims);
-  const dimsSufficient = computeStep1DimensionsSufficient({
-    ...merged,
-    suggestedDimensions: dims,
-  });
+  const dimsSufficient = computeStep1DimensionsSufficient(
+    { ...merged, suggestedDimensions: dims },
+    { exhausted },
+  );
   if (step1New) {
     step1New.dimensionsSufficient = dimsSufficient;
   }
-  const slotsOk = isStep1SlotsComplete({
-    ...merged,
-    suggestedDimensions: dims,
-    dimensionsSufficient: dimsSufficient,
-  });
+  const slotsOk = isStep1SlotsComplete(
+    {
+      ...merged,
+      suggestedDimensions: dims,
+      dimensionsSufficient: dimsSufficient,
+    },
+    { exhausted },
+  );
   const text = String(data.text || "");
   const softExitAsk = textOffersStep1Exit(text);
   const ctaOk = textSuggestsStep1Complete(text);
@@ -5700,7 +6318,12 @@ function enforceStep1SlotCompletion(
     const part1 = safeOverridePart1(
       split.part1 || "目前可展开的角度还偏少。",
     );
-    data.text = `${part1}\n\n---\n\n目前比较扎实的分析角度还不到 ${STEP1_DIM_MIN_EFFECTIVE} 个。请再补充一个不同的中性角度（不要和已有角度重复）。`;
+    const missingHint = formatStep1MissingSideHint(
+      String(merged.correctType || ""),
+      dims.map(String),
+      exhausted,
+    );
+    data.text = `${part1}\n\n---\n\n${missingHint}`;
     console.warn(
       `[Step1Guard] Soft exit asked before sufficiency (effective=${effectiveCount}); forcing more angles.`,
     );
@@ -5778,10 +6401,18 @@ function enforceStep1SlotCompletion(
     const part1 = safeOverridePart1(
       split.part1 || "我们先把讨论角度确认清楚。",
     );
-    const ask =
-      effectiveCount < STEP1_DIM_MIN_EFFECTIVE
-        ? `目前可确认展开的角度是 ${effectiveCount} 个，还需要至少 ${STEP1_DIM_MIN_EFFECTIVE} 个。请再补充一个不同的中性角度，并说明有没有具体场景苗头。`
-        : "请确认这些角度是否已有具体场景苗头；如果暂时想不到别的，告诉我，我们再进入第二步。";
+    const perSideNow = step1PerSideStatus(
+      dims.map(String),
+      String(merged.correctType || ""),
+      exhausted,
+    );
+    const ask = perSideNow.pass
+      ? "请确认这些角度是否已有具体场景苗头；如果暂时想不到别的，告诉我，我们再进入第二步。"
+      : formatStep1MissingSideHint(
+          String(merged.correctType || ""),
+          dims.map(String),
+          exhausted,
+        );
     data.text = `${part1}\n\n---\n\n${ask}`;
     if (dimsSufficient) {
       if (!data.progressUpdate.step1Data) {
@@ -5796,6 +6427,44 @@ function enforceStep1SlotCompletion(
     }
     console.warn(
       `[Step1Guard] Cleared completion; effectiveDims=${effectiveCount} sufficient=${dimsSufficient}.`,
+    );
+    return;
+  }
+
+  // F2 硬出口：学生已明确耗尽（"想不出来了"）且按侧门禁已放行（含降级逃生），
+  // 但模型持续追索缺失侧、从不发硬 CTA → 实机卡死（recorded e2e 打满 10 轮 cap）。
+  // 此处由服务端确定性补硬 CTA 并完成 Step1，不再等模型文本。
+  // 注意不要求 dimsSufficient：该标志尊重模型的 dimensionsSufficient=false 否决，
+  // 而模型会按"材料不足"持续否决，使耗尽逃生永远不可达——降级放行本就是服务端裁决。
+  // 底线：至少 2 个已探测维度（防空洞完成；已探测即"教练问过、学生答过"，
+  // 判 thin/空标签 的也计入——耗尽降级本就允许带薄料进入下一步）。
+  const probedDimCount = dims.filter((d) =>
+    hasStandaloneStep1Tag(String(d), STEP1_DIM_PROBED_TAG),
+  ).length;
+  if (
+    exhausted &&
+    !ctaOk &&
+    slotsOk &&
+    !newDimSameTurn &&
+    probedDimCount >= 2
+  ) {
+    const target = ensureStep1DataBucket(data, mergedAfter);
+    target.dimensionsSufficient = true;
+    ensureStep1ExitOfferedFlag(
+      target,
+      Array.isArray(target.suggestedDimensions)
+        ? target.suggestedDimensions
+        : dims,
+    );
+    const split = splitTwoParts(text, 1);
+    const part1 = safeOverridePart1(split.part1 || "好的，我们先到这里。");
+    data.text = `${part1}\n\n---\n\n想不出来也没关系，现有的角度已经够用了。请点击【下一步】进入第二步。`;
+    data.progressUpdate.isCompleted = true;
+    if (data.progressUpdate.step2Data) {
+      delete data.progressUpdate.step2Data;
+    }
+    console.warn(
+      "[Step1Guard] F2 hard exit: student exhausted + per-side gate passed (escape) → deterministic CTA + complete.",
     );
     return;
   }
@@ -5982,6 +6651,8 @@ async function generateOpenAICompat(params: {
     // 自带 .text getter，OpenAI 兼容路径必须补上，否则 undefined）。
     text: content,
     candidates: [{ content: { parts: [{ text: content }] } }],
+    // token 用量（DeepSeek 含 prompt_cache_hit_tokens 等缓存命中字段）。
+    usage: data?.usage,
   };
 }
 
@@ -6030,7 +6701,13 @@ async function generateContentWithFallback(params: {
 }): Promise<any> {
   // 多提供商分派：openai-compatible 走 OpenAI 兼容端点，其余走 Gemini。
   if (getLLMProvider() === "openai-compatible") {
-    return generateOpenAICompatWithRetry(params);
+    const response = await generateOpenAICompatWithRetry(params);
+    recordTokenUsage(
+      "openai-compatible",
+      String(process.env.OPENAI_MODEL || ""),
+      response?.usage,
+    );
+    return response;
   }
 
   const ai = getAI();
@@ -6052,6 +6729,7 @@ async function generateContentWithFallback(params: {
         });
         const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         log.llmResponse(model, rawText);
+        recordTokenUsage("gemini", model, response?.usageMetadata);
         return response;
       } catch (error: any) {
         lastError = error;
@@ -7513,6 +8191,11 @@ async function startServer() {
     });
   });
 
+  // 1a. API - LLM token 用量累计（进程内存级；缓存命中等字段 API 返回时计入）
+  app.get("/api/token-usage", (req, res) => {
+    res.json(getTokenUsageSnapshot());
+  });
+
   // 1b. API - Step 2.5 Planner
   app.post("/api/planner/generate", async (req, res) => {
     try {
@@ -8092,10 +8775,30 @@ async function startServer() {
           step1Summary += `Student's own words from Step 1 (unprocessed — prefer these phrasings when expanding):\n"${step1Notes}"\n`;
         }
         if (step1Eval) {
-          const step1Dims = (step1Eval.suggestedDimensions || [])
-            .map((d: string) => d?.trim?.() || "")
+          // 防御：模型偶尔把数组字段返回为字符串/对象，.map/.join 会直接 500。
+          const rawSugDims = step1Eval.suggestedDimensions;
+          const step1Dims = (
+            Array.isArray(rawSugDims)
+              ? rawSugDims
+              : typeof rawSugDims === "string" && rawSugDims.trim()
+                ? [rawSugDims]
+                : []
+          )
+            .map((d: any) =>
+              String(
+                d && typeof d === "object" ? d.dimension ?? d.label ?? "" : d || "",
+              ).trim(),
+            )
             .filter((d: string) => d.length > 0);
-          step1Summary += `Coach Evaluation:\n- Question Type: ${step1Eval.correctType}\n- Core Issue: ${step1Eval.coreIssue}\n- Constraints: ${(step1Eval.constraints || []).join(", ")}\n- Suggested Dimensions: ${step1Dims.length > 0 ? step1Dims.join(", ") : "Not provided"}\n- Critique: ${step1Eval.critique}`;
+          const rawConstraints = step1Eval.constraints;
+          const step1Constraints = (
+            Array.isArray(rawConstraints)
+              ? rawConstraints
+              : typeof rawConstraints === "string" && rawConstraints.trim()
+                ? [rawConstraints]
+                : []
+          ).map((c: any) => String(c || ""));
+          step1Summary += `Coach Evaluation:\n- Question Type: ${step1Eval.correctType}\n- Core Issue: ${step1Eval.coreIssue}\n- Constraints: ${step1Constraints.join(", ")}\n- Suggested Dimensions: ${step1Dims.length > 0 ? step1Dims.join(", ") : "Not provided"}\n- Critique: ${step1Eval.critique}`;
         }
         if (!step1Summary) {
           step1Summary = "Not provided";
@@ -8249,6 +8952,7 @@ ${memoryDigestStr}
   Dimension quality & exit rules (CRITICAL — Step 1 is divergent brainstorm with light quality filter; server enforces tags + exit gate):
   - Cap: never keep more than 6 dimension labels. At 6, stop asking for more angles and you MAY emit the hard Step-2 CTA.
   - Tag format (STRICT): write status tags as SEPARATE parentheses after the label. Correct: "公众健康（已探测）（可展开）". Incorrect / ignored by server: "公众健康（二手烟危害 - 可展开）", untagged "公众健康", or mixing explanation inside the status parentheses.
+  - Side attribution (STRICT, per PM "每问/每侧 ≥2"): for two-side/two-question types (Discuss Both Views, Advantages/Disadvantages, Two-part Question, Problem / Solution, Positive / Negative), you MUST declare EVERY dimension's side via the structured field step1Data.dimensionSides (entries of {dimension, side}; A = 观点A/优点/第1问/成因侧, B = 观点B/缺点/第2问/措施侧; "G" only when a dimension genuinely covers BOTH). The server counts per side from THIS field — in-text （侧：X） tags are NOT required (harmless if present, the server preserves them). Dimensions with no declared side count as 未归属 and do NOT count toward any side — the gate requires ≥2 effective per side. For single-side types (Agree/Disagree etc.) dimensionSides may be omitted.
   - Confirmed dimension LOCK (CRITICAL): once a dimension already carries server probe stamps （已探测）/（可展开）/（空标签）/（质量待确认）, copy that entry VERBATIM (same core label + same status tags) into suggestedDimensions every turn. You may APPEND new bare labels at the end. FORBIDDEN: stripping status tags, rewriting a confirmed label's tags, or dropping a confirmed dimension unless the student explicitly asks to remove/rename it. Server restores confirmed stamps if the model rewrites them.
   - Light expandability probe (ONCE per new dimension, REQUIRED before quality tags) — SERVER OWNS THE LOOP:
     1) First record the raw label WITHOUT （可展开）/（空标签）/（已探测）. FORBIDDEN: tagging status on the introduce turn.
@@ -8257,7 +8961,7 @@ ${memoryDigestStr}
   - FORBIDDEN: emitting hard completion CTA or soft exit while unprobed labels remain.
   - Probe anti-loop: each dimension gets at most ONE probe. If it fails (thin), do NOT deepen that same dimension — invite a DIFFERENT new angle instead (only when no bare labels remain).
   - Effective count (server enforces): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, and （质量待确认） do NOT count toward sufficiency.
-  - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) effective dimensions >= 3; (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough"; (d) no bare/unprobed labels remain. If not sufficient, keep probing bare labels or ask for another NEW angle — do NOT ask "够用了吗".
+  - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) EVERY required side has at least 2 effective dimensions (per-side ≥2: Agree/Disagree = 1 side ≥2; Discuss Both Views & Advantages/Disadvantages = 2 sides each ≥2; Two-part / Problem-Solution / Positive-Negative = each question ≥2); (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough"; (d) no bare/unprobed labels remain. If not sufficient, keep probing bare labels or ask for another NEW angle ON THE MISSING SIDE — do NOT ask "够用了吗".
   - Soft exit offer ONLY after dimensionsSufficient=true and no bare labels: ask whether they want to add more; set exitOffered=true and tag （已询退出）. Soft ask MUST NOT include "点击【下一步】". Example soft ask: "这几个角度已经可以支撑分析了。还能想到别的吗？如果暂时想不到别的，告诉我，我们再进入第二步。"
   - Hard completion CTA ONLY after soft exit was offered AND student confirms stop / says "没有更多了" / "先这样", OR (cap=6 AND every label already probed): Part 2 MUST include both "点击" + "【下一步】" (or "下一步") AND "进入第二步", then set isCompleted:true.
   - Cap=6 means stop asking for MORE new angles. It does NOT skip probes on existing bare labels. Student exhausted with bare labels still open → server may stamp （质量待确认）.
@@ -8272,8 +8976,8 @@ ${memoryDigestStr}
        - Do NOT invent the Task B dimension yourself — it must come from what the student actually said.
   - Single-task question types (Agree / Disagree, Discuss Both Views, Advantages / Disadvantages) keep the existing single generic "list 2-4 dimensions" question — do NOT split these; they only have one task to analyze.
   - Tag each recorded dimension with which task(s) it covers using a short natural-language suffix so Step 2 can anchor correctly later, e.g. "经济发展（原因+评价均适用）" or "身份认同（评价）". Do not use raw field/stage names (taskMap, explore_A/B) as the tag text — and never expose this tagging logic to the student either.
-  - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), prefer at least 2 distinct angles before moving to the next task/slot. HARD: do NOT ask Task B while any Task A label is still unprobed — finish light probes on Task A first (server will rewrite Part 2 if you jump early). If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？") before moving on. Anti-loop: at most ONE such follow-up per task; if the student still only gives 1, accept it and move on (do not fabricate a 2nd to force the count).
-  - Sequencing with Dimension quality & exit rules above: after BOTH tasks have been asked AND all collected labels are probed (each following Per-task sufficiency + probe-first), if the TOTAL EFFECTIVE dimension count is still below 3, ask for one more NEW angle (no exit option yet); do not fabricate to skip this.
+  - Per-task sufficiency (CRITICAL — prefer collecting per-task, not just a pooled total): for EACH task (A and B), you MUST reach at least 2 distinct angles before moving to the next task/slot. HARD: do NOT ask Task B while any Task A label is still unprobed — finish light probes on Task A first (server will rewrite Part 2 if you jump early). If a task only has 1 angle after the first ask, ask ONE follow-up scoped to THAT SAME task (e.g. "除了[已给角度]，这方面还有别的角度吗？"); if it still has only 1, ask once more with a concrete example direction for that same task — do NOT fabricate a 2nd label, and do NOT move on until the student signals they cannot think of more (then the server's per-side escape handles it).
+  - Sequencing with Dimension quality & exit rules above: after BOTH tasks have been asked AND all collected labels are probed (each following Per-task sufficiency + probe-first), if ANY required side still has fewer than 2 effective dimensions, ask for one more NEW angle ON THAT SIDE (no exit option yet); do not fabricate to skip this.
   - Continuation-signal routing (CRITICAL — student may still be finishing the previous task after you already asked the next one):
     - If your previous question already moved to Task B (or the next slot), but the student's CURRENT message signals they are still continuing the previous task — e.g. "还没说完" / "我接着说" / "继续刚才" / "等一下" / "先补充一下" / "还有一个原因" / or they clearly keep elaborating causes when you just asked for evaluation angles — then route this turn's content into the PREVIOUS task/slot (Task A / prior slot). Do NOT treat it as an answer to the new question.
     - Silently merge the continuation into the correct prior slot's suggestedDimensions (apply the causal-chain vs parallel-angles test). Do NOT scold, do NOT re-ask the already-advanced question in the same turn, and do NOT pretend they answered Task B.
@@ -8301,7 +9005,7 @@ ${memoryDigestStr}
   - missing suggestedDimensions, single-task type -> "为了回答这道题，我们需要比较哪些方面？请列出 2~4 个中性维度名称即可（先不要下利弊结论）。"
   - missing suggestedDimensions, compound type, Task A not yet answered -> use the Per-task dimension flow above, Task A question.
   - Task A answered, Task B not yet answered (compound type) -> use the Per-task dimension flow above, Task B question (guided by Task A's answer).
-  - suggestedDimensions has fewer than 3 effective dimensions so far -> ask for another NEW angle with no exit option yet (per Dimension quality & exit rules); do not fabricate labels.
+  - suggestedDimensions: ANY required side has fewer than 2 effective dimensions so far -> ask for another NEW angle on the missing side with no exit option yet (per Dimension quality & exit rules); do not fabricate labels.
 
   Completion output (ONLY after dimensionsSufficient + exit offered + student confirmed stop, or cap=6):
   - Part 1: ONE short confirmation + compact structured summary (题型、核心议题、关键限定、建议维度). No long restatement. You MAY briefly echo writingDestination in structural terms only.
@@ -8576,6 +9280,7 @@ ${memoryDigestStr}
   - If the student's answer is off-target for the current slot, name the mismatch in one short sentence, then guide back — do NOT open with empty praise.
   - Anti-loop: never re-ask the same question 3+ times; after one depth follow-up, accept concise content and move on.
   - Do NOT propose paragraph modes, pointBlock splits, direct_points / total_then_points, or any structural scheme — the skeleton is already frozen.
+  - STRUCTURE CHANGE OFFER (P3): if the student EXPLICITLY objects to the current structure or wants to change a body's core point (e.g. "我想把第二个论点换成…", "这个结构不合适", "我不想按这两段写"), you MAY acknowledge it, explain the cost (confirming will clear the current Step-3 progress and regenerate the plan), and ask the student to confirm or decline — set intent=structure_change. You MUST NOT change any structure yourself; the server executes the re-plan only after the student confirms.
   - Keep it human: vary openers, no filler superlatives, no meta-commentary about the board/write process (「确认前不会写入右侧」类禁止), no English translations.
   - SINGLE-SUBPOINT SCOPE: each reply serves ONLY the current Active Subpoint. Do not start the next body or ask "我们接着写第二个分论点吧" — switching bodies is the UI's job.
   - No-spoiler acknowledgment: Part 1 may name WHICH slot the answer fills, but must NOT explain why it works or spell out the reasoning chain for the student (that reasoning is their own thinking practice).
@@ -8690,19 +9395,27 @@ ${stepGuidelines}
   - If the student's input is a brief affirmation, acknowledgement, or filler word (e.g., "嗯", "然后呢", "好的", "好的好的", "对", "对的", "是", "是的", "对，没有了", "嗯呢", "好的，明白"), you MUST NOT respond with simple filler phrases (like "很好。我们继续。") without a clear, specific follow-up question.
   - Instead, you MUST immediately analyze where you are in the current step's tasklist, formulate the next concrete, constructive question in the Socratic sequence (e.g., ask about constraints, underlying contradiction, or ask them to map their thoughts into an argument stance/subpoints), and present it clearly as the next specific question.
   - There must ALWAYS be a highly specific, action-oriented question or instruction in Part 2. Never leave the student hanging or waiting for a question.
-- STRUCTURE RULE (CRITICAL): You MUST ALWAYS split your response into TWO distinct parts separated by a line containing exactly and only "---".
+- STRUCTURE RULE (CRITICAL): Your reply has TWO parts — return them as the separate JSON fields "part1" and "part2" (preferred; the server assembles the display text), or as one "text" string whose two parts are separated by a line containing exactly and only "---" (legacy fallback).
   Part 1 (Feedback): Concise, constructive feedback on the student's input. Highlight (bold) only the key points. If the student only said "嗯" or "好的", Part 1 should simply validate their agreement briefly.
   Part 2 (Next Action): A single, highly specific and concise question to guide the student to the next step, OR a clear call-to-action directing them to click the next-step button if the current step is completed. **YOU MUST NEVER OMIT PART 2.** Even if you think you just answered their question, you MUST end with a follow-up question to keep the flow moving.
 - FORMATTING: Use appropriate line breaks for readability. Ensure the structure is: Feedback section \n\n --- \n\n Question section/Call-to-action. DO NOT include "反馈:" or "引导:" labels.
 
 JSON Output Schema rules:
-- "text" is ALWAYS required.
+- PREFERRED output contract (CRITICAL): return "part1" and "part2" as TWO SEPARATE JSON fields — "part1" = your feedback/validation of the student's answer (NO "---" inside), "part2" = the next guiding question or CTA (NO "---" inside). The server assembles the display text from them. If you use part1/part2, "text" may simply repeat part1 + "\n\n---\n\n" + part2.
+- Legacy fallback: if you do not return part1/part2, then "text" is required and MUST contain the two parts separated by a line with only "---".
 - You MUST populate "step1Data" / "step2Data" inside "progressUpdate" IN REAL-TIME as the Socratic dialogue progresses.
   - For Step 1: As soon as any element is discussed (e.g. they determine the correctType, coreIssue, constraints, writingTask, keyQualifier, or suggestedDimensions), put those values in "step1Data" and leave other fields as empty strings or appropriate placeholders. This allows the right-side board to sync in real-time as they talk.
   - For Step 2: As soon as they discuss their stance, populate "userStance". As soon as they suggest points, populate "userPoints", "critique", "suggestions", "blueprint", and the three checks. Keep suggestedPoints as "" (no English polish). suggestedStance optional Chinese only.
   - For Step 3: STRUCTURE IS FULLY SERVER-OWNED (meeting secretary). The server owns the frozen skeleton, lands the student's words into slots, and writes the board after confirm. You MUST NOT output paragraphPlan / step3SlotEval / step3SubpointSteps / kickoffPendingDrafts / any structure JSON in Step 3. Your ONLY job in Step 3 is a high-quality Socratic dialogue "text": read the Step 3 slot cursor in ContextSummary (firstEmpty label / confirmed siblings / pending), ask the first still-missing slot in natural Chinese, briefly acknowledge the student's answer, and guide them to confirm. Do not waste output tokens fabricating structure that the server already manages deterministically.
   - For Step 3, you MAY additionally output "step3Assessment" (judgment lens): after the student gives a real answer, assess it against the current slot and emit { slotKey, verdict: ok|thin|off_target|duplicate, reason, nextHint?, polishedText?, intent?, beats? }. verdict=ok means the answer fills the slot; thin = too shallow, ask one concrete follow-up; off_target = answered a different beat, guide back; duplicate = repeats a confirmed sibling, ask for a new angle. Optionally include "polishedText": a LIGHT language-only polish of the student's answer for the board display — ONLY allowed operations: delete filler words (那个/然后/就是/嗯), smooth word order without changing meaning, supply an elided subject/connector. KEEP ≥80% of the student's original words: do NOT swap words for synonyms, do NOT compress or drop content words, do NOT add any fact/claim/meaning the student did not say. When in doubt, return the original verbatim; empty when no polish is needed. Optionally include "beats": when ONE student message covers MULTIPLE consecutive empty slots of the same body (e.g. claim + its reason), list the segments (each a substring of the message, in order) so the server batch-lands them for a single confirm — omit when the answer covers one slot only. Optionally include "intent" ONLY when the message is semantically ambiguous (meta/question/correction); the server's deterministic rules already cover clear affirm/reject/meta. These fields are INTERNAL (server uses them for landing/audit/hints) — never echo them in "text". Keep them optional; "text" remains your priority.
 - Do NOT omit "step1Data" / "step2Data" when "isCompleted" is false. Real-time extraction is crucial so the student sees their thoughts instantly mirrored and summarized in the right sidebar.
+- OUTPUT SKELETON (CRITICAL for openai-compatible models — follow this shape exactly, every turn):
+  {"part1":"反馈……","part2":"下一个问题……","text":"反馈……\n\n---\n\n下一个问题……","progressUpdate":{"isCompleted":false,"step1Data":{"correctType":"","coreIssue":"","constraints":[],"suggestedDimensions":["角度A","角度B"],"dimensionSides":[{"dimension":"角度A","side":"A"},{"dimension":"角度B","side":"B"}],"critique":"","score":0},"step2Data":{…}},"step3Assessment":{…}}
+  Hard rules:
+  - part1/part2 contain NO "---" inside; the server assembles the final text from them.
+  - "suggestedDimensions" MUST be an ARRAY of strings listing EVERY dimension label collected so far — copy forward verbatim every turn (with their （已探测）/（可展开） stamps); never return [] or omit it once any angle has been discussed. Returning a single concatenated string is WRONG.
+  - "dimensionSides" is REQUIRED for two-side/two-question types (see Side attribution rule); each entry's "dimension" copies the dimension's core label.
+  - Omit step2Data/step3Assessment entirely when not relevant to the current step.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
 
@@ -8728,7 +9441,17 @@ Student says:
               text: {
                 type: Type.STRING,
                 description:
-                  "The AI Coach's message to the student. This string MUST consist of exactly two sections separated by a line containing ONLY '---'. Part 1 (above '---') is the validation/feedback of the student's answer. Part 2 (below '---') is the NEXT Socratic guiding question in the sequence (e.g. asking about Core Issue, Key Constraints, or Contradiction) or Next-Step Call-to-Action. YOU MUST NEVER OMIT PART 2 AND MUST NEVER OMIT THE '---' SEPARATOR.",
+                  "The AI Coach's message to the student. PREFERRED: return part1/part2 fields instead and let the server assemble this. Legacy form: two sections separated by a line containing ONLY '---' (Part 1 = validation/feedback above, Part 2 = next guiding question or CTA below). Never omit Part 2.",
+              },
+              part1: {
+                type: Type.STRING,
+                description:
+                  "PREFERRED output field: the coach's feedback/validation of the student's answer (NO '---' inside). The server assembles text = part1 + separator + part2.",
+              },
+              part2: {
+                type: Type.STRING,
+                description:
+                  "PREFERRED output field: the next guiding question or next-step call-to-action (NO '---' inside). If omitted, the server generates it deterministically from the current gate state.",
               },
               step3Assessment: {
                 type: Type.OBJECT,
@@ -8761,9 +9484,9 @@ Student says:
                   },
                   intent: {
                     type: Type.STRING,
-                    enum: ["content", "affirm", "reject", "meta", "question", "correction"],
+                    enum: ["content", "affirm", "reject", "meta", "question", "correction", "structure_change"],
                     description:
-                      "Step 3 ONLY, optional. Semantic intent of the student's latest message when the server's deterministic regex cannot classify it (ambiguous only). content=real answer; affirm=agreeing/confirming; reject=rejecting; meta=complaint like 'I already said this earlier'; question=student asks a question; correction=revising/correcting prior content.",
+                      "Step 3 ONLY, optional. Semantic intent of the student's latest message when the server's deterministic regex cannot classify it (ambiguous only). content=real answer; affirm=agreeing/confirming; reject=rejecting; meta=complaint like 'I already said this earlier'; question=student asks a question; correction=revising/correcting prior content; structure_change=student wants to change the body structure / replace a body's core point (server will arm a re-plan confirmation offer, never change structure directly).",
                   },
                   beats: {
                     type: Type.ARRAY,
@@ -8797,6 +9520,28 @@ Student says:
                       suggestedDimensions: {
                         type: Type.ARRAY,
                         items: { type: Type.STRING },
+                      },
+                      dimensionSides: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            dimension: {
+                              type: Type.STRING,
+                              description:
+                                "Copy of one dimension's core label from suggestedDimensions (status tags optional).",
+                            },
+                            side: {
+                              type: Type.STRING,
+                              enum: ["A", "B", "G"],
+                              description:
+                                "A = 观点A/优点/第1问/成因侧, B = 观点B/缺点/第2问/措施侧, G = genuinely covers both sides/questions (rare).",
+                            },
+                          },
+                          required: ["dimension", "side"],
+                        },
+                        description:
+                          "Step 1 ONLY. For two-side/two-question types (Discuss Both Views, Advantages/Disadvantages, Two-part Question, Problem / Solution, Positive / Negative): declare the side of EVERY dimension here — the server's per-side >=2 gate reads THIS structured field (in-text side tags are NOT required). Omit for single-side types (Agree/Disagree etc.).",
                       },
                       exitOffered: {
                         type: Type.BOOLEAN,
@@ -9141,6 +9886,7 @@ Student says:
         text: "Error parsing AI response.",
         progressUpdate: { isCompleted: false },
       });
+      assembleCoachTextFromParts(data);
 
       const currentStepNum = Number(step);
       const checkNeedsRepair = (parsed: any) => {
@@ -9161,6 +9907,16 @@ Student says:
             stage === "summary" &&
             (!Array.isArray(bodies) || bodies.length === 0)
           ) {
+            // F3：模型反复缺 blueprint（DeepSeek 实机观测）时，先用 plannerPayload
+            // 已确认材料确定性补全，避免修复重试循环打到缺料兜底、卡住真实用户。
+            const backfilled = synthesizeStep2BlueprintFromPayload(session);
+            if (backfilled && parsed?.progressUpdate?.step2Data) {
+              parsed.progressUpdate.step2Data.blueprint = backfilled;
+              console.warn(
+                `[CoachGuard] F3: summary blueprint missing → backfilled deterministically (bodies=${backfilled.bodies.length}).`,
+              );
+              return { needsRepair: false, reason: "", split };
+            }
             return {
               needsRepair: true,
               reason: "step2_summary_missing_blueprint",
@@ -9192,6 +9948,7 @@ Student says:
             currentStepNum,
             session,
             data?.progressUpdate?.step2Data,
+            data?.progressUpdate?.step1Data,
           );
           data.text = `${rawTextForP1}\n\n---\n\n${p1Part2}`;
           if (!data.progressUpdate) {
@@ -9206,10 +9963,8 @@ Student says:
 [SYSTEM CORRECTION]
 你的上一次输出存在格式或推进缺陷（reason=${firstCheck.reason}）。
 请严格重写本轮 JSON：
-1) text 必须包含两段，且用单独一行的 --- 分隔；
-2) Part 1 是简明反馈；
-3) Part 2 必须是一个具体、可执行的下一步问题或明确行动指令（不能省略）。
-4) 保持与当前步骤一致，继续推进流程，不要停在空泛回应。`;
+1) 优先用独立字段 part1（简明反馈）和 part2（具体、可执行的下一步问题或行动指令，不能省略），两个字段内部都不要出现 ---；若改用 text 单字段，则必须包含单独一行的 --- 分隔两段；
+2) 保持与当前步骤一致，继续推进流程，不要停在空泛回应。`;
 
         const retryResponse = await generateContentWithFallback({
           contents: `${prompt}${correctionSuffix}`,
@@ -9223,6 +9978,7 @@ Student says:
           text: "Error parsing AI response.",
           progressUpdate: { isCompleted: false },
         });
+        assembleCoachTextFromParts(retryData);
         const retryCheck = checkNeedsRepair(retryData);
 
         if (retryCheck.needsRepair) {
@@ -9238,6 +9994,8 @@ Student says:
             session,
             retryData?.progressUpdate?.step2Data ||
               data?.progressUpdate?.step2Data,
+            retryData?.progressUpdate?.step1Data ||
+              data?.progressUpdate?.step1Data,
           );
           retryData.text = `${safePart1}\n\n---\n\n${safePart2}`;
           if (!retryData.progressUpdate) {
@@ -9305,6 +10063,9 @@ Student says:
             );
           }
         }
+
+        // F1 兜底：双侧题型的维度侧别聚焦小调用（dimensionSides/前缀正则未覆盖时）。
+        await maybeClassifyStep1DimensionSides(data, session, question);
 
         enforceStep1SlotCompletion(data, session, userMessage);
       }
@@ -9494,8 +10255,23 @@ Student says:
         console.warn(
           `[Step3Decision] reject subpoint=${subpointId} x${landedList.length}（回退 recorded）`,
         );
+      } else if (decision === "reopen") {
+        // P2（D5 前半）：已确认槽修订入口。最小方案——只重开指定槽，不影响后续已确认槽。
+        const slotKey = String(req.body.slotKey || "").trim();
+        if (!slotKey) {
+          res.status(400).json({ error: "reopen requires slotKey" });
+          return;
+        }
+        const r = reopenSlot(sp, slotKey);
+        if (!r.ok) {
+          res.status(400).json({ error: r.reason || "reopen failed" });
+          return;
+        }
+        console.warn(
+          `[Step3Decision] reopen subpoint=${subpointId} slot=${slotKey}`,
+        );
       } else {
-        res.status(400).json({ error: "decision must be confirm|reject" });
+        res.status(400).json({ error: "decision must be confirm|reject|reopen" });
         return;
       }
       // 完成标志回传：本 body 是否填满 + 整个 Step3 是否全部完成（前端据此解锁 Step4）。
@@ -9508,7 +10284,8 @@ Student says:
         step3Subpoints.length > 0
           ? step3Subpoints.every((s: any) => isSkeletonComplete(s))
           : sp.isCompleted;
-      if (step3Done) session.step3.isCompleted = true;
+      // reopen 会让某 body 重新变为未完成，必须同步清除整个 Step3 的完成标志。
+      session.step3.isCompleted = step3Done;
       res.json({
         subpoint: sp,
         board: renderBoard(sp),

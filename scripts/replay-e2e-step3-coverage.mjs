@@ -224,9 +224,15 @@ async function main() {
     session: coachSession,
   });
 
+  // 真实契约：paragraphPlan 挂在客户端构建的 active subpoint 上（随 step3SecretarySubpoints
+  // 往返）；服务端秘书路径不保证在 progressUpdate 顶层/step3 回显。此处回退到 subpoint。
+  const activeSub = (coachSession.step3.subpoints || []).find(
+    (s) => String(s.id) === String(coachSession.step3.activeSubpointId),
+  );
   const plan = resp?.progressUpdate?.step3?.paragraphPlan ||
     resp?.progressUpdate?.paragraphPlan ||
     (resp?.progressUpdate?.step3Data && resp.progressUpdate.step3Data.paragraphPlan) ||
+    activeSub?.paragraphPlan ||
     null;
   assert.ok(plan && Array.isArray(plan.pointBlocks), '响应应带 paragraphPlan');
   const blockLabels = (plan.pointBlocks || [])

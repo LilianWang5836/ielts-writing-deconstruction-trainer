@@ -31,6 +31,7 @@ import {
   buildPlannerMaterialDigest,
   expandPackedDetailBodies,
   hydrateBodyPlansFromPayload,
+  isPointConfirmed,
   mergeBriefOnlyBodies,
   normalizeStep2PlannerPayload,
   resolvePointId,
@@ -102,7 +103,10 @@ export function collectPlannerInput(session: any, question: string, questionType
     plannerPayload = { ...plannerPayload, points: stamped };
   }
 
-  const points = activePoints(plannerPayload);
+  // PM 需求：planner 只消费已确认点（未确认点不进入 planner 输入）。
+  const points = activePoints(plannerPayload).filter((p) =>
+    isPointConfirmed(plannerPayload, p),
+  );
   const aMatch = userPoints.match(/A面[^：:]*[：:]([\s\S]*?)(?=B面[^：:]*[：:]|$)/);
   const bMatch = userPoints.match(/B面[^：:]*[：:]([\s\S]*)$/);
 
@@ -124,7 +128,7 @@ export function collectPlannerInput(session: any, question: string, questionType
     eval2?.clustering?.clusters?.[1]?.content ||
     '';
 
-  const materialDigest = buildPlannerMaterialDigest(plannerPayload);
+  const materialDigest = buildPlannerMaterialDigest(plannerPayload, points);
 
   return {
     question,

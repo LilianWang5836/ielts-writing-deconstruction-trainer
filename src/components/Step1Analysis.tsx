@@ -27,6 +27,7 @@ function formatStep1DimensionForDisplay(dim: string): {
     !has('空标签');
   const label = raw
     .replace(/[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出)\s*[）)]/g, '')
+    .replace(/[（(]\s*侧[：:]\s*[ABG]\s*[）)]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
   return { label: label || raw, expandable };

@@ -13,13 +13,49 @@ export const STEP1_PROBE_EXIT_OFFERED = '已询退出';
 export type Step1ProbeVerdict = 'expandable' | 'thin' | '';
 
 const STATUS_TAG_RE =
-  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出)\s*[）)]/g;
+  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测)\s*[）)]/g;
+
+const SIDE_TAG_RE = /[（(]\s*侧[：:]\s*([ABG])\s*[）)]/;
 
 export function stripStep1StatusTags(dim: string): string {
   return String(dim || '')
     .replace(STATUS_TAG_RE, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** 侧别标签（PM 每问/每侧 ≥2 用；侧别不算核心文案）。 */
+function stripStep1SideTag(dim: string): string {
+  return String(dim || '')
+    .replace(SIDE_TAG_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 侧别前缀习语（与 server.ts 的 STEP1_DIM_SIDE_PREFIX_RES 保持一致）：
+ *  模型常把侧别写进标签文本，如 "角度A（…）"、"A面…"、"第1问…"。只在词首匹配。 */
+const SIDE_PREFIX_RES: [RegExp, 'A' | 'B'][] = [
+  [/^(?:角度|观点|方面|立场|侧面|侧)\s*[:：]?\s*A(?=[（(：:、\s]|$)/i, 'A'],
+  [/^(?:角度|观点|方面|立场|侧面|侧)\s*[:：]?\s*B(?=[（(：:、\s]|$)/i, 'B'],
+  [/^A\s*(?:面|侧|方)(?=[（(：:、\s]|$)/i, 'A'],
+  [/^B\s*(?:面|侧|方)(?=[（(：:、\s]|$)/i, 'B'],
+  [/^第\s*(?:1|一)\s*问/, 'A'],
+  [/^第\s*(?:2|二|两)\s*问/, 'B'],
+];
+
+function step1DimensionSide(dim: string): 'A' | 'B' | 'G' | null {
+  const m = SIDE_TAG_RE.exec(String(dim || ''));
+  if (m) return m[1] as 'A' | 'B' | 'G';
+  const t = String(dim || '').trim();
+  for (const [re, side] of SIDE_PREFIX_RES) {
+    if (re.test(t)) return side;
+  }
+  return null;
+}
+
+/** core = 状态戳与侧别标签都剥掉后的核心文案（用于跨轮匹配）。 */
+function stripStep1AllTags(dim: string): string {
+  return stripStep1SideTag(stripStep1StatusTags(dim));
 }
 
 export function hasStep1StatusTag(dim: string, tag: string): boolean {
@@ -54,7 +90,7 @@ const PROBE_STATUS_TAGS = [
 function collectCores(dims: string[] | null | undefined): Set<string> {
   const seen = new Set<string>();
   for (const d of dims || []) {
-    const core = stripStep1StatusTags(String(d || '')).toLowerCase();
+    const core = stripStep1AllTags(String(d || '')).toLowerCase();
     if (core) seen.add(core);
   }
   return seen;
@@ -84,7 +120,7 @@ export function preserveStep1ProbeTags(
   const priorList = (priorDims || []).map((d) => String(d || '').trim()).filter(Boolean);
   const priorByCore = new Map<string, { raw: string; tags: string[] }>();
   for (const raw of priorList) {
-    const core = stripStep1StatusTags(raw).toLowerCase();
+    const core = stripStep1AllTags(raw).toLowerCase();
     if (!core) continue;
     const tags = extractProbeStatusTags(raw);
     if (tags.length === 0) continue;
@@ -98,12 +134,18 @@ export function preserveStep1ProbeTags(
   const next = (newDims || []).map((d) => {
     const raw = String(d || '').trim();
     if (!raw) return raw;
-    const core = stripStep1StatusTags(raw).toLowerCase();
+    const core = stripStep1AllTags(raw).toLowerCase();
     if (!core) return raw;
     seenCores.add(core);
     const prior = priorByCore.get(core);
     if (!prior) return raw;
     let stamped = stripStep1StatusTags(raw) || raw;
+    // T1：侧别标签与状态戳同级——prior 有侧别而本轮丢失时恢复；LLM 显式换侧则尊重新值。
+    const newSide = step1DimensionSide(stamped);
+    const priorSide = step1DimensionSide(prior.raw);
+    if (!newSide && priorSide) {
+      stamped = `${stripStep1SideTag(stamped)}（侧：${priorSide}）`;
+    }
     for (const tag of prior.tags) {
       stamped = stampStep1StatusTag(stamped, tag);
     }
@@ -129,13 +171,23 @@ export function stripIllegalSameTurnProbeTags(
   dims: string[],
   priorDims: string[] | null | undefined,
 ): { dims: string[]; strippedCores: string[] } {
-  const oldCores = collectCores(priorDims);
+  // prior 中带合法状态戳的 core：戳由服务端掌管，模型复写时由 preserveStep1ProbeTags
+  // 负责恢复，这里不动。prior 中无戳（或不存在）的 core：模型自带的任何状态戳都是
+  // 自报 → 剥掉。注意不能只看"core 是否老"：上一轮剥成裸标签入会话后，模型下一轮
+  // 又给它贴上自报戳，若按老 core 放行，脏戳就被当作服务端戳永久锁定（实机观测）。
+  const legitCores = new Set<string>();
+  for (const d of priorDims || []) {
+    const raw = String(d || '').trim();
+    if (!raw || isStep1DimensionUnprobed(raw)) continue;
+    const core = stripStep1AllTags(raw).toLowerCase();
+    if (core) legitCores.add(core);
+  }
   const strippedCores: string[] = [];
   const next = (dims || []).map((d) => {
     const raw = String(d || '').trim();
     if (!raw) return raw;
-    const core = stripStep1StatusTags(raw).toLowerCase();
-    if (!core || oldCores.has(core)) return raw;
+    const core = stripStep1AllTags(raw).toLowerCase();
+    if (!core || legitCores.has(core)) return raw;
     if (!isStep1DimensionUnprobed(raw)) {
       strippedCores.push(core);
       return stripStep1StatusTags(raw) || raw;
@@ -181,12 +233,12 @@ export function resolvePendingProbeAnswer(
   pendingCore: string,
   verdict?: unknown,
 ): string[] {
-  const core = stripStep1StatusTags(pendingCore).toLowerCase();
+  const core = stripStep1AllTags(pendingCore).toLowerCase();
   if (!core) return dims;
   const v = normalizeProbeVerdict(verdict);
   return (dims || []).map((d) => {
     const raw = String(d || '').trim();
-    if (stripStep1StatusTags(raw).toLowerCase() !== core) return raw;
+    if (stripStep1AllTags(raw).toLowerCase() !== core) return raw;
     // Drop self-reported status tags; keep task suffixes (原因/评价/…).
     let next = stripStep1StatusTags(raw) || raw;
     next = stampStep1StatusTag(next, STEP1_PROBE_PROBED);
@@ -221,7 +273,7 @@ export function earliestUnprobedDimension(
 }
 
 export function buildBareDimensionProbeAsk(dim: string): string {
-  const label = stripStep1StatusTags(dim) || String(dim || '').trim() || '这个角度';
+  const label = stripStep1AllTags(dim) || String(dim || '').trim() || '这个角度';
   return (
     `『${label}』这个角度你脑子里已经有具体场景或例子的苗头了吗？` +
     `有的话简单说一句信号即可；还没有的话我们再换一个角度。`
@@ -239,7 +291,7 @@ export function textLooksLikeProbeAskForDim(
         .slice(1)
         .join('---')
     : String(text || '');
-  const label = stripStep1StatusTags(dim);
+  const label = stripStep1AllTags(dim);
   if (!label || label.length < 2) return false;
   const core = label.replace(/（[^）]*）|\([^)]*\)/g, '').trim();
   const hitLabel =

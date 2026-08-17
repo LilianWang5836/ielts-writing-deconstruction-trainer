@@ -98,7 +98,7 @@ async function main() {
   msg = '我来说说我对这个题目的立场和一些论点。';
   messages.push({ sender: 'user', text: msg });
   let step2Completed = false;
-  for (let t = 0; t < 24; t++) {
+  for (let t = 0; t < 32; t++) {
     resp = await postCoach({ step: 2, userMessage: msg, session, messages });
     applyProgress(session, 2, resp.progressUpdate);
     messages.push({ sender: 'ai', text: resp.text });
@@ -118,6 +118,13 @@ async function main() {
     // 决策下一步回复（顺序重要：先识别"确认进入下一步"，再识别立场/采纳）
     if (/材料池和立场已经齐了|确认进入下一步|请确认进入|确认完成|全部齐了|没有要改/.test(p2)) {
       msg = '确认进入下一步';
+      messages.push({ sender: 'user', text: msg });
+      continue;
+    }
+    // 教练明确在补缺侧材料（含刚锁定一侧详略后的"接下来只补真正缺失的材料类别"）：
+    // 必须给点，不能回"采纳"。置于"采纳/详略"分支之前，否则"已锁定"会抢先命中。
+    if (/缺失的材料类别|只补真正缺失|「观点A」当前|「观点B」当前|还差至少|请给出至少 1 个具体主张/.test(p2)) {
+      msg = pi < studentPoints.length ? studentPoints[pi++] : (extra.shift() || '再补一个：AI 会推动企业重塑组织架构，把裁员视为最后手段，转而通过内部转岗消化冲击，所以长期就业总量未必下降。');
       messages.push({ sender: 'user', text: msg });
       continue;
     }

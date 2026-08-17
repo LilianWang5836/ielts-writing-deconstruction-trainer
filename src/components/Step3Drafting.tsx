@@ -11,6 +11,7 @@ import {
   HelpCircle,
   Sparkles,
   RotateCcw,
+  Pencil,
 } from "lucide-react";
 import { Topic, PracticeSession } from "../types";
 import CoachChat, { CoachChatHandle } from "./CoachChat";
@@ -113,6 +114,55 @@ export default function Step3Drafting({
   const coachChatRef = useRef<CoachChatHandle>(null);
   // 同步 CoachChat 的 loading 状态（ref 更新不触发父组件重渲染，故用回调存本地 state）。
   const [coachLoading, setCoachLoading] = useState(false);
+  // P3（D5 后半）结构重规划：确认后重跑 planner 并重建 Step3。
+  const [replanning, setReplanning] = useState(false);
+  const [replanError, setReplanError] = useState(false);
+  const replanStartedRef = useRef(false);
+
+  const runReplan = async () => {
+    setReplanning(true);
+    setReplanError(false);
+    try {
+      const res = await fetch('/api/planner/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session }),
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'passed' && data.step2_5) {
+        onUpdateSession({
+          step2_5: data.step2_5,
+          step3: {
+            ...session.step3,
+            subpoints: [],
+            activeSubpointId: undefined,
+            isCompleted: false,
+            structureReplanned: false,
+          },
+        } as any);
+      } else {
+        setReplanError(true);
+        replanStartedRef.current = false; // 允许重试
+      }
+    } catch (e) {
+      console.warn('[Step3] replan error', e);
+      setReplanError(true);
+      replanStartedRef.current = false;
+    } finally {
+      setReplanning(false);
+    }
+  };
+
+  useEffect(() => {
+    if (session.step3.structureReplanned && !replanStartedRef.current) {
+      replanStartedRef.current = true;
+      runReplan();
+    }
+    if (!session.step3.structureReplanned) {
+      replanStartedRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.step3.structureReplanned]);
 
   /**
    * 确认/拒绝当前 landed 待写板内容：优先走确定性 decision 通道（零 LLM 调用），
@@ -155,6 +205,49 @@ export default function Step3Drafting({
       }
     } catch {
       fallback();
+    } finally {
+      setCoachLoading(false);
+    }
+  };
+
+  /**
+   * P2（D5 前半）已确认槽修订入口：调用确定性 decision 通道 reopen 指定槽，
+   * 该槽回到待填，用户重新作答后复用现有 pending→confirm 路径。
+   */
+  const reopenSlot = async (targetSubpointId: string, slotKey: string) => {
+    try {
+      setCoachLoading(true);
+      const res = await fetch('/api/step3/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session,
+          subpointId: targetSubpointId,
+          decision: 'reopen',
+          slotKey,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.subpoint) {
+        onUpdateSession((prev) => {
+          const subpoints = Array.isArray(prev.step3?.subpoints)
+            ? [...prev.step3.subpoints]
+            : [];
+          const idx = subpoints.findIndex(
+            (s: any) => String(s.id) === String(targetSubpointId),
+          );
+          if (idx >= 0) subpoints[idx] = data.subpoint;
+          // reopen 会重新打开某 body，因此 Step3 完成标志以决策通道回传为准。
+          const isCompleted = data.step3Done || false;
+          return {
+            step3: { ...prev.step3, subpoints, isCompleted },
+          } as Partial<PracticeSession>;
+        });
+      } else {
+        console.warn('[Step3] reopen failed', data);
+      }
+    } catch (e) {
+      console.warn('[Step3] reopen error', e);
     } finally {
       setCoachLoading(false);
     }
@@ -462,6 +555,34 @@ export default function Step3Drafting({
     (s) => s.id === session.step3.activeSubpointId,
   );
 
+  // body 完成后自动推进到下一段：教练口播"进入下一段"但 activeSubpointId 不会
+  // 自己切换，学生继续在聊天里作答会被打到已完成 body 上空转（UI 实机录制证实：
+  // body-1 完成后 body-2 的答案全部空转，教练原地重问 30+ 轮）。只在"同一 body 从
+  // 未完成变为完成"的跃迁时推进一次；用户手动点 tab 回看不触发。
+  const bodyAdvanceRef = useRef<{ id?: string; complete: boolean }>({
+    id: undefined,
+    complete: false,
+  });
+  useEffect(() => {
+    const active = subpoints.find(
+      (s) => s.id === session.step3.activeSubpointId,
+    );
+    const id = active?.id as string | undefined;
+    const complete = !!active?.isCompleted;
+    const prev = bodyAdvanceRef.current;
+    if (id && id === prev.id && complete && !prev.complete) {
+      const next = subpoints.find(
+        (s) => s.id !== id && !s.isCompleted && (s as any).selectable !== false,
+      );
+      if (next) {
+        onUpdateSession((prev) => ({
+          step3: { ...prev.step3, activeSubpointId: next.id },
+        }) as Partial<PracticeSession>);
+      }
+    }
+    bodyAdvanceRef.current = { id, complete };
+  }, [subpoints, session.step3.activeSubpointId, onUpdateSession]);
+
   // Find the first EMPTY slot in the plan (prefilled/confirmed claim slots are skipped).
   const findFirstEmptyStepLabel = (plan: any): string => {
     if (!plan || !Array.isArray(plan.pointBlocks)) return '分论点';
@@ -601,6 +722,7 @@ export default function Step3Drafting({
     }
     const confirmedBySlot = new Map<string, string>();
     const landedBySlot = new Map<string, string>();
+    const landedRevertedBySlot = new Map<string, boolean>();
     for (const m of sp.minutes || []) {
       if (!m?.slotKey) continue;
       const view = (m as any).displayText || m.text;
@@ -608,6 +730,7 @@ export default function Step3Drafting({
       if (m.status === 'confirmed') confirmedBySlot.set(m.slotKey, tagged);
       else if (m.status === 'landed' && !confirmedBySlot.has(m.slotKey)) {
         landedBySlot.set(m.slotKey, tagged);
+        if ((m as any).polishReverted) landedRevertedBySlot.set(m.slotKey, true);
       }
     }
     const flatSlots: { key: string; label: string; placeholder: string; semantic: string }[] = [];
@@ -642,6 +765,7 @@ export default function Step3Drafting({
           semantic: s.semantic,
           content: confirmedBySlot.get(s.key) || '',
           pending: landedBySlot.get(s.key) || '',
+          polishReverted: landedRevertedBySlot.has(s.key) || false,
         })),
       })),
       flatSlots,
@@ -697,6 +821,9 @@ export default function Step3Drafting({
                     <p className="text-xs md:text-[12.5px] leading-relaxed text-slate-700">
                       <span className="text-amber-600 font-bold">待确认：</span>
                       {slot.pending}
+                      {slot.polishReverted ? (
+                        <span className="block text-[10px] text-slate-400 mt-0.5">（已保持你的原话）</span>
+                      ) : null}
                     </p>
                     <button
                       type="button"
@@ -709,17 +836,33 @@ export default function Step3Drafting({
                     </button>
                   </div>
                 ) : (
-                  <p
-                    className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
-                      slot.content
-                        ? "text-slate-700"
-                        : isActive
-                        ? "text-slate-400 italic"
-                        : "text-slate-300"
-                    }`}
-                  >
-                    {slot.content || (isActive ? "当前待回答…" : "待填写")}
-                  </p>
+                  <div className="min-w-0">
+                    <p
+                      className={`text-xs md:text-[12.5px] mt-0.5 leading-relaxed min-h-[1.25rem] ${
+                        slot.content
+                          ? "text-slate-700"
+                          : isActive
+                          ? "text-slate-400 italic"
+                          : "text-slate-300"
+                      }`}
+                    >
+                      {slot.content || (isActive ? "当前待回答…" : "待填写")}
+                    </p>
+                    {slot.content ? (
+                      <button
+                        type="button"
+                        disabled={coachLoading}
+                        onClick={() =>
+                          reopenSlot(activeSubpoint?.id || '', slot.key)
+                        }
+                        className="mt-0.5 inline-flex items-center gap-1 rounded-md bg-slate-100 hover:bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-500 transition disabled:opacity-50"
+                        title="重新打开该槽进行修订"
+                      >
+                        <Pencil className="h-2.5 w-2.5" />
+                        修改
+                      </button>
+                    ) : null}
+                  </div>
                 )}
               </div>
             </div>
@@ -731,6 +874,28 @@ export default function Step3Drafting({
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6 h-full min-h-0 w-full flex-1">
+      {/* P3（D5 后半）结构重规划 loading / 失败重试 */}
+      {replanning && (
+        <div className="col-span-12 mb-1 rounded-xl bg-indigo-50 border border-indigo-200 p-3 text-sm text-indigo-700 flex items-center gap-2">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          正在重新规划段落结构，请稍候…
+        </div>
+      )}
+      {replanError && (
+        <div className="col-span-12 mb-1 rounded-xl bg-rose-50 border border-rose-200 p-3 text-sm text-rose-700 flex items-center gap-2">
+          重新规划段落结构失败。
+          <button
+            type="button"
+            onClick={() => {
+              replanStartedRef.current = false;
+              runReplan();
+            }}
+            className="rounded-md bg-rose-600 hover:bg-rose-700 px-2 py-0.5 text-[11px] font-bold text-white transition"
+          >
+            重试
+          </button>
+        </div>
+      )}
       {/* LEFT COLUMN: AI Coach Dialogue Area */}
       <div className="lg:col-span-5 xl:col-span-5 h-[480px] lg:h-full flex flex-col min-h-0">
         <CoachChat
@@ -742,6 +907,7 @@ export default function Step3Drafting({
           onUpdateSession={onUpdateSession}
           stepContext={{ subpoints }}
           onLoadingChange={setCoachLoading}
+          inputDisabled={replanning}
           welcomeMessage={welcomeMessage}
           autoKickoff={true}
           kickoffPrompt={kickoffPrompt}

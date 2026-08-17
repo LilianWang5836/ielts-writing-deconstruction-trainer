@@ -140,6 +140,8 @@ export function appendMinute(
     rejectReason?: string;
     displayText?: string;
     thinTag?: boolean;
+    polishReverted?: boolean;
+    skippedTag?: boolean;
   },
 ): Step3Minute {
   const ts = Date.now();
@@ -152,6 +154,8 @@ export function appendMinute(
     status: opts?.status || 'recorded',
     ...(opts?.displayText ? { displayText: opts.displayText } : {}),
     ...(opts?.thinTag ? { thinTag: true } : {}),
+    ...(opts?.polishReverted ? { polishReverted: true } : {}),
+    ...(opts?.skippedTag ? { skippedTag: true } : {}),
     ...(opts?.fromCoachAsk ? { fromCoachAsk: opts.fromCoachAsk } : {}),
     ...(opts?.rejectReason ? { rejectReason: opts.rejectReason } : {}),
   };
@@ -401,6 +405,73 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
   }
 }
 
+/**
+ * P2（D5 前半）已确认槽修订入口：把某已 confirmed 的槽重新打开。
+ *  - 对应 minute 从 confirmed 回退为 recorded（保留文本与审计历史）；
+ *  - 清空该槽（看板投影消失该槽内容）；
+ *  - 秘书游标移回该槽，后续复用现有 pending→confirm 路径。
+ * 最小方案：不影响其他已确认槽；后续槽保持已确认。
+ */
+export function reopenSlot(
+  subpoint: Step3Subpoint,
+  slotKey: string,
+): { ok: boolean; reason?: string } {
+  if (!subpoint || !Array.isArray(subpoint.minutes)) {
+    return { ok: false, reason: 'no_minutes' };
+  }
+  const minute = subpoint.minutes.find(
+    (m) => m.status === 'confirmed' && m.slotKey === slotKey,
+  );
+  if (!minute) return { ok: false, reason: 'slot_not_confirmed' };
+  minute.status = 'recorded';
+  minute.slotKey = undefined;
+  if (subpoint.skeleton) {
+    const flat = skeletonFlatSlots(subpoint.skeleton);
+    const idx = flat.findIndex((f) => f.slot.key === slotKey);
+    if (idx !== -1) subpoint.activeSlotIndex = idx;
+  }
+  appendAudit(subpoint, minute.id, 'reopened', slotKey, 'user reopened slot for revision');
+  return { ok: true };
+}
+
+/**
+ * 打转熔断（duplicate/held 死循环修复）：学生明确说「跳过」时暂略当前槽。
+ * 以一条 confirmed + skippedTag 的占位分钟实现——游标推进、完成判定、看板投影
+ * 全部复用现有机制（confirmed 分钟即视为该槽已定稿）；学生之后可点「修改」reopen 回补。
+ * 该槽未确认的 landed 待确认稿会被回退（避免跳过决策与待确认稿并存）。
+ */
+export function skipSlot(
+  subpoint: Step3Subpoint,
+  slotKey: string,
+): { ok: boolean; reason?: string } {
+  if (!subpoint || !subpoint.skeleton) return { ok: false, reason: 'no_skeleton' };
+  const flat = skeletonFlatSlots(subpoint.skeleton);
+  const idx = flat.findIndex((f) => f.slot.key === slotKey);
+  if (idx === -1) return { ok: false, reason: 'slot_not_found' };
+  const confirmedKeys = new Set(
+    (subpoint.minutes || [])
+      .filter((m) => m.status === 'confirmed' && m.slotKey)
+      .map((m) => m.slotKey as string),
+  );
+  if (confirmedKeys.has(slotKey)) return { ok: false, reason: 'already_confirmed' };
+  for (const m of subpoint.minutes || []) {
+    if (m.status === 'landed' && m.slotKey === slotKey) {
+      m.status = 'recorded';
+      m.slotKey = undefined;
+    }
+  }
+  const minute = appendMinute(subpoint, 'student', '', {
+    status: 'confirmed',
+    slotKey,
+    skippedTag: true,
+  });
+  appendAudit(subpoint, minute.id, 'confirmed', slotKey, '学生选择暂略该槽（打转熔断）', {
+    source: 'skip',
+  });
+  subpoint.activeSlotIndex = idx + 1;
+  return { ok: true };
+}
+
 /** 记录一条落槽审计事件（P1）。确定性：追加到 subpoint.landingLog。 */
 export function appendAudit(
   subpoint: Step3Subpoint,
@@ -468,6 +539,7 @@ export function renderBoard(subpoint: Step3Subpoint): BoardView {
     );
     const viewText = (m?: Step3Minute): string => {
       if (!m) return '';
+      if (m.skippedTag) return '（暂略，可点「修改」补充）';
       const base = m.displayText || m.text;
       return m.thinTag ? `${base}（偏薄待补）` : base;
     };
@@ -802,7 +874,34 @@ export function detectStall(
     (m) => m.status === 'landed' && m.slotKey,
   );
   if (landedOnly.length === 0) {
-    return { stalled: false, slotKey: null, slotLabel: null, attempts: 0, level: 'warn' };
+    // 无待确认落槽时，统计自最近一次确认以来连续的 rejected/held 轮次——
+    // duplicate/off_target 打转（学生反复给出不可落槽内容）同样是原地打转，
+    // 旧逻辑只看 landed 分钟，对这种死循环完全失明（UI 实机录制证实）。
+    const log = Array.isArray(subpoint.landingLog) ? subpoint.landingLog : [];
+    let failed = 0;
+    for (let i = log.length - 1; i >= 0; i--) {
+      const ev = log[i]?.event;
+      if (ev === 'confirmed') break;
+      if (ev === 'rejected' || ev === 'held') failed += 1;
+    }
+    if (failed < maxAttempts) {
+      return { stalled: false, slotKey: null, slotLabel: null, attempts: failed, level: 'warn' };
+    }
+    const key = firstEmptySlotKey(subpoint);
+    let label: string | null = null;
+    const sk = subpoint.skeleton;
+    if (key && sk) {
+      for (const f of skeletonFlatSlots(sk)) {
+        if (f.slot.key === key) { label = f.slot.label; break; }
+      }
+    }
+    return {
+      stalled: !!key,
+      slotKey: key,
+      slotLabel: label,
+      attempts: failed,
+      level: failed >= maxAttempts + 2 ? 'hard' : 'warn',
+    };
   }
 
   // 找最近的 landed 槽

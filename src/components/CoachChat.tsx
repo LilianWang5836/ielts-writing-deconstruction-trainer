@@ -1019,6 +1019,11 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
                 typeof step3Ui?.isStep3Finished === 'boolean'
                   ? step3Ui.isStep3Finished
                   : !!data.progressUpdate.isCompleted,
+              // P3（D5 后半）：结构重规划已确认 → 前端据此重跑 planner 并重建 Step3。
+              structureReplanned:
+                data.progressUpdate.step3StructureReplanned === true
+                  ? true
+                  : currentStep3.structureReplanned,
             }
           };
         }

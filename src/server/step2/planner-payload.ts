@@ -135,6 +135,23 @@ export function pointSideKey(p: Step2Point): string {
   return 'general';
 }
 
+/**
+ * 点是否已确认入池（PM 需求：planner 只消费已确认点）。
+ * 含旧会话读取侧迁移：无 confirmed 字段时，若其侧已 sideSettled 视为已确认
+ * （不改历史数据，仅读取时判定）。
+ */
+export function isPointConfirmed(
+  payload: Step2PlannerPayload | null | undefined,
+  point: Step2Point,
+): boolean {
+  if (point.confirmed === true) return true;
+  if (point.confirmed === undefined) {
+    const side = pointSideKey(point);
+    return Array.isArray(payload?.sideSettled) && payload.sideSettled.includes(side);
+  }
+  return false;
+}
+
 export function sideKeyLabel(sideKey: string): string {
   return SIDE_BUCKET_LABELS[sideKey] || sideKey || '同侧材料';
 }
@@ -2330,6 +2347,8 @@ export function upsertPointsFromClaims(
       fromDimension: dim || claim,
       leanTags: tags.length ? tags : ['general'],
       quality: scorePointQuality(claim, elab || ''),
+      // PM 需求：实时抽取的新点默认未确认，待其所在侧 side_settle 采纳后才确认入池。
+      confirmed: false,
       ...(elab
         ? seedContext
           ? { seedOnly: true }
@@ -4162,7 +4181,7 @@ export function plannerPayloadFingerprint(payload: Step2PlannerPayload | null | 
   const pts = activePoints(payload)
     .map(
       (p) =>
-        `${p.id}|${p.claim}|${p.elaboration || ''}|${(p.leanTags || []).join(',')}|${p.quality}`,
+        `${p.id}|${p.claim}|${p.elaboration || ''}|${(p.leanTags || []).join(',')}|${p.quality}|${p.confirmed === true ? '1' : '0'}`,
     )
     .join('||');
   return [
@@ -4480,8 +4499,10 @@ export function suggestPlannerBodyCount(
 /** One-line digest for Planner prompt (dynamic bodyCount signals). */
 export function buildPlannerMaterialDigest(
   payload: Step2PlannerPayload | null | undefined,
+  points?: Step2Point[],
 ): string {
-  const active = activePoints(payload).filter((p) => p.retentionRole !== 'dropped');
+  const base = Array.isArray(points) && points.length > 0 ? points : activePoints(payload);
+  const active = base.filter((p) => p.retentionRole !== 'dropped');
   if (!active.length) return '无可用平行论点';
   const detail = active.filter((p) => p.retentionRole === 'detail');
   const brief = active.filter((p) => p.retentionRole === 'brief');
