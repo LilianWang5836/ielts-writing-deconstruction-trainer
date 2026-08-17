@@ -109,7 +109,8 @@ check('probe ask detection matches named label', () => {
       dim,
     ),
   );
-  assert.ok(ask.includes('『沟通效率（评价）』'));
+  assert.ok(ask.includes('「沟通效率（评价）」'));
+  assert.ok(!ask.includes('苗头') && !ask.includes('信号'), `still robotic: ${ask}`);
 });
 
 check('probe-first order: causes before evaluation', () => {
@@ -121,6 +122,22 @@ check('probe-first order: causes before evaluation', () => {
   assert.equal(
     stripStep1StatusTags(earliestUnprobedDimension(dims)),
     '主流文化冲击（原因）',
+  );
+});
+
+check('natural model phrasing is detected (no server rewrite)', () => {
+  const dim = '便利性';
+  assert.ok(
+    textLooksLikeProbeAskForDim(
+      '「便利性」这个角度，你脑海里有没有浮现出具体的画面或例子？哪怕一两句话、说个大概就行。',
+      dim,
+    ),
+  );
+  assert.ok(
+    textLooksLikeProbeAskForDim(
+      '关于「便利性」，你想到过什么具体的情形吗？',
+      dim,
+    ),
   );
 });
 

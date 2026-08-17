@@ -74,7 +74,9 @@ import {
   buildBareDimensionProbeAsk,
   countUnprobedStep1Dimensions,
   earliestUnprobedDimension,
+  inferProbeVerdictFromStudentMessage,
   isStep1DimensionUnprobed,
+  normalizeProbeVerdict,
   preserveStep1ProbeTags,
   resolvePendingProbeAnswer,
   stampUnprobedQualityPending,
@@ -2907,7 +2909,9 @@ function formatStep1MissingSideHint(
         1,
       )} 个`,
   );
-  return `${parts.join("；")}。请在该侧再补充至少 1 个不同的中性角度，并说明有没有具体场景苗头。`;
+  // 措辞尽量自然：保留“「X」当前 N 个有效角度，还差至少 M 个”前缀（测试/记录兼容），
+  // 尾部改为面向学生的正常口吻，避免暴露“该侧”这类内部术语。
+  return `${parts.join("；")}。目前记录到的角度还不足以支撑展开，请再补充至少 1 个不同的中性角度，并简单说说它对应的具体场景。`;
 }
 
 function textSuggestsStep1Complete(text: string): boolean {
@@ -6198,8 +6202,15 @@ function enforceStep1SlotCompletion(
       "",
   ).trim();
   if (pendingProbeCore && String(userMessage || "").trim()) {
-    const verdict =
+    const modelVerdict =
       data.progressUpdate?.step1Data?.probeVerdict ?? merged.probeVerdict;
+    // 实机死锁修复（2026-08-17）：DeepSeek 常整轮不返回 probeVerdict，缺省会全部
+    // 误标（空标签）→ effectiveDims=0 → “0 个有效角度”死锁。模型明确裁决（expandable/thin）
+    // 时以模型为准；未返回或返回无法识别的值时由服务端按学生实际回答推断：
+    // 纯拒绝/含糊 → thin；任何具体内容 → expandable。
+    const verdict =
+      normalizeProbeVerdict(modelVerdict) ||
+      inferProbeVerdictFromStudentMessage(userMessage);
     dims = resolvePendingProbeAnswer(
       dims.map(String),
       pendingProbeCore,
@@ -6354,7 +6365,7 @@ function enforceStep1SlotCompletion(
     );
     const ask = bare
       ? buildBareDimensionProbeAsk(bare)
-      : "这个角度你脑子里已经有具体场景或例子的苗头了吗？有的话简单说一句信号即可；还没有的话我们再换一个角度。";
+      : "这个角度，你脑海里有没有浮现出具体的画面或例子？哪怕一两句话、说个大概就行；暂时想不出来也没关系，我们就换个角度。";
     if (bare) {
       target.pendingProbeCore = stripStep1DimensionTags(bare);
       target.exitOffered = false;
@@ -6407,7 +6418,7 @@ function enforceStep1SlotCompletion(
       exhausted,
     );
     const ask = perSideNow.pass
-      ? "请确认这些角度是否已有具体场景苗头；如果暂时想不到别的，告诉我，我们再进入第二步。"
+      ? "这些角度你都能想到对应的具体例子或场景吗？能的话就说一声，我们准备进入第二步；暂时想不到别的了，也直接告诉我。"
       : formatStep1MissingSideHint(
           String(merged.correctType || ""),
           dims.map(String),
@@ -6441,13 +6452,11 @@ function enforceStep1SlotCompletion(
   const probedDimCount = dims.filter((d) =>
     hasStandaloneStep1Tag(String(d), STEP1_DIM_PROBED_TAG),
   ).length;
-  if (
-    exhausted &&
-    !ctaOk &&
-    slotsOk &&
-    !newDimSameTurn &&
-    probedDimCount >= 2
-  ) {
+  // 实机死锁修复（2026-08-17）：去掉 `!ctaOk`。此前当模型已发硬 CTA（ctaOk=true）
+  // 但 dimsSufficient=false 时，F2 被跳过，随后 strict-tags 块把 CTA 覆写成
+  // “0 个有效角度”并清 isCompleted → 学生耗尽也永远出不了 Step1。
+  // 现在：exhausted + 按侧门禁放行 + 已探测≥2 → 服务端确定性补 CTA 并完成。
+  if (exhausted && slotsOk && !newDimSameTurn && probedDimCount >= 2) {
     const target = ensureStep1DataBucket(data, mergedAfter);
     target.dimensionsSufficient = true;
     ensureStep1ExitOfferedFlag(
@@ -8956,7 +8965,7 @@ ${memoryDigestStr}
   - Confirmed dimension LOCK (CRITICAL): once a dimension already carries server probe stamps （已探测）/（可展开）/（空标签）/（质量待确认）, copy that entry VERBATIM (same core label + same status tags) into suggestedDimensions every turn. You may APPEND new bare labels at the end. FORBIDDEN: stripping status tags, rewriting a confirmed label's tags, or dropping a confirmed dimension unless the student explicitly asks to remove/rename it. Server restores confirmed stamps if the model rewrites them.
   - Light expandability probe (ONCE per new dimension, REQUIRED before quality tags) — SERVER OWNS THE LOOP:
     1) First record the raw label WITHOUT （可展开）/（空标签）/（已探测）. FORBIDDEN: tagging status on the introduce turn.
-    2) While ANY unprobed (bare) label remains: Part 2 MUST be a ONE-dimension probe ask for the earliest bare label (e.g. "『××』这个角度你脑子里已经有具体场景或例子的苗头了吗？"). FORBIDDEN: jumping to the next task (e.g. Task B / 评价) while Task A / earlier labels are still unprobed. FORBIDDEN: merge-probing two labels in one ask. FORBIDDEN: re-probing a dimension that already has （已探测）.
+    2) While ANY unprobed (bare) label remains: Part 2 MUST be a ONE-dimension probe ask for the earliest bare label, PRE-WRITTEN in your own natural tutor voice and continuing from what was just discussed — e.g. "「××」这个角度，你脑海里有没有浮现出具体的画面或例子？哪怕一两句话、说个大概就行。" Never use checklist-style wording ("苗头/信号/简单说一句即可"), never ask about more than one dimension in a single question, and never ask a generic "还有别的角度吗" while a bare label is still unprobed. The server only injects its own fallback when your Part 2 is not a clear single-dimension probe, so the natural phrasing you write is what the student usually reads. FORBIDDEN: jumping to the next task (e.g. Task B / 评价) while Task A / earlier labels are still unprobed. FORBIDDEN: merge-probing two labels in one ask. FORBIDDEN: re-probing a dimension that already has （已探测）.
     3) On the student's NEXT answer to a probe: set progressUpdate.step1Data.probeVerdict to "expandable" (any concrete cue) or "thin" (no/不清楚/vague). Do NOT self-stamp （可展开）/（空标签） — the server stamps from probeVerdict. Ambiguous → "thin".
   - FORBIDDEN: emitting hard completion CTA or soft exit while unprobed labels remain.
   - Probe anti-loop: each dimension gets at most ONE probe. If it fails (thin), do NOT deepen that same dimension — invite a DIFFERENT new angle instead (only when no bare labels remain).
@@ -9313,6 +9322,8 @@ ${memoryDigestStr}
 # IELTS Writing Decomposition Training System - AI Prompt Architecture v2
 
 You are an IELTS Writing Cognitive Coach guiding a student to get a Band 7.5+ in IELTS Writing Task 2.
+
+PERSONA (fixed, applies to every message): You are a patient, warm, plain-spoken Chinese IELTS tutor talking to a real student one-on-one — like a live lesson, not a report. You react to what the student actually just said, use everyday words, keep questions short, and never sound like you are ticking off a template or a checklist.
 Current IELTS Writing Prompt:
 "${question}"
 

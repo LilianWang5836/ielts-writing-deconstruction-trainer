@@ -225,6 +225,30 @@ export function normalizeProbeVerdict(raw: unknown): Step1ProbeVerdict {
 }
 
 /**
+ * 服务端探针裁决兜底（实机死锁修复，2026-08-17）：
+ * B-lite 依赖模型返回 probeVerdict 来盖章（可展开/空标签），但实测 DeepSeek
+ * 经常整轮不返回该字段。若缺省一律判 thin，学生给出的具体场景会被误标（空标签），
+ * 进而 effectiveDims=0 → guard 死锁在"当前 0 个有效角度"（真实用户第一轮即卡住）。
+ *
+ * 因此模型未裁决时由服务端根据学生本轮回答推断：
+ *   - 明确拒绝 / 含糊（"没有 / 不清楚 / 想不出来 / 还没想好"等短句）→ thin；
+ *   - 任何包含具体内容的回答（哪怕一句场景信号）→ expandable。
+ * 设计上偏向 expandable：Step1 探针只是轻量过滤，"任何具体线索"即算可展开，
+ * 深度由 Step2/3 把关；误判 expandable 的代价远小于误判 thin 导致的死锁。
+ */
+const STEP1_THIN_ANSWER_RE =
+  /^(?:(?:暂时|还|现在|目前|其实|这个|这方面|这块|我|嗯|呃|em|emm)[，,、\s]*)*(?:没有(?:具体(?:的)?(?:例子|场景|想法|内容|苗头|方向|思路|素材|概念|信号))?|没|不清楚|不知道|想不?出[来]?|想不到|想不好|没想好|不确定|说不好|难说|没什么|不太清楚|没概念|没头绪|没想法|没感觉|不记得|忘了|无法确定|确定不了|没有特别)[。.!！~～…\s]*$/;
+
+export function inferProbeVerdictFromStudentMessage(
+  message: string,
+): Step1ProbeVerdict {
+  const t = String(message || '').trim();
+  if (!t) return 'thin';
+  if (STEP1_THIN_ANSWER_RE.test(t)) return 'thin';
+  return 'expandable';
+}
+
+/**
  * After a server-forced probe ask: stamp target from probeVerdict.
  * Strips any model self-tags on the target first; missing verdict → 空标签.
  */
@@ -274,9 +298,10 @@ export function earliestUnprobedDimension(
 
 export function buildBareDimensionProbeAsk(dim: string): string {
   const label = stripStep1AllTags(dim) || String(dim || '').trim() || '这个角度';
+  // 真人口吻（真实用户“非常人机”反馈后自然化）：不用“苗头/信号”这类检查清单式措辞。
   return (
-    `『${label}』这个角度你脑子里已经有具体场景或例子的苗头了吗？` +
-    `有的话简单说一句信号即可；还没有的话我们再换一个角度。`
+    `「${label}」这个角度，你脑海里有没有浮现出具体的画面或例子？` +
+    `哪怕一两句话、说个大概就行；暂时想不出来也没关系，我们就换个角度。`
   );
 }
 
@@ -296,7 +321,12 @@ export function textLooksLikeProbeAskForDim(
   const core = label.replace(/（[^）]*）|\([^)]*\)/g, '').trim();
   const hitLabel =
     part2.includes(label) || (core.length >= 2 && part2.includes(core));
-  const hitProbe = /苗头|具体场景|例子|可展开|有没有.*场景/.test(part2);
+  // 识别范围放宽到自然问法（“画面/情形/例子/想到/有没有…”），避免模型用真人口吻
+  // 提问时被服务端模板覆写（真实用户“非常人机”反馈后自然化）。
+  const hitProbe =
+    /苗头|具体场景|具体.{0,8}(画面|情形|例子)|想到过|想到\S{0,4}具体|有没有.{0,6}(画面|例子|场景|情形)|可展开|例子/.test(
+      part2,
+    );
   return hitLabel && hitProbe;
 }
 
