@@ -84,6 +84,7 @@ import {
   stripIllegalSameTurnProbeTags,
   textLooksLikeProbeAskForDim,
 } from "./src/server/step1/dimension-probe";
+import { classifyStudentReply, isStudentExhausted } from "./src/server/intent-router";
 import {
   armNextProposal,
   buildAskFromProposal,
@@ -1484,9 +1485,11 @@ function isStep2ExploreDone(args: {
   session?: any;
   userMessage?: string;
 }): boolean {
+  // V1.1：接入共享意图路由——exhausted/skip 都算放弃补充（非阻塞）。
   const exhausted =
     typeof args.userMessage === "string" &&
-    studentSignalsExhausted(args.userMessage);
+    (studentSignalsExhausted(args.userMessage) ||
+      isStudentExhausted(args.userMessage));
 
   const dispositions =
     args.step2Data?.dimensionDispositions ||
@@ -1739,8 +1742,10 @@ async function applyStep2PlannerPayloadNormalize(
     step2.userPoints = lockedUserPoints;
   }
 
+  // V1.1：接入共享意图路由——exhausted/skip 都算放弃补充（非阻塞）。
   const exhausted =
-    typeof userMessage === "string" && studentSignalsExhausted(userMessage);
+    typeof userMessage === "string" &&
+    (studentSignalsExhausted(userMessage) || isStudentExhausted(userMessage));
   const forceExitUsed = Boolean(
     exhausted ||
       step2.plannerPayload?.exitGate?.forceExitUsed ||
@@ -4617,9 +4622,18 @@ function enforceStep3SecretaryPath(
     return;
   }
 
-  // ---- 常规轮：分类学生发言 ----
-  const isAff = /^(对|好|是|嗯|可以|同意|采纳|确认|行|就按|确认写入|点击确认|确认提交)[。.!！?？]?$/.test(msg) || /确认写入|点击确认/.test(msg);
-  const isRej = /^(不对|不好|不是|重说|重写|换一个|去掉|不要|改一下|重新说)[。.!！?？]?$/.test(msg) || /拒绝|否决|撤销/.test(msg);
+  // ---- 常规轮：分类学生发言（V1.1：接入共享意图路由，非阻塞）----
+  // accept：路由的纯确认（对/好/可以/嗯/没问题/继续…）+ 原有专用词。
+  // object：路由的反对（排除“还有一个/补充一个/等等”等增量表达——那些是加料不是拒收）。
+  const isAff =
+    classifyStudentReply(msg) === "accept" ||
+    /^(同意|采纳|就按|确认写入|点击确认|确认提交)[。.!！?？]?$/.test(msg) ||
+    /确认写入|点击确认/.test(msg);
+  const isRej =
+    (classifyStudentReply(msg) === "object" &&
+      !/还有一|补充一|再补|等等|等一下|另外|以及/.test(msg)) ||
+    /^(不好|不是|重说|重新说|改一下)[。.!！?？]?$/.test(msg) ||
+    /拒绝|否决|撤销/.test(msg);
 
   // ---- P3（D5 后半）结构异议：已武装重规划要约时，本轮优先处理 确认/拒绝 ----
   if (sp.pendingStructureOffer) {
@@ -4660,30 +4674,40 @@ function enforceStep3SecretaryPath(
     );
   }
 
-  // ---- 打转熔断出口：stall 已触发时，学生明确说「跳过」→ 确定性暂略当前槽 ----
-  // 场景：学生在某槽连续给出 duplicate/off_target 内容被拒绝，教练换措辞重问仍无解
-  //（UI 实机录制：同槽重复追问 10+ 轮）。跳过只在 stall 状态下生效，避免误伤正常流程。
+  // ---- 打转熔断出口：stall 已触发（或该空槽已多次被拒）时，学生说「跳过」或
+  //      表达「展开不了/想不出来」（exhausted 意图）→ 确定性暂略当前槽 ----
+  // V1.1 修复（2026-08-18 UI 全流程复现）：学生反复"这个点我暂时展开不了更多"，
+  // 秘书 gate 判 verdict=ok 但落槽被 checkDuplicate 判重拒绝 → 同槽死锁、教练文本
+  // 却已进入下一段（文本/状态脱节）。把 exhausted 意图识别为暂略信号（复用 skipSlot）。
+  // 仅在"stall 已触发"或"该槽已至少被拒 2 次"时生效，避免误伤正常作答。
   const isSkipAsk =
+    classifyStudentReply(msg) === "skip" ||
     /^(跳过|先跳过|略过|先略过|暂时跳过|这拍先跳过|这步先跳过|先不填|暂时不填|先过|暂时过)[。.!！]?$/.test(
       msg,
     );
-  if (isSkipAsk) {
+  const exhaustedIntent = isStudentExhausted(msg);
+  if (isSkipAsk || exhaustedIntent) {
     const stallNow = detectStall(sp);
     const skipTarget = firstEmptySlotKey(sp);
-    if (stallNow.stalled && skipTarget) {
+    const targetRejectedCount = (sp.landingLog || []).filter(
+      (e: any) =>
+        e.event === "rejected" &&
+        (e.slotKey === skipTarget || !e.slotKey),
+    ).length;
+    if (skipTarget && (stallNow.stalled || targetRejectedCount >= 2)) {
       const r = skipSlot(sp, skipTarget);
       if (r.ok) {
         const part1 = safeOverridePart1(String(data.text || ""));
-        data.text = `${part1 || "好的。"}\n\n---\n\n好的，这一拍我们先跳过——看板上标了「暂略」，之后随时可以点「修改」回来补。我们继续下一拍。`;
+        data.text = `${part1 || "好的。"}\n\n---\n\n好的，这个点我们先不硬展开了——看板上标了「暂略」，之后随时可以点「修改」回来补。我们继续下一拍。`;
         data.progressUpdate.secretaryBoard = renderBoard(sp);
         data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
         console.warn(
-          `[Secretary] SKIP slot=${skipTarget}（打转熔断，attempts=${stallNow.attempts}）`,
+          `[Secretary] SKIP slot=${skipTarget}（${isSkipAsk ? "跳过请求" : "学生表示无法展开（exhausted）"}，attempts=${stallNow.attempts}）`,
         );
         return;
       }
     }
-    // 非 stall 状态下的「跳过」：不落任何分支，按普通内容继续处理。
+    // 未形成死锁（stall 未触发且该槽未被拒≥2）：不落分支，按普通内容继续处理。
   }
 
   // 当前 landed 待确认纪要（单条或批量多条）
@@ -5902,15 +5926,16 @@ function enforceStep2Completion(data: any, session: any): void {
     return;
   }
 
+  // V1 去门禁化（2026-08-18）：不再因"材料未就绪 / 无 CTA"把模型表达的完成弹回
+  // （默认推进 + 尽力记录；空材料由 planner fallback + 学生可回头补充兜底）。
+  // 保留日志便于观察，但不清 isCompleted。
   if (data.progressUpdate.isCompleted && !materialReady) {
-    data.progressUpdate.isCompleted = false;
     console.warn(
-      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, checklistDone=${checklistDone}, stanceOk=${stanceOk})`,
+      `[Step2CompletionGuard] (degated) keep isCompleted despite material not ready (stage=${stage}, checklistDone=${checklistDone}, stanceOk=${stanceOk})`,
     );
   } else if (data.progressUpdate.isCompleted && !ctaOk && !materialReady) {
-    data.progressUpdate.isCompleted = false;
     console.warn(
-      `[Step2CompletionGuard] Cleared premature isCompleted (stage=${stage}, ctaOk=${ctaOk}, contentOk=${contentOk})`,
+      `[Step2CompletionGuard] (degated) keep isCompleted despite no CTA (stage=${stage}, contentOk=${contentOk})`,
     );
   }
 }
@@ -6228,7 +6253,11 @@ function enforceStep1SlotCompletion(
   // Escape: ONLY student exhausted → stamp remaining bare as 质量待确认.
   // Cap alone must NOT stamp (that aborted live probes when label count hit 6).
   const dimLabelCount = countStep1DimensionLabels(dims);
-  const exhausted = studentSignalsExhausted(userMessage);
+  // V1 去门禁化（2026-08-18）：学生意图路由（确定性优先）——只用于逃生/状态判定，
+  // 绝不当门禁。误判可由"默认推进 + 教练回声 + 检查点回滚"自愈。
+  const intent = classifyStudentReply(userMessage);
+  const exhausted =
+    intent === "exhausted" || studentSignalsExhausted(userMessage);
   if (exhausted) {
     const before = countUnprobedStep1Dimensions(dims);
     if (before > 0) {
@@ -6272,23 +6301,24 @@ function enforceStep1SlotCompletion(
   const ctaOk = textSuggestsStep1Complete(text);
   const unprobed = earliestUnprobedDimension(dims.map(String));
 
-  // Soft exit round must never unlock the jump button.
+  // 软退出（"够用了吗"）且无硬 CTA → 不是完成（保持 false）。
   if (softExitAsk && !ctaOk) {
     data.progressUpdate.isCompleted = false;
   }
 
-  // v2 probe-first: any bare label → Part2 must probe the earliest one
-  // (blocks Task-B jump, soft exit, CTA, and model merge-probes).
-  if (unprobed) {
+  // v2 probe-first（V1 去门禁化后为"引导"而非"门禁"）：仅当教练尚未明确完成
+  // （无硬 CTA、未置 isCompleted）且存在裸标签时，把 Part2 引导到最早未探测维度
+  // （自然化文案）；教练已明确完成则不覆写文本、不拦完成，裸标签按原样记录
+  // （学生可随时回来补充）。
+  if (unprobed && !ctaOk && data.progressUpdate.isCompleted !== true) {
     data.progressUpdate.isCompleted = false;
     const target = ensureStep1DataBucket(data, merged);
     target.suggestedDimensions = dims;
-    target.exitOffered = false;
-    // Do not claim sufficiency while bare labels remain.
+    target.pendingProbeCore = stripStep1DimensionTags(unprobed);
+    // 裸标签未清完时不宣称充分（状态标记，不影响推进）。
     if (!step1CapProbeComplete(dims.map(String), STEP1_DIM_MAX)) {
       target.dimensionsSufficient = false;
     }
-    target.pendingProbeCore = stripStep1DimensionTags(unprobed);
     const alreadyProbing = textLooksLikeProbeAskForDim(text, unprobed);
     if (!alreadyProbing) {
       const split = splitTwoParts(text, 1);
@@ -6297,7 +6327,7 @@ function enforceStep1SlotCompletion(
       );
       data.text = `${part1}\n\n---\n\n${buildBareDimensionProbeAsk(unprobed)}`;
       console.warn(
-        `[Step1Guard] Probe-first: rewrote Part2 to probe「${target.pendingProbeCore}」(labels=${dimLabelCount}, unprobed=${countUnprobedStep1Dimensions(dims)})`,
+        `[Step1Guard] Probe-first: guided Part2 to probe「${target.pendingProbeCore}」(labels=${dimLabelCount}, unprobed=${countUnprobedStep1Dimensions(dims)})`,
       );
     } else {
       console.warn(
@@ -6307,155 +6337,34 @@ function enforceStep1SlotCompletion(
     return;
   }
 
-  // Only stamp exitOffered when AI/server already judges dimensions sufficient
-  // AND no unprobed bare labels remain.
-  if (
-    dimsSufficient &&
-    !unprobed &&
-    (softExitAsk || step1DimsHaveExitOfferedTag(dims))
-  ) {
-    const target = ensureStep1DataBucket(data, merged);
-    target.dimensionsSufficient = true;
-    ensureStep1ExitOfferedFlag(target, Array.isArray(target.suggestedDimensions)
-      ? target.suggestedDimensions
-      : dims);
-  } else if (!dimsSufficient && softExitAsk) {
-    // Model asked "enough?" too early — rewrite to keep collecting.
-    data.progressUpdate.isCompleted = false;
-    const target = ensureStep1DataBucket(data, merged);
-    target.dimensionsSufficient = false;
-    target.exitOffered = false;
-    const split = splitTwoParts(text, 1);
-    const part1 = safeOverridePart1(
-      split.part1 || "目前可展开的角度还偏少。",
-    );
-    const missingHint = formatStep1MissingSideHint(
-      String(merged.correctType || ""),
-      dims.map(String),
-      exhausted,
-    );
-    data.text = `${part1}\n\n---\n\n${missingHint}`;
-    console.warn(
-      `[Step1Guard] Soft exit asked before sufficiency (effective=${effectiveCount}); forcing more angles.`,
-    );
-    return;
-  }
-
   const mergedAfter = mergeStep1Evaluation(data.progressUpdate, session);
-  const exitOpen = isStep1ExitGateOpen(mergedAfter, session, userMessage);
   const newDimSameTurn = step1HasNewlyIntroducedDimension(
     mergedAfter.suggestedDimensions,
     session,
   );
 
-  // Same-turn guard: cannot complete in the turn that first introduces a dimension
-  // (probe/exit must happen before CTA).
-  if ((ctaOk || data.progressUpdate.isCompleted) && newDimSameTurn) {
-    data.progressUpdate.isCompleted = false;
+  // 状态标记（exitOffered / dimensionsSufficient）——只记状态，不影响推进。
+  if (
+    dimsSufficient &&
+    !unprobed &&
+    (softExitAsk || step1DimsHaveExitOfferedTag(dims))
+  ) {
     const target = ensureStep1DataBucket(data, mergedAfter);
-    const bare =
-      earliestUnprobedDimension(
-        Array.isArray(target.suggestedDimensions)
-          ? target.suggestedDimensions.map(String)
-          : dims.map(String),
-      ) || unprobed;
-    const split = splitTwoParts(text, 1);
-    const part1 = safeOverridePart1(
-      split.part1 || "这个角度我先记下了。",
-    );
-    const ask = bare
-      ? buildBareDimensionProbeAsk(bare)
-      : "这个角度，你脑海里有没有浮现出具体的画面或例子？哪怕一两句话、说个大概就行；暂时想不出来也没关系，我们就换个角度。";
-    if (bare) {
-      target.pendingProbeCore = stripStep1DimensionTags(bare);
-      target.exitOffered = false;
-    }
-    data.text = `${part1}\n\n---\n\n${ask}`;
-    console.warn(
-      "[Step1Guard] Blocked same-turn complete while new dimension introduced; requiring probe/exit offer.",
-    );
-    return;
-  }
-
-  // Soft-exit-only text must never set isCompleted even if model flipped the flag.
-  if (softExitAsk && !ctaOk) {
-    data.progressUpdate.isCompleted = false;
-  }
-
-  // Exit gate: sufficiency + exit offer / student stop / cap before hard CTA unlock.
-  if ((ctaOk || data.progressUpdate.isCompleted) && slotsOk && dimsSufficient && !exitOpen) {
-    data.progressUpdate.isCompleted = false;
-    if (!data.progressUpdate.step1Data) {
-      data.progressUpdate.step1Data = { ...mergedAfter };
-    }
+    target.dimensionsSufficient = true;
     ensureStep1ExitOfferedFlag(
-      data.progressUpdate.step1Data,
-      Array.isArray(data.progressUpdate.step1Data.suggestedDimensions)
-        ? data.progressUpdate.step1Data.suggestedDimensions
+      target,
+      Array.isArray(target.suggestedDimensions)
+        ? target.suggestedDimensions
         : dims,
     );
-    const split = splitTwoParts(text, 1);
-    const part1 = safeOverridePart1(
-      split.part1 || "目前已经有几个可以展开的分析角度了。",
-    );
-    data.text = `${part1}\n\n---\n\n这几个角度已经可以支撑分析了。你还能想到别的中性角度吗？如果暂时想不到别的，告诉我，我们再进入第二步。`;
-    console.warn(
-      "[Step1Guard] Blocked premature Step1 completion; exit offer required after sufficiency.",
-    );
-    return;
   }
 
-  // Strict tags / count: model claimed complete but slots or sufficiency short.
-  if ((ctaOk || data.progressUpdate.isCompleted) && (!slotsOk || !dimsSufficient)) {
-    data.progressUpdate.isCompleted = false;
-    const split = splitTwoParts(text, 1);
-    const part1 = safeOverridePart1(
-      split.part1 || "我们先把讨论角度确认清楚。",
-    );
-    const perSideNow = step1PerSideStatus(
-      dims.map(String),
-      String(merged.correctType || ""),
-      exhausted,
-    );
-    const ask = perSideNow.pass
-      ? "这些角度你都能想到对应的具体例子或场景吗？能的话就说一声，我们准备进入第二步；暂时想不到别的了，也直接告诉我。"
-      : formatStep1MissingSideHint(
-          String(merged.correctType || ""),
-          dims.map(String),
-          exhausted,
-        );
-    data.text = `${part1}\n\n---\n\n${ask}`;
-    if (dimsSufficient) {
-      if (!data.progressUpdate.step1Data) {
-        data.progressUpdate.step1Data = { ...mergedAfter };
-      }
-      ensureStep1ExitOfferedFlag(
-        data.progressUpdate.step1Data,
-        Array.isArray(data.progressUpdate.step1Data.suggestedDimensions)
-          ? data.progressUpdate.step1Data.suggestedDimensions
-          : dims,
-      );
-    }
-    console.warn(
-      `[Step1Guard] Cleared completion; effectiveDims=${effectiveCount} sufficient=${dimsSufficient}.`,
-    );
-    return;
-  }
-
-  // F2 硬出口：学生已明确耗尽（"想不出来了"）且按侧门禁已放行（含降级逃生），
-  // 但模型持续追索缺失侧、从不发硬 CTA → 实机卡死（recorded e2e 打满 10 轮 cap）。
-  // 此处由服务端确定性补硬 CTA 并完成 Step1，不再等模型文本。
-  // 注意不要求 dimsSufficient：该标志尊重模型的 dimensionsSufficient=false 否决，
-  // 而模型会按"材料不足"持续否决，使耗尽逃生永远不可达——降级放行本就是服务端裁决。
-  // 底线：至少 2 个已探测维度（防空洞完成；已探测即"教练问过、学生答过"，
-  // 判 thin/空标签 的也计入——耗尽降级本就允许带薄料进入下一步）。
+  // F2 硬出口（保留为确定性安全网）：学生已明确耗尽 + 按侧门禁放行 + 已探测≥2 →
+  // 服务端确定性补 CTA 并完成（这是唯一一处服务端写完成文案的路径，仅在耗尽时触发）。
+  // 不要求 dimsSufficient（降级放行本就是服务端裁决）；已探测即"教练问过、学生答过"。
   const probedDimCount = dims.filter((d) =>
     hasStandaloneStep1Tag(String(d), STEP1_DIM_PROBED_TAG),
   ).length;
-  // 实机死锁修复（2026-08-17）：去掉 `!ctaOk`。此前当模型已发硬 CTA（ctaOk=true）
-  // 但 dimsSufficient=false 时，F2 被跳过，随后 strict-tags 块把 CTA 覆写成
-  // “0 个有效角度”并清 isCompleted → 学生耗尽也永远出不了 Step1。
-  // 现在：exhausted + 按侧门禁放行 + 已探测≥2 → 服务端确定性补 CTA 并完成。
   if (exhausted && slotsOk && !newDimSameTurn && probedDimCount >= 2) {
     const target = ensureStep1DataBucket(data, mergedAfter);
     target.dimensionsSufficient = true;
@@ -6478,23 +6387,17 @@ function enforceStep1SlotCompletion(
     return;
   }
 
-  // Only unlock when slots filled, dimensions sufficient, exit gate open,
-  // AND hard completion CTA (click next-step button) is present.
-  if (slotsOk && ctaOk && exitOpen && dimsSufficient) {
+  // V1 完成判定（去门禁化）：完成 = 教练硬 CTA 或教练置 isCompleted=true。
+  // 不再因维度充分性 / exitOpen / 同日新维度而拒绝完成；软退出且无 CTA 除外
+  // （已在上面保持 false）。内容充分性只作为状态标记（dimensionsSufficient）。
+  if (ctaOk || data.progressUpdate.isCompleted === true) {
     data.progressUpdate.isCompleted = true;
     if (data.progressUpdate.step1Data) {
-      data.progressUpdate.step1Data.dimensionsSufficient = true;
+      data.progressUpdate.step1Data.dimensionsSufficient = dimsSufficient;
     }
     if (data.progressUpdate.step2Data) {
       delete data.progressUpdate.step2Data;
     }
-    return;
-  }
-
-  // Premature-completion guard: clear isCompleted if the model set it while
-  // still asking a follow-up (no hard completion CTA in this turn's text).
-  if (data.progressUpdate.isCompleted && !ctaOk) {
-    data.progressUpdate.isCompleted = false;
   }
 }
 
@@ -8958,7 +8861,7 @@ ${memoryDigestStr}
     - Fabrication VIOLATION (do NOT do this): student's message only describes ONE causal chain — economic development -> communication convenience -> people learn the dominant language -> native language de-emphasized. Collapsing that chain into ONE label (e.g. "经济与沟通便利驱动") is correct; ALSO adding "文化身份认同" (never mentioned) as an extra dimension to look more thorough is FABRICATION and FORBIDDEN.
   - Feedback proportionality: Part 1's confirmation must match what was ACTUALLY given. Do NOT describe a single causal chain as if the student did rich "多维度分析". State plainly what was recorded, nothing more.
 
-  Dimension quality & exit rules (CRITICAL — Step 1 is divergent brainstorm with light quality filter; server enforces tags + exit gate):
+  Dimension quality & exit rules (CRITICAL — Step 1 is divergent brainstorm with light quality filter; server RECORDS tags/state and does NOT block advancement):
   - Cap: never keep more than 6 dimension labels. At 6, stop asking for more angles and you MAY emit the hard Step-2 CTA.
   - Tag format (STRICT): write status tags as SEPARATE parentheses after the label. Correct: "公众健康（已探测）（可展开）". Incorrect / ignored by server: "公众健康（二手烟危害 - 可展开）", untagged "公众健康", or mixing explanation inside the status parentheses.
   - Side attribution (STRICT, per PM "每问/每侧 ≥2"): for two-side/two-question types (Discuss Both Views, Advantages/Disadvantages, Two-part Question, Problem / Solution, Positive / Negative), you MUST declare EVERY dimension's side via the structured field step1Data.dimensionSides (entries of {dimension, side}; A = 观点A/优点/第1问/成因侧, B = 观点B/缺点/第2问/措施侧; "G" only when a dimension genuinely covers BOTH). The server counts per side from THIS field — in-text （侧：X） tags are NOT required (harmless if present, the server preserves them). Dimensions with no declared side count as 未归属 and do NOT count toward any side — the gate requires ≥2 effective per side. For single-side types (Agree/Disagree etc.) dimensionSides may be omitted.
@@ -8969,7 +8872,8 @@ ${memoryDigestStr}
     3) On the student's NEXT answer to a probe: set progressUpdate.step1Data.probeVerdict to "expandable" (any concrete cue) or "thin" (no/不清楚/vague). Do NOT self-stamp （可展开）/（空标签） — the server stamps from probeVerdict. Ambiguous → "thin".
   - FORBIDDEN: emitting hard completion CTA or soft exit while unprobed labels remain.
   - Probe anti-loop: each dimension gets at most ONE probe. If it fails (thin), do NOT deepen that same dimension — invite a DIFFERENT new angle instead (only when no bare labels remain).
-  - Effective count (server enforces): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, and （质量待确认） do NOT count toward sufficiency.
+  - Effective count (server records): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, and （质量待确认） do NOT count toward sufficiency.
+  - DE-GATED COMPLETION (V1, server behavior): the server no longer bounces your completion back or rewrites your Part 2 (the only exceptions: a gentle ONE-dimension probe fallback when a bare label remains and you have NOT completed; and a deterministic auto-complete CTA when the student is clearly exhausted). Completion is MODEL-DRIVEN: when you judge the angle set sufficient and say so naturally (e.g. "这几个角度够了，我们进入第二步"), emit the hard CTA ("点击【下一步】…进入第二步") and set isCompleted:true — the server honors it. Keep the quality bar in this section as your own pedagogical standard: probe each new angle once, don't rush to completion while a bare label is still open, and prefer the soft-exit → student-confirms → hard-CTA sequence when the conversation allows it.
   - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) EVERY required side has at least 2 effective dimensions (per-side ≥2: Agree/Disagree = 1 side ≥2; Discuss Both Views & Advantages/Disadvantages = 2 sides each ≥2; Two-part / Problem-Solution / Positive-Negative = each question ≥2); (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough"; (d) no bare/unprobed labels remain. If not sufficient, keep probing bare labels or ask for another NEW angle ON THE MISSING SIDE — do NOT ask "够用了吗".
   - Soft exit offer ONLY after dimensionsSufficient=true and no bare labels: ask whether they want to add more; set exitOffered=true and tag （已询退出）. Soft ask MUST NOT include "点击【下一步】". Example soft ask: "这几个角度已经可以支撑分析了。还能想到别的吗？如果暂时想不到别的，告诉我，我们再进入第二步。"
   - Hard completion CTA ONLY after soft exit was offered AND student confirms stop / says "没有更多了" / "先这样", OR (cap=6 AND every label already probed): Part 2 MUST include both "点击" + "【下一步】" (or "下一步") AND "进入第二步", then set isCompleted:true.

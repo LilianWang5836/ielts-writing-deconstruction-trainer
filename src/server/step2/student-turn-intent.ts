@@ -4,6 +4,7 @@
  * Live path: LLM JSON classification (meaning), with a thin structured fallback
  * for UI decisions / offline tests — not a growing synonym dictionary.
  */
+import { classifyStudentReply } from '../intent-router';
 
 export type Step2TurnIntentKind =
   | 'content_elaboration'
@@ -108,6 +109,26 @@ export function classifyStep2StudentTurnHeuristic(args: {
 }): Step2StudentTurnIntent {
   const msg = String(args.userMessage || '').trim();
   if (!msg) return emptyStep2StudentTurnIntent('unknown');
+
+  // V1.1：共享粗粒度意图路由先做一轮（非阻塞、只路由不拦）——
+  //   - 待提案槽位：accept/短句 object 直接映射采纳/拒绝（object 排除增量表达）；
+  //   - exhausted/skip：明确返回 unknown，防止长句“我暂时想不出别的角度了”被误判为内容；
+  //   - accept：落到 confirm_ack（富集：没问题/可以啊/好嘞/对对/确认 等）。
+  const coarse = classifyStudentReply(msg);
+  if (args.hasPendingSlotAdd) {
+    if (coarse === 'accept' && !/继续/.test(msg)) {
+      return { kind: 'accept_slot_add', confidence: 0.85, source: 'heuristic' };
+    }
+    if (coarse === 'object' && msg.length <= 20 && !/还有一|补充一|再补/.test(msg)) {
+      return { kind: 'reject_slot_add', confidence: 0.85, source: 'heuristic' };
+    }
+  }
+  if (coarse === 'exhausted' || coarse === 'skip') {
+    return emptyStep2StudentTurnIntent('unknown');
+  }
+  if (coarse === 'accept') {
+    return { kind: 'confirm_ack', confidence: 0.8, source: 'heuristic' };
+  }
 
   // Pending slot-add: bare accept/reject tokens
   if (args.hasPendingSlotAdd) {
