@@ -121,6 +121,13 @@ async function main() {
       messages.push({ sender: 'user', text: msg });
       continue;
     }
+    // 教练在引导某一方头脑风暴（问"具体点/场景/对哪些人群有好处"等）→ 必须给论点材料，
+    // 不能回"确认/继续"（否则教练重复同一问句，脚本会陷入死循环）。
+    if (/哪些具体的点|哪些点|对哪些人群|在哪些场景|哪些工作场景|这面开始|从.{1,14}这面|列举|想想看|想到哪些/.test(p2)) {
+      msg = pi < studentPoints.length ? studentPoints[pi++] : (extra.shift() || '再补一个：AI 会推动企业重塑组织架构，把裁员视为最后手段，转而通过内部转岗消化冲击，所以长期就业总量未必下降。');
+      messages.push({ sender: 'user', text: msg });
+      continue;
+    }
     // 教练明确在补缺侧材料（含刚锁定一侧详略后的"接下来只补真正缺失的材料类别"）：
     // 必须给点，不能回"采纳"。置于"采纳/详略"分支之前，否则"已锁定"会抢先命中。
     if (/缺失的材料类别|只补真正缺失|「观点A」当前|「观点B」当前|还差至少|请给出至少 1 个具体主张/.test(p2)) {
@@ -153,7 +160,15 @@ async function main() {
       messages.push({ sender: 'user', text: msg });
       continue;
     }
-    // 默认：确认
+    // 兜底：教练在问话（含问号）但未被上面识别 → 大概率在要材料/要具体点/要更多论点 →
+    // 有剩余点就给点；没有剩余点就明确"没有更多了"（触发 exhausted 出口），
+    // 避免"好的，我们继续。"这种无信息回复让教练重复同一问句（如「你还能想到另一个吗？」）。
+    if (/[？?]/.test(p2)) {
+      msg = pi < studentPoints.length ? studentPoints[pi++] : (extra.shift() || '没有更多了，我觉得这些已经足够，就这样吧。');
+      messages.push({ sender: 'user', text: msg });
+      continue;
+    }
+    // 默认（教练在陈述/指示，不是问话）：确认
     msg = '好的，我们继续。';
     messages.push({ sender: 'user', text: msg });
   }
