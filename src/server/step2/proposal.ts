@@ -20,6 +20,7 @@ import {
   headsCompatible,
   inferStanceMeta,
   isPointExpandedForWalk,
+  isSideContentComplete,
   parseSideRetentionSchemeFromCoachText,
   pointHasSubstantiveContent,
   pointSideKey,
@@ -479,7 +480,7 @@ export function buildFallbackSideSettleProposal(
   return {
     proposalId: proposalId || `fallback-side-${sideKey}-${Date.now()}`,
     kind: 'side_settle',
-    rationale: '按各条信息量生成的兜底方案',
+    // 兜底方案无真实判断来源 — 不带 rationale，ask 文案也不渲染兜底说明。
     payload: { side: sideKey, assignments },
   };
 }
@@ -986,6 +987,8 @@ export function buildAskFromProposal(
     const byId = new Map(
       activePoints(payload).map((p) => [p.id, p] as const),
     );
+    const roleWord = (r: Step2ProposalRole) =>
+      r === 'detail' ? '详写' : r === 'brief' ? '略写' : '放下';
     const lines: string[] = [];
     const details: string[] = [];
     const briefs: string[] = [];
@@ -993,11 +996,16 @@ export function buildAskFromProposal(
     for (const a of proposal.payload.assignments) {
       const p = byId.get(a.slotId);
       const label = claimMatchCore(p?.claim || '') || p?.claim || a.slotId;
-      lines.push(`${lines.length + 1}. ${label}`);
+      // 逐条展示论点完整表述（claim + elaboration），替代短标签列表。
+      const body = String(p?.elaboration || '').trim();
+      const full = body ? `${p?.claim || label}：${body}` : p?.claim || label;
+      lines.push(`${lines.length + 1}. ${full}（${roleWord(a.role)}）`);
       if (a.role === 'detail') details.push(`『${label}』`);
       else if (a.role === 'brief') briefs.push(`『${label}』`);
       else drops.push(`『${label}』`);
     }
+    // 仅真实方案来源（教练评估 / LLM retentionSuggestion）才带 rationale；
+    // 信息量兜底方案没有判断依据，不输出 rationale 行。
     const rationale = proposal.rationale
       ? `（${proposal.rationale}）`
       : '';
@@ -1005,9 +1013,11 @@ export function buildAskFromProposal(
       `「${sideLabel}」这一侧的材料都已展开。建议：**详写**${details.join('、') || '（无）'}` +
       (briefs.length ? `，**略写**${briefs.join('、')}` : '') +
       (drops.length ? `，**放下**${drops.join('、')}` : '') +
-      `。${rationale}略写即控制单段篇幅。\n\n${lines.join('\n')}\n\n` +
-      `采纳后将把这 ${lines.length} 条论点确认写入材料池（未采纳前为待确认）。\n` +
-      `请点击下方「采纳」或「拒绝」；也可直接回复「都详写」或「①详写，②略写」。`
+      `。${rationale}略写即控制单段篇幅。\n\n` +
+      `请确认以下论点表述及详略分工：\n${lines.join('\n')}\n\n` +
+      `以上论点已实时列入右侧看板（标「待确认」）。` +
+      `点「采纳」即确认表述并锁定详略分工；点「拒绝」后可重新安排，` +
+      `也可直接回复「都详写」或「①详写，②略写」。`
     );
   }
   if (proposal.kind === 'slot_add') {
@@ -1298,6 +1308,40 @@ export function sanitizeRetentionReason(raw: string): string {
   return t;
 }
 
+type SideWalkDisposition = {
+  dimension?: string;
+  disposition?: string;
+  mergedInto?: string;
+  side?: string;
+};
+
+/**
+ * 探索结束门（详略兜底提案）：该侧内容巡检完成（等价于 resolveNextSideWalkStep
+ * 不再对该侧返回 expand），且没有尚未落槽的 Step1 pending 维度——pending 维度
+ * 随时可能增量挂载为本侧新槽位，挂载前武装兜底提案会把未来的槽位排除在详略
+ * 分工之外。
+ */
+function sideExploreComplete(
+  payload: Step2PlannerPayload,
+  sideKey: string,
+  dispositions?: SideWalkDisposition[],
+): boolean {
+  if (!isSideContentComplete(payload, sideKey, dispositions)) return false;
+  if (!Array.isArray(dispositions) || !dispositions.length) return true;
+  const pts = activeNonDropped(payload);
+  return !dispositions.some((d) => {
+    if (String(d?.disposition || '').trim() !== 'pending') return false;
+    const dim = String(d?.dimension || '').trim();
+    if (!dim) return false;
+    // 已落槽（板上有点对应）的 pending 不阻塞 — 它不会再产生新槽位。
+    return !pts.some(
+      (p) =>
+        headsCompatible(String(p.claim || ''), dim) ||
+        headsCompatible(String(p.fromDimension || ''), dim),
+    );
+  });
+}
+
 export function armNextProposal(params: {
   payload: Step2PlannerPayload;
   coachText?: string;
@@ -1306,6 +1350,8 @@ export function armNextProposal(params: {
   studentWantsResettleSide?: string;
   /** Structured 详略 scheme from the LLM's step2Data this turn. */
   retentionSuggestion?: RetentionSuggestionInput;
+  /** Step1 维度处置（walk 状态判定用；缺省读 payload.dimensionDispositions）。 */
+  dispositions?: SideWalkDisposition[];
 }): Step2Proposal | null {
   const payload = params.payload;
   if (payload.pendingProposal?.proposalId) return payload.pendingProposal;
@@ -1329,6 +1375,9 @@ export function armNextProposal(params: {
     if (merge) return merge;
   }
 
+  const dispositions =
+    params.dispositions || payload.dimensionDispositions || [];
+
   for (const side of listSettleSides(payload)) {
     // Student rejected this side's settle and owns the scheme now — never
     // auto re-arm the same fallback until they answer or ask us to suggest.
@@ -1338,80 +1387,108 @@ export function armNextProposal(params: {
     ) {
       continue;
     }
+    const sidePts =
+      side === 'general' && isGeneralOnlyBoard(payload)
+        ? activeNonDropped(payload)
+        : pointsOnSideKey(payload, side);
+    const sug = params.retentionSuggestion;
+    const sugDetailOnSide = Boolean(
+      sug &&
+        Array.isArray(sug.detail) &&
+        sug.detail.length &&
+        sug.detail.some((lab) =>
+          matchLabelToPoint(String(lab || ''), sidePts),
+        ),
+    );
+    const fromCoach = params.coachText
+      ? buildSideSettleFromCoachText(payload, side, params.coachText)
+      : null;
+
+    // 单点侧没有详略分工可决策：无真实方案来源（fromCoach / retentionSuggestion）
+    // 时不走提案，直接确定性确认入池（confirmed + detail 锁定，复用 side_settle
+    // 提交逻辑）。仅多条点的侧才弹详略提案。
+    if (sidePts.length === 1 && !fromCoach && !sugDetailOnSide) {
+      const auto = buildFallbackSideSettleProposal(
+        payload,
+        side,
+        `auto-${side}`,
+      );
+      if (auto) {
+        const res = commitProposal({ payload, proposal: auto });
+        if (res.ok) {
+          Object.assign(payload, res.payload);
+          console.warn(
+            `[Step2Proposal] 单点侧自动确认 side=${side} slot=${sidePts[0].id} → detail`,
+          );
+        }
+      }
+      continue;
+    }
+
     // Priority 1: structured retentionSuggestion from the LLM's step2Data —
     // its actual judgment, no prose reverse-parsing. Only trusted when at
     // least one detail label resolves onto this side's slots.
-    const sug = params.retentionSuggestion;
     let usedStructuredSuggestion = false;
-    if (sug && Array.isArray(sug.detail) && sug.detail.length) {
-      const sidePts =
-        side === 'general' && isGeneralOnlyBoard(payload)
-          ? activeNonDropped(payload)
-          : pointsOnSideKey(payload, side);
-      const detailOnSide = sug.detail.some((lab) =>
-        matchLabelToPoint(String(lab || ''), sidePts),
-      );
-      if (detailOnSide) {
-        let dropLabels = (sug.drop || []).map((s) => String(s || ''));
-        let briefLabels = (sug.brief || []).map((s) => String(s || ''));
-        // A drop of a slot WITH real content, narrated as「合并/并入」, must
-        // become a slot_merge confirm FIRST — settle's drop only marks the
-        // slot, it never folds content, so accepting would silently lose it.
-        const mergeText = `${String(sug.reason || '')}\n${String(params.coachText || '')}`;
-        const mergeNarrated = /合并|并入|折进|整合至|整合到|归入/.test(mergeText);
-        const contentDrops = dropLabels
-          .map((lab) => matchLabelToPoint(lab, sidePts))
-          .filter(
-            (p): p is Step2Point =>
-              Boolean(p) && pointHasSubstantiveContent(p as Step2Point),
-          );
-        if (contentDrops.length && mergeNarrated) {
-          const from = contentDrops[0];
-          const into = resolveMergeIntoFromText(mergeText, sidePts, from.id);
-          const merge: Step2Proposal | null = into
-            ? {
-                proposalId: `merge-${from.id}-${into.id}`,
-                kind: 'slot_merge',
-                rationale:
-                  sanitizeRetentionReason(String(sug.reason || '')) ||
-                  '教练建议将这条并入另一条，需要你确认',
-                payload: { fromSlotId: from.id, intoSlotId: into.id },
-              }
-            : null;
-          if (
-            merge &&
-            !mergeAlreadyRejected(payload, merge.proposalId) &&
-            validateProposal(payload, merge).ok
-          ) {
-            usedStructuredSuggestion = true;
-            return merge;
-          }
-          // Merge target unresolvable (or already rejected): never let real
-          // content vanish under a「合并」narrative — demote those drops to
-          // brief. An explicit student「丢掉X」still drops via its own channel.
-          const demoteIds = new Set(contentDrops.map((p) => p.id));
-          const demoted = dropLabels.filter((lab) => {
-            const p = matchLabelToPoint(lab, sidePts);
-            return p && demoteIds.has(p.id);
-          });
-          dropLabels = dropLabels.filter((lab) => !demoted.includes(lab));
-          briefLabels = [...briefLabels, ...demoted];
-        }
-        const prop = buildSideSettleFromLabels({
-          payload,
-          sideKey: side,
-          detailLabels: (sug.detail || []).map((s) => String(s || '')),
-          briefLabels,
-          dropLabels,
-          rationale:
-            sanitizeRetentionReason(String(sug.reason || '')) ||
-            '来自教练评估方案',
-          proposalId: `settle-${side}`,
-        });
-        if (prop && validateProposal(payload, prop).ok) {
+    if (sug && sugDetailOnSide) {
+      let dropLabels = (sug.drop || []).map((s) => String(s || ''));
+      let briefLabels = (sug.brief || []).map((s) => String(s || ''));
+      // A drop of a slot WITH real content, narrated as「合并/并入」, must
+      // become a slot_merge confirm FIRST — settle's drop only marks the
+      // slot, it never folds content, so accepting would silently lose it.
+      const mergeText = `${String(sug.reason || '')}\n${String(params.coachText || '')}`;
+      const mergeNarrated = /合并|并入|折进|整合至|整合到|归入/.test(mergeText);
+      const contentDrops = dropLabels
+        .map((lab) => matchLabelToPoint(lab, sidePts))
+        .filter(
+          (p): p is Step2Point =>
+            Boolean(p) && pointHasSubstantiveContent(p as Step2Point),
+        );
+      if (contentDrops.length && mergeNarrated) {
+        const from = contentDrops[0];
+        const into = resolveMergeIntoFromText(mergeText, sidePts, from.id);
+        const merge: Step2Proposal | null = into
+          ? {
+              proposalId: `merge-${from.id}-${into.id}`,
+              kind: 'slot_merge',
+              rationale:
+                sanitizeRetentionReason(String(sug.reason || '')) ||
+                '教练建议将这条并入另一条，需要你确认',
+              payload: { fromSlotId: from.id, intoSlotId: into.id },
+            }
+          : null;
+        if (
+          merge &&
+          !mergeAlreadyRejected(payload, merge.proposalId) &&
+          validateProposal(payload, merge).ok
+        ) {
           usedStructuredSuggestion = true;
-          return prop;
+          return merge;
         }
+        // Merge target unresolvable (or already rejected): never let real
+        // content vanish under a「合并」narrative — demote those drops to
+        // brief. An explicit student「丢掉X」still drops via its own channel.
+        const demoteIds = new Set(contentDrops.map((p) => p.id));
+        const demoted = dropLabels.filter((lab) => {
+          const p = matchLabelToPoint(lab, sidePts);
+          return p && demoteIds.has(p.id);
+        });
+        dropLabels = dropLabels.filter((lab) => !demoted.includes(lab));
+        briefLabels = [...briefLabels, ...demoted];
+      }
+      const prop = buildSideSettleFromLabels({
+        payload,
+        sideKey: side,
+        detailLabels: (sug.detail || []).map((s) => String(s || '')),
+        briefLabels,
+        dropLabels,
+        rationale:
+          sanitizeRetentionReason(String(sug.reason || '')) ||
+          '来自教练评估方案',
+        proposalId: `settle-${side}`,
+      });
+      if (prop && validateProposal(payload, prop).ok) {
+        usedStructuredSuggestion = true;
+        return prop;
       }
     }
     // 显式降级（文档 item5-4）：结构化 retentionSuggestion 提供了但本侧不可用
@@ -1422,14 +1499,21 @@ export function armNextProposal(params: {
         `[Step2Proposal] retentionSuggestion 退化未用（side=${side}），退回 prose/长度启发式：detail=${JSON.stringify(sug.detail || []).slice(0, 120)}`,
       );
     }
-    // Priority 2: parse the coach's narrated scheme from prose (compat).
-    const fromCoach = params.coachText
-      ? buildSideSettleFromCoachText(payload, side, params.coachText)
-      : null;
+    // Priority 2: coach-prose scheme（真实方案来源，不受探索结束门限制）。
+    if (fromCoach && validateProposal(payload, fromCoach).ok) {
+      return fromCoach;
+    }
+
+    // 探索结束门：无真实方案来源时，仅当学生 exhausted 或该侧 checklist walk
+    // 完成才允许 Priority 3 信息量兜底武装；explore 中途禁止兜底提案。
+    if (!params.exhausted && !sideExploreComplete(payload, side, dispositions)) {
+      console.warn(
+        `[Step2Proposal] 探索未结束，跳过信息量兜底武装（side=${side}）`,
+      );
+      continue;
+    }
     // Priority 3: volume ranking fallback (longest elaboration → detail).
-    const prop =
-      fromCoach ||
-      buildFallbackSideSettleProposal(payload, side, `settle-${side}`);
+    const prop = buildFallbackSideSettleProposal(payload, side, `settle-${side}`);
     if (prop && validateProposal(payload, prop).ok) return prop;
   }
 

@@ -399,6 +399,7 @@ export function enforceStep2AskContract(
       payload,
       coachText: text,
       retentionSuggestion: step2.retentionSuggestion || null,
+      dispositions,
     });
     if (armed?.proposalId) {
       payload.pendingProposal = armed;

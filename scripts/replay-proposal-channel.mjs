@@ -786,7 +786,8 @@ check('structured retentionSuggestion wins over volume fallback', () => {
   assert.match(String(armed.rationale || ''), /因果链/);
 
   // Suggestion whose detail labels resolve to nothing on the side →
-  // ignored; volume fallback picks the longest (p1).
+  // ignored; volume fallback picks the longest (p1). Fallback carries no
+  // rationale（无真实方案来源 → ask 不输出 rationale 行 / 兜底硬编码）.
   const fallback = armNextProposal({
     payload,
     retentionSuggestion: { detail: ['不存在的槽位'], brief: [], reason: '' },
@@ -796,7 +797,9 @@ check('structured retentionSuggestion wins over volume fallback', () => {
     (a) => a.role === 'detail',
   );
   assert.equal(fbDetail.slotId, 'p1');
-  assert.match(String(fallback.rationale || ''), /按各条信息量/);
+  assert.equal(fallback.rationale, undefined);
+  const fbAsk = buildAskFromProposal(payload, fallback);
+  assert.doesNotMatch(fbAsk, /兜底方案/);
 });
 
 check('stance ask is self-contained; legacy pendingStanceConfirm migrates to channel', () => {

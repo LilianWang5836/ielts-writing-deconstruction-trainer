@@ -66,18 +66,29 @@ check("reopen 前：2 槽已确认", before.filledSlots === 2);
 
 const r = reopenSlot(sp, "pb1_s2");
 check("reopen 返回 ok", r.ok === true);
-check("reopen 后 slot2 minute 回退 recorded", m2.status === "recorded" && !m2.slotKey);
+// 新语义（fix#1）：reopen 回退为 landed 并保留 slotKey/原文 → 看板渲染为「待确认草稿」
+check("reopen 后 slot2 minute 回退 landed 且保留 slotKey", m2.status === "landed" && m2.slotKey === "pb1_s2");
 check("reopen 后 slot1 仍 confirmed", m1.status === "confirmed" && m1.slotKey === "pb1_s1");
 const after = renderBoard(sp);
-check("reopen 后看板：slot2 变空", after.filledSlots === 1 && after.blocks[0].slots[1].status === "empty");
+check("reopen 后看板：slot2 变为待确认草稿（原文保留）",
+  after.filledSlots === 1 &&
+  after.blocks[0].slots[1].status === "draft" &&
+  after.blocks[0].slots[1].pending === "通勤路上可以听课");
 check("reopen 后 body 未完成", isSkeletonComplete(sp) === false);
 check("reopen 有 reopened 审计事件", sp.landingLog!.some((e: any) => e.event === "reopened" && e.slotKey === "pb1_s2"));
 check("activeSlotLabel 指向展开原因", activeSlotLabel(sp) === "展开原因");
 
-// 重新作答并确认 → 复用 pending→confirm 路径
+// 路径 A：直接确认写板（不修改原文）→ 原 minute 恢复 confirmed
+commitPendingMinute(sp, m2);
+check("reopen 后直接确认：slot2 恢复 confirmed", m2.status === "confirmed" && m2.slotKey === "pb1_s2");
+
+// 路径 B：再次 reopen 后重新作答 → 新稿落同槽并覆盖旧待确认稿，复用 pending→confirm 路径
+const r1b = reopenSlot(sp, "pb1_s2");
+check("再次 reopen 返回 ok", r1b.ok === true && m2.status === "landed");
 const m3 = appendMinute(sp, "student", "通勤或午休的碎片时间可以听课程回放");
 const l3 = landMinuteToSlot(sp, m3);
 check("重答后落回 slot2", l3.ok && l3.slotKey === "pb1_s2");
+check("重答后旧待确认稿被覆盖回退 recorded", m2.status === "recorded" && !m2.slotKey);
 commitPendingMinute(sp, m3);
 check("重答确认后 slot2 恢复 confirmed", m3.status === "confirmed" && m3.slotKey === "pb1_s2");
 check("重答后 body 仍未全完（slot3 空）", isSkeletonComplete(sp) === false);

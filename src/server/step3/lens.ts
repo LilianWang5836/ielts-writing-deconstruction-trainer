@@ -303,7 +303,7 @@ export function resolveLandingGate(params: {
   const lens = evaluateMinute(text, slot, confirmed, chainType);
   const verdict = llmVerdict && slot ? llmVerdict : lens.verdict;
   const reason = String(llmReason || lens.reason || '');
-  const hint = String(lens.hint || llmHint || '');
+  const hint = String(llmHint || lens.hint || '');
   if (verdict === 'duplicate') {
     return { action: 'reject', verdict, reason, hint };
   }

@@ -224,6 +224,12 @@ export interface Step3Minute {
   status: 'recorded' | 'landed' | 'confirmed' | 'rejected';
   rejectReason?: string;
   fromCoachAsk?: string;
+  /**
+   * reopen「修改」标记：该 minute 由 reopenSlot 从 confirmed 回退为 landed（保留原文）。
+   * 学生在聊天里重新作答落同槽时，landMinuteToSlot 只覆盖带此标记的旧待确认稿，
+   * 不影响正常的同槽多次落槽（detectStall 打转检测依赖该堆叠语义）。
+   */
+  reopenedTag?: boolean;
 }
 
 /** Step 3 的一个主体段（body）。含会议秘书新架构字段。 */
@@ -292,6 +298,27 @@ export interface Step3Subpoint {
    * 学生确认后服务端清空 Step3 并重跑 planner；拒绝则关闭。
    */
   pendingStructureOffer?: { askedAt: number };
+}
+
+/**
+ * Step3 LLM 评估契约（判断透镜，随 /api/coach/chat 每轮返回）。
+ * 服务端秘书消费：verdict 参与质量门控、polishedText 整理稿校验、
+ * reuseQuote 历史回填（须为学生历史发言原文子串，服务端校验后才落槽）。
+ */
+export interface Step3Assessment {
+  /** 评估针对的槽 key（应对齐当前 firstEmpty；不匹配时服务端模糊兜底）。 */
+  slotKey: string;
+  verdict: 'ok' | 'thin' | 'off_target' | 'duplicate';
+  reason: string;
+  /** verdict 非 ok 时必填：引用学生原话的具体调整方向。 */
+  nextHint?: string;
+  /** verdict=ok 时应当输出：轻语言整理稿（服务端校验失败回退原文）。 */
+  polishedText?: string;
+  intent?: 'content' | 'affirm' | 'reject' | 'meta' | 'question' | 'correction' | 'structure_change';
+  /** 一条消息覆盖多个连续空槽时的分段（每段为消息子串）。 */
+  beats?: string[];
+  /** meta 指回历史时的回填引用：学生历史发言原文子串（跨 body，服务端子串校验）。 */
+  reuseQuote?: string;
 }
 
 /** 落槽审计事件（P1 — 纪要双层 + 可审计）。 */

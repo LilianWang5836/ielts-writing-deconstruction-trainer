@@ -220,6 +220,26 @@ export function landMinuteToSlot(
     return { ok: false, minuteId: minute.id, reason: dup };
   }
 
+  // reopen「修改」保留的旧待确认稿（reopenedTag）→ 新内容落同槽时回退 recorded，
+  // 保证 reopen 修订路径一个槽至多一条 landed（看板 pending / 确认写板只认最新一条）。
+  // 注意：①必须在 dup 预检之后，新 minute 被拒时不得误伤旧稿；
+  // ②只覆盖 reopen 稿，正常同槽多次落槽的堆叠语义保持不变（detectStall 依赖）。
+  for (const m of subpoint.minutes || []) {
+    if (
+      m.id !== minute.id &&
+      m.status === 'landed' &&
+      m.reopenedTag &&
+      m.slotKey === target.slot.key
+    ) {
+      m.status = 'recorded';
+      m.slotKey = undefined;
+      m.reopenedTag = undefined;
+      appendAudit(subpoint, m.id, 'held', undefined, '被新回答覆盖，旧待确认稿回退', {
+        source: 'supersede',
+      });
+    }
+  }
+
   minute.status = 'landed';
   minute.slotKey = target.slot.key;
   subpoint.activeSlotIndex = targetIndex;
@@ -407,9 +427,10 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
 
 /**
  * P2（D5 前半）已确认槽修订入口：把某已 confirmed 的槽重新打开。
- *  - 对应 minute 从 confirmed 回退为 recorded（保留文本与审计历史）；
- *  - 清空该槽（看板投影消失该槽内容）；
- *  - 秘书游标移回该槽，后续复用现有 pending→confirm 路径。
+ *  - 对应 minute 从 confirmed 回退为 **landed** 并**保留 slotKey 与原文**——
+ *    看板投影为「待确认草稿」（不清空原文），学生可直接确认写板、铅笔编辑后重答、
+ *    或在聊天里重新作答（landMinuteToSlot 会用新稿覆盖这条旧待确认稿）；
+ *  - 秘书游标移回该槽，复用现有 pending→confirm 路径。
  * 最小方案：不影响其他已确认槽；后续槽保持已确认。
  */
 export function reopenSlot(
@@ -423,8 +444,8 @@ export function reopenSlot(
     (m) => m.status === 'confirmed' && m.slotKey === slotKey,
   );
   if (!minute) return { ok: false, reason: 'slot_not_confirmed' };
-  minute.status = 'recorded';
-  minute.slotKey = undefined;
+  minute.status = 'landed';
+  minute.reopenedTag = true;
   if (subpoint.skeleton) {
     const flat = skeletonFlatSlots(subpoint.skeleton);
     const idx = flat.findIndex((f) => f.slot.key === slotKey);
@@ -740,7 +761,9 @@ function replayFromAuditLog(
             ? 'landed'
             : entry.event === 'held'
               ? 'recorded'
-              : 'rejected',
+              : entry.event === 'reopened'
+                ? 'landed' // reopen 保留 slotKey 回退为待确认草稿（与 reopenSlot 语义一致）
+                : 'rejected',
       // 仅 rejected 事件把原因映射到 minute.rejectReason；held 只记在审计（recorded 无 rejectReason）。
       rejectReason: entry.event === 'rejected' ? entry.reason : undefined,
     };
