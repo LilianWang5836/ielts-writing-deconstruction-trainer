@@ -217,7 +217,7 @@ export function evaluateMinute(
     return {
       verdict: 'thin',
       reason: `内容偏薄（${nt.length} 字 < 建议 ${minLen}）`,
-      hint: `这一步（${slot.label}）可以再具体一点：补充场景、机制或对象。`,
+      hint: `这一步（${slot.label}）可以再具体一点：如果已经举了例子，把它细化（谁、怎么发生）；如果还没有，补一个具体场景或对象。`,
     };
   }
 
