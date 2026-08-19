@@ -42,6 +42,9 @@ function TokenUsageBadge() {
 interface HeaderProps {
   activeTopic: Topic | null;
   currentStep: number;
+  /** Step numbers (1-4) that have been completed in this session, so they
+   *  remain clickable even after the user navigates back to an earlier step. */
+  completedSteps?: number[];
   onStepClick: (step: number) => void;
   onReset: () => void;
   apiKeyMissing: boolean;
@@ -58,6 +61,7 @@ const STEPS = [
 export default function Header({
   activeTopic,
   currentStep,
+  completedSteps = [],
   onStepClick,
   onReset,
   apiKeyMissing,
@@ -77,7 +81,7 @@ export default function Header({
                 雅思写作“拆解式”训练营
               </h1>
               <span className="rounded-full bg-indigo-50 px-2 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
-                MVP v1.0
+                v0.5.4.5
               </span>
               <TokenUsageBadge />
             </div>
@@ -192,7 +196,7 @@ export default function Header({
           <div className="grid grid-cols-4 gap-2">
             {STEPS.map((step) => {
               const isActive = currentStep === step.num;
-              const isCompleted = currentStep > step.num;
+              const isCompleted = completedSteps.includes(step.num);
               return (
                 <button
                   key={step.num}

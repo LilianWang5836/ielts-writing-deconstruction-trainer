@@ -115,6 +115,25 @@ export default function App() {
       <Header
         activeTopic={activeTopic}
         currentStep={session?.currentStep || 1}
+        completedSteps={
+          session
+            ? [
+                session.step1?.isCompleted ? 1 : null,
+                session.step2?.isCompleted ? 2 : null,
+                // Step 3: trust the whole-step flag, but also fall back to
+                // "every subpoint isCompleted" so historical sessions that
+                // completed via the chat AFFIRM path (which didn't persist
+                // session.step3.isCompleted) still unlock Step 3/4 navigation.
+                session.step3?.isCompleted ||
+                (Array.isArray(session.step3?.subpoints) &&
+                  session.step3.subpoints.length > 0 &&
+                  session.step3.subpoints.every((sp: any) => sp?.isCompleted))
+                  ? 3
+                  : null,
+                session.step4?.isCompleted ? 4 : null,
+              ].filter((n): n is number => n !== null)
+            : []
+        }
         onStepClick={handleSetStep}
         onReset={handleResetSession}
         apiKeyMissing={apiKeyMissing}

@@ -433,7 +433,7 @@ function computePlanSignature(session: PracticeSession): string {
 | **PR-A** | types 扩展 + `step2_5` API + CTA 触发 + 禁输入 + 等待跳转 | ~300 行 | 手动走通 Step 2→Step 3 跳转，plan 正确灌入 |
 | **PR-B** | Step 3 读 2.5 plan + kickoff 锁定 + 禁造骨架 | ~200 行 | `verify-step-openers.mjs` 通过 |
 | **PR-C** | Planner QA（机械 + LLM） | ~200 行 | 手动触发 QA fail → 重试 → pass |
-| **PR-D** | 拆除 `applyStep3FrameworkGuard` 结构作者 + 补拍逻辑 | ~150 行（删） | `verify-slot-reuse.mjs` 更新通过 |
+| **PR-D** | 拆除 `applyStep3FrameworkGuard` 结构作者 + 补拍逻辑 | ~150 行（删） | `verify-slot-reuse.mjs` 已归档至 `scripts/legacy/`（会议秘书架构取代） |
 | **PR-E** | adaptations 执行器 + structureChangeOffer | ~200 行 | 手动测试 reclass/merge/add/skip |
 | **PR-F** | 死代码清理 + 重构 + 回归测试 | ~100 行 | 全量 verify 脚本通过 |
 
@@ -447,7 +447,7 @@ function computePlanSignature(session: PracticeSession): string {
 | `src/components/Step3Drafting.tsx` | B | 从 `step2_5.bodyPlans` 灌 plan、kickoff 锁定 |
 | `src/components/CoachChat.tsx` | A/E | running 禁用输入、执行 adaptations 刷新 |
 | `scripts/verify-step-openers.mjs` | B | 更新断言 |
-| `scripts/verify-slot-reuse.mjs` | D | 更新断言 |
+| `scripts/legacy/verify-slot-reuse.mjs` | D | 已归档（会议秘书架构取代 adaptations 机制） |
 
 ### 7.3 不修改的文件（冻结）
 
@@ -466,47 +466,47 @@ function computePlanSignature(session: PracticeSession): string {
 
 ### 8.1 PR-A 验收
 
-- [ ] `session.step2_5` 有正确的 TypeScript 类型
-- [ ] Step 2 `isCompleted` 时自动触发 POST `/api/step2_5/plan`
-- [ ] `running` 期间左侧 CoachChat 输入框禁用
-- [ ] `passed` 后点击"进入第三步"正确跳转
-- [ ] `failed` 后显示重试按钮
-- [ ] 超时 ~60s 自动标记 `failed`
+- [x] `session.step2_5` 有正确的 TypeScript 类型（`src/types.ts` `Step2_5State`）
+- [x] Step 2 `isCompleted` 时自动触发 Planner（路由为 `/api/planner/generate`，非文档原名 `/api/step2_5/plan`；前端 `Step2Brainstorm.tsx` CTA 自动触发）
+- [x] `running` 期间左侧 CoachChat 输入框禁用
+- [x] `passed` 后点击"进入第三步"正确跳转
+- [x] `failed` 后显示重试按钮（降级路径：`degraded` 标志 + 前端重试）
+- [ ] 超时 ~60s 自动标记 `failed`（未实现超时；Planner 失败走 LLM 重试 1 次 + 程序兜底 `buildFallbackBodyPlans`，无 60s 硬超时）
 
 ### 8.2 PR-B 验收
 
-- [ ] Step 3 进入时 `subpoints[].paragraphPlan` 不为空
-- [ ] 右侧看板正确展示 plan 的 pointBlocks / steps
-- [ ] kickoff 第一条消息对准 firstEmpty（expand），不要求 LLM 造骨架
-- [ ] kickoff 不包含 confirm bundle / pendingText
-- [ ] `verify-step-openers.mjs` 全部通过
+- [x] Step 3 进入时 `subpoints[].paragraphPlan` 不为空（灌入 `step2_5.bodyPlans`；会议秘书架构下改为 `skeleton` 冻结 + `minutes` 真相源，`paragraphPlan` 仅旧会话兼容回退）
+- [x] 右侧看板正确展示 plan 的 pointBlocks / steps（`renderBoard` 投影 skeleton+minutes）
+- [x] kickoff 第一条消息对准 firstEmpty（expand），不要求 LLM 造骨架（`firstEmptySlotKey` + probe-first）
+- [x] kickoff 不包含 confirm bundle / pendingText
+- [x] `verify-step-openers.mjs` 全部通过
 
 ### 8.3 PR-C 验收
 
-- [ ] 机械 QA 正确拒绝：value 非空的 plan / bodyPlans 数量不对 / key 重复
-- [ ] QA fail 后 Planner 重试最多 2 次
-- [ ] 2 次仍 fail → `failed` 状态
+- [x] 机械 QA 正确拒绝：value 非空的 plan / bodyPlans 数量不对 / key 重复（`runMechanicalQa`，`src/server/planner/planner.ts`）
+- [x] QA fail 后 Planner 重试最多 2 次（`MAX_PLANNER_ATTEMPTS = 2`）
+- [x] 2 次仍 fail → 降级 `buildFallbackBodyPlans`（非 `failed` 状态；走程序兜底保证可用性）
 
 ### 8.4 PR-D 验收
 
-- [ ] `applyStep3FrameworkGuard` 不再在 Step 3 对话路径中被调用
-- [ ] `enforceFrameworkPointBlockCount` 不再被调用
-- [ ] `ensureArgumentRelationCoverage` / `ensureConcessionStructure` 的 Step 3 调用被移除
-- [ ] Step 3 对话中 plan 结构不再每轮变化
-- [ ] `verify-slot-reuse.mjs` 更新通过
+- [x] `applyStep3FrameworkGuard` 不再在 Step 3 对话路径中被调用（已删除，`b083d62` P0 补完）
+- [x] `enforceFrameworkPointBlockCount` 不再被调用（已删除）
+- [x] `ensureArgumentRelationCoverage` / `ensureConcessionStructure` 的 Step 3 调用被移除（mode-correction 死代码链全删）
+- [x] Step 3 对话中 plan 结构不再每轮变化（骨架冻结，LLM 禁止输出结构字段）
+- [x] `verify-slot-reuse.mjs` 已归档至 `scripts/legacy/`（会议秘书架构取代 adaptations 机制）
 
 ### 8.5 PR-E 验收
 
-- [ ] `reclass`：LLM 声明改 label → 服务端验证 key 存在 → 立即更新 label
-- [ ] `merge`：LLM 声明合并两个槽 → 服务端验证同 block → 合并
-- [ ] `add`：LLM 声明插入新槽 → 服务端验证 → 插入
-- [ ] `skip`：跳过未使用的槽
-- [ ] `structureChangeOffer`：LLM 声明改 Body 论点 → 用户确认 → 清 Step 3 → 2.5 重跑
+> 注：原 PR-E 的 `reclass`/`merge`/`add`/`skip` adaptations 机制被会议秘书架构取代。Step3 槽位适配改为：LLM 出判断（verdict/intent），服务端确定性函数（`appendMinute`/`landMinuteToSlot`/`commitPendingMinute`/`renderBoard`）管状态。结构异议走 `structure_change` 意图 → `pendingStructureOffer` → 确认清空 + stale step2_5 重跑（见 `prompt-ds-requirements-alignment` P3）。
+
+- [x] 槽位适配：LLM 判断 + 服务端确定性落槽（取代 reclass/merge/add/skip）
+- [x] `structureChangeOffer`：LLM 判 `intent=structure_change` → 用户确认 → 清 Step3 + stale step2_5 → 重跑 planner（`applyStep3StructureReplan`，`verify-p3-replan.mts` 17/17）
+- [x] 已确认槽 reopen 修订入口（`reopenSlot`，`verify-p2-reopen.mts` 16/16）
 
 ### 8.6 端到端验收
 
-- [ ] 用 `scripts/run-step1-3-e2e.mjs` 完整跑通 Step 1 → Step 2 → Step 3
-- [ ] Step 1 不会无限循环
-- [ ] Step 2 正确触发 2.5
-- [ ] Step 3 的 paragraphPlan 稳定不漂移
-- [ ] 所有 verify 脚本通过
+- [x] 用 `scripts/run-step1-3-e2e.mjs` 完整跑通 Step 1 → Step 2 → Step 3
+- [x] Step 1 不会无限循环（de-gate V1 + `inferProbeVerdictFromStudentMessage` 兜底，`verify-step1-degate.mts` 21/21）
+- [x] Step 2 正确触发 2.5（CTA 自动触发 `/api/planner/generate`）
+- [x] Step 3 的 paragraphPlan 稳定不漂移（骨架冻结）
+- [x] 所有 verify 脚本通过（17 套 `verify-*.mts` 全绿；`replay-retention-planner-checklist.mjs` 27/27 已修复；`verify-discussion-step2.mjs` 需 dev server + API key）

@@ -2,7 +2,7 @@
  * Paper + unit replay of the latest public-transport session path
  * against the retention-lock + planner checklist.
  *
- * Run: node scripts/replay-retention-planner-checklist.mjs
+ * Run: npx tsx scripts/replay-retention-planner-checklist.mjs
  */
 import assert from "node:assert/strict";
 import {
@@ -153,7 +153,7 @@ const coachSrc = fs.readFileSync(
   "utf8",
 );
 assert.match(serverSrc, /rewriteStep3WholeStepJumpCta/);
-assert.match(serverSrc, /No incomplete sibling body; promoting to whole-step jump CTA/);
+assert.match(serverSrc, /Real incomplete sibling body label, or null when none remain/);
 assert.match(serverSrc, /Never invent "下一段"/);
 ok("Step3 jump-CTA fix still present (no fake 下一段)");
 

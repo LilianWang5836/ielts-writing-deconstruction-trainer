@@ -119,14 +119,22 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
       ? activeStep3Subpoint?.chatHistory || []
       : session[stepKey]?.chatHistory || [];
 
-  // Step 3：服务端暂存 pending（kickoffPendingDrafts）时，确认 UI 挂在最新 Coach 气泡上。
+  // Step 3：会议秘书新架构——landed minute（待确认草稿）从 minutes 投影，
+  // 不再依赖已废弃的 kickoffPendingDrafts。确认 UI 挂在最新 Coach 气泡上。
   const pendingDrafts =
-    stepKey === 'step3'
-      ? Array.isArray(activeStep3Subpoint?.kickoffPendingDrafts)
-        ? activeStep3Subpoint.kickoffPendingDrafts.filter(
-            (d: any) => String(d?.text || '').trim().length >= 4,
-          )
-        : []
+    stepKey === 'step3' && activeStep3Subpoint
+      ? (() => {
+          const sp: any = activeStep3Subpoint;
+          const minutes = Array.isArray(sp.minutes) ? sp.minutes : [];
+          // 当前 active slot 的 landed minute = 待确认草稿
+          const landed = minutes.find(
+            (m: any) => m?.status === 'landed' && m?.slotKey,
+          );
+          if (!landed) return [];
+          const text = String(landed.displayText || landed.text || '').trim();
+          if (text.length < 4) return [];
+          return [{ key: landed.slotKey, text }];
+        })()
       : [];
   // Keep confirm bubble stable while the affirm request is in flight (don't
   // re-split the coach message on --- just because loading flipped true).
@@ -534,9 +542,16 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
     stepKey,
   ]);
 
+  const prevStepKeyRef = useRef<string | null>(null);
   useEffect(() => {
     setShowResetConfirm(false); // Reset confirmation state on step change
-    kickoffRef.current = null;
+    // Only reset the kickoff guard on a REAL step change, not on StrictMode
+    // double-invocation. Otherwise the second mount nulls the ref after the
+    // first mount's autoKickoff already fired, causing a duplicate kickoff.
+    if (prevStepKeyRef.current !== stepKey) {
+      prevStepKeyRef.current = stepKey;
+      kickoffRef.current = null;
+    }
     // When autoKickoff is on (step2/step3), the LLM-generated opener is the first
     // message; do NOT seed a templated welcome bubble (it duplicates the opener).
     if (chatHistory.length === 0 && !autoKickoff) {
@@ -554,6 +569,7 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
         },
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stepKey]);
 
   // Scroll to bottom on new messages
@@ -1088,9 +1104,13 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
     );
     if (hasAnyMessage) return;
     const kickoffKey = `${stepKey}:${kickoffContextKey}`;
+    // Guard against double-fire (React 18 StrictMode / fast re-renders):
+    // check AND set synchronously so a second invocation in the same tick sees
+    // the flag already raised.
     if (kickoffRef.current === kickoffKey) return;
     kickoffRef.current = kickoffKey;
     sendUserMessage(kickoffPrompt, { hiddenUserMessage: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     autoKickoff,
     kickoffPrompt,
@@ -1528,12 +1548,16 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
               ) : (
                 <div className="markdown-body text-xs md:text-[12.5px] text-slate-800">
                   <ReactMarkdown>{prepareCoachMarkdown(msg.text)}</ReactMarkdown>
-                  {/* Step1 Q1: question-type chips → fill input (mutually exclusive) */}
+                  {/* Step1 Q1: question-type chips → fill input (mutually exclusive)
+                      Show on the LATEST AI message whenever the coach is asking
+                      about question type (not only the very first turn), so that
+                      after a wrong-type correction the chips re-appear for the
+                      student to pick again. */}
                   {msg.sender === 'ai' &&
                     stepKey === 'step1' &&
-                    chatHistory[0] &&
-                    msg.id.startsWith(chatHistory[0].id) &&
-                    !chatHistory.some((m) => m.sender === 'user') && (
+                    msg.id === chatHistory[lastAiHistoryIndex]?.id &&
+                    /题型|属于什么|哪一类|Question Type|question type/i.test(msg.text) &&
+                    !session.step1.isCompleted && (
                       <div className="mt-2.5 flex flex-wrap gap-1.5">
                         {STEP1_QUESTION_TYPES.map((type) => (
                           <button

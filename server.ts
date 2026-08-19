@@ -3348,6 +3348,12 @@ function attachStep3UiProgress(
   }
   // Keep whole-step flag aligned with the UI contract.
   data.progressUpdate.isCompleted = isStep3Finished;
+  // Persist whole-step completion on the server session object so historical
+  // sessions restored later report step3.isCompleted correctly (the AFFIRM
+  // path only sets progressUpdate, never session.step3.isCompleted).
+  if (isStep3Finished && session?.step3) {
+    session.step3.isCompleted = true;
+  }
 
   // Final authority for coach copy: finished board ⇒ jump CTA, never「下一段」.
   if (isStep3Finished) {
@@ -4660,6 +4666,19 @@ function enforceStep3SecretaryPath(
     /^(不好|不是|重说|重新说|改一下)[。.!！?？]?$/.test(msg) ||
     /拒绝|否决|撤销/.test(msg);
 
+  // 当前 landed 待确认纪要（单条或批量多条）
+  const landedList = (sp.minutes || []).filter((m: any) => m.status === "landed");
+
+  // 当有 landed 待确认草稿时，学生说“下一步/继续/进入下一步”等推进信号
+  // 应视为确认（= 确认当前草稿并推进），而不是 exhausted/skip。
+  // 否则这些短句会被误判为内容走门控落槽，导致“下一步”被写进看板。
+  const isAdvanceSignal =
+    landedList.length > 0 &&
+    /^(下一步|进入下一步|先进入下一步|继续|继续下一步|好.*下一步|下一步吧)[。.!！?？]?$/.test(
+      msg,
+    );
+  const isAffEffective = isAff || isAdvanceSignal;
+
   // ---- P3（D5 后半）结构异议：已武装重规划要约时，本轮优先处理 确认/拒绝 ----
   if (sp.pendingStructureOffer) {
     if (isAff) {
@@ -4735,10 +4754,9 @@ function enforceStep3SecretaryPath(
     // 未形成死锁（stall 未触发且该槽未被拒≥2）：不落分支，按普通内容继续处理。
   }
 
-  // 当前 landed 待确认纪要（单条或批量多条）
-  const landedList = (sp.minutes || []).filter((m: any) => m.status === "landed");
+  // 当前 landed 待确认纪要（单条或批量多条）—— landedList 已在上方定义。
 
-  if (isAff && landedList.length > 0) {
+  if (isAffEffective && landedList.length > 0) {
     // 确认 → 写板（支持批量：一条消息覆盖多槽时一次全过）。
     const confirmedIds: string[] = [];
     for (const lm of landedList) {

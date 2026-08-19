@@ -198,10 +198,20 @@ export function landMinuteToSlot(
   );
   let start = Math.min(Math.max(subpoint.activeSlotIndex || 0, 0), flat.length - 1);
   let targetIndex = -1;
+  // 游标优先：从 activeSlotIndex 起向后找第一个空槽；找不到则回退从 0 全局扫描，
+  // 避免游标卡在末尾（历史跳跃式确认导致中间空槽被跳过）时误判 all_slots_filled。
   for (let i = start; i < flat.length; i++) {
     if (!confirmedKeys.has(flat[i].slot.key)) {
       targetIndex = i;
       break;
+    }
+  }
+  if (targetIndex === -1) {
+    for (let i = 0; i < start; i++) {
+      if (!confirmedKeys.has(flat[i].slot.key)) {
+        targetIndex = i;
+        break;
+      }
     }
   }
   if (targetIndex === -1) {
@@ -306,8 +316,13 @@ export function firstEmptySlotKey(subpoint: Step3Subpoint): string | null {
       .filter((m) => m.status === 'confirmed' && m.slotKey)
       .map((m) => m.slotKey as string),
   );
+  // 游标优先：从 activeSlotIndex 起向后找第一个空槽；找不到则回退从 0 全局扫描，
+  // 避免游标卡在末尾（历史跳跃式确认导致中间空槽被跳过）时找不到前面的空槽。
   const start = Math.min(Math.max(subpoint.activeSlotIndex || 0, 0), flat.length - 1);
   for (let i = start; i < flat.length; i++) {
+    if (!confirmedKeys.has(flat[i].slot.key)) return flat[i].slot.key;
+  }
+  for (let i = 0; i < start; i++) {
     if (!confirmedKeys.has(flat[i].slot.key)) return flat[i].slot.key;
   }
   return null;
@@ -414,13 +429,21 @@ export function commitPendingMinute(subpoint: Step3Subpoint, minute: Step3Minute
   // 推进到下一个未填槽
   if (subpoint.skeleton) {
     const flat = skeletonFlatSlots(subpoint.skeleton);
-    const next = flat.findIndex(
-      (f, i) =>
-        i > (subpoint.activeSlotIndex || 0) &&
-        !(subpoint.minutes || []).some(
-          (m) => m.status === 'confirmed' && m.slotKey === f.slot.key,
-        ),
-    );
+    const isFilled = (i: number) =>
+      (subpoint.minutes || []).some(
+        (m) => m.status === 'confirmed' && m.slotKey === flat[i].slot.key,
+      );
+    // 游标优先：先向后找；找不到则回退从 0 全局扫描，避免游标卡在末尾
+    // （历史跳跃式确认导致中间空槽被跳过）时无法回到前面的空槽。
+    let next = -1;
+    for (let i = (subpoint.activeSlotIndex || 0) + 1; i < flat.length; i++) {
+      if (!isFilled(i)) { next = i; break; }
+    }
+    if (next === -1) {
+      for (let i = 0; i < (subpoint.activeSlotIndex || 0); i++) {
+        if (!isFilled(i)) { next = i; break; }
+      }
+    }
     if (next !== -1) subpoint.activeSlotIndex = next;
   }
 }

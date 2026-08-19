@@ -313,11 +313,7 @@ export default function Step4SentencePractice({
   const [viewMode, setViewMode] = useState<'editing' | 'reviewing'>('editing');
   const [selectedText, setSelectedText] = useState('');
   const [guidanceLoading, setGuidanceLoading] = useState(false);
-  const [guidance, setGuidance] = useState<InlineGuidanceResult | null>(null);
-  const [guidanceIntent, setGuidanceIntent] = useState<GuidanceIntent | ''>('');
-  const [guidanceQuestion, setGuidanceQuestion] = useState('');
   const [confirming, setConfirming] = useState(false);
-  const [showGuidance, setShowGuidance] = useState(false);
   const [topicExpanded, setTopicExpanded] = useState(false);
   const [draftExpanded, setDraftExpanded] = useState(false);
   const [activeAnnotationIdx, setActiveAnnotationIdx] = useState<number | null>(null);
@@ -437,10 +433,6 @@ export default function Step4SentencePractice({
     );
     setViewMode('editing');
     setSelectedText('');
-    setGuidance(null);
-    setGuidanceIntent('');
-    setGuidanceQuestion('');
-    setShowGuidance(false);
     setActiveAnnotationIdx(null);
     setDraftExpanded(false);
     setGuidanceThread([]);
@@ -671,10 +663,6 @@ export default function Step4SentencePractice({
       setTaskState(sortedUpdated);
       setViewMode('editing');
       setSelectedText('');
-      setGuidance(null);
-      setGuidanceIntent('');
-      setGuidanceQuestion('');
-      setShowGuidance(false);
       setActiveAnnotationIdx(null);
       setGuidanceThread([]);
       setStartScaffoldActive(false);
@@ -702,10 +690,6 @@ export default function Step4SentencePractice({
     setUserDraft(persisted[idx]?.userDraft || persisted[idx]?.confirmedSentence || '');
     setViewMode('editing');
     setSelectedText('');
-    setGuidance(null);
-    setGuidanceIntent('');
-    setGuidanceQuestion('');
-    setShowGuidance(false);
     setErrorMsg('');
     setActiveAnnotationIdx(null);
     setGuidanceThread([]);
@@ -818,7 +802,6 @@ export default function Step4SentencePractice({
     priorThread: GuidanceThreadMessage[],
   ) => {
     if (!activeTask) return;
-    setGuidanceIntent(intent);
     if (intent === 'start_sentence') setStartScaffoldActive(true);
     setGuidanceLoading(true);
     setErrorMsg('');
@@ -856,7 +839,6 @@ export default function Step4SentencePractice({
         issue: data.issue || '',
         hint: data.hint || '',
       };
-      setGuidance(result);
       setGuidanceThread((prev) => [
         ...prev,
         {
