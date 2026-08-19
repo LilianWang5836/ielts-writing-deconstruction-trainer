@@ -3356,9 +3356,16 @@ function attachStep3UiProgress(
   }
 
   // Final authority for coach copy: finished board ⇒ jump CTA, never「下一段」.
+  // P-correction：如果当前 body 有 pending draft（correction reopen 产生的 landed），
+  // 说明学生在修正某个已确认槽，不应覆盖成"全通关"CTA——要让学生确认新内容。
   if (isStep3Finished) {
+    const hasPendingDraft = (session?.step3?.subpoints || []).some(
+      (sp: any) =>
+        Array.isArray(sp?.minutes) &&
+        sp.minutes.some((m: any) => m.status === "landed"),
+    );
     const t = String(data.text || "");
-    if (!textSuggestsStep3Complete(t) || textLooksLikeStep3NextBodyAdvance(t)) {
+    if (!hasPendingDraft && (!textSuggestsStep3Complete(t) || textLooksLikeStep3NextBodyAdvance(t))) {
       rewriteStep3WholeStepJumpCta(data);
       console.warn(
         "[Step3Guard] isStep3Finished=true — normalized coach text to whole-step jump CTA.",
@@ -3844,6 +3851,7 @@ function formatStep3SlotCursorForPrompt(activeSp: any): string {
   const pending = minutes.find((m: any) => m.status === "landed");
   // P-#10 上下文扩容：注入当前 body 全部已确认槽文本（取消同 block 限制，
   // 单条截断 40→120 字），教练复述/追问不再丢上下文。
+  // P-correction：带上 slotKey，便于 LLM 在 correction 意图时指明要修正哪个槽。
   const confirmedTexts = flat
     .filter((f) => confirmedKeys.has(f.slot.key))
     .map((f) => {
@@ -3851,7 +3859,7 @@ function formatStep3SlotCursorForPrompt(activeSp: any): string {
         (x: any) => x.slotKey === f.slot.key && x.status === "confirmed",
       );
       return m
-        ? `${f.slot.label}: ${String(m.displayText || m.text || "").slice(0, 120)}`
+        ? `[${f.slot.key}] ${f.slot.label}: ${String(m.displayText || m.text || "").slice(0, 120)}`
         : "";
     })
     .filter(Boolean);
@@ -3869,6 +3877,13 @@ function formatStep3SlotCursorForPrompt(activeSp: any): string {
     }`,
     `- skeleton completion: ${confirmedKeys.size}/${flat.length} slots confirmed`,
   ];
+  // P-correction：body 已完整时提示 LLM 学生可能想修正某个已确认槽，
+  // 必须输出 step3Assessment(intent=correction, slotKey=要修正的槽)。
+  if (!firstEmpty && confirmedKeys.size === flat.length) {
+    lines.push(
+      `- NOTE: body is complete. If the student is correcting/revising a confirmed slot above, you MUST output step3Assessment with intent=correction and slotKey=[the slot key being corrected]. Do NOT just acknowledge in chat — the board must update.`,
+    );
+  }
   const gateHint = activeSp?.lastGateHint;
   if (gateHint && gateHint.hint) {
     lines.push(
@@ -4718,6 +4733,15 @@ function enforceStep3SecretaryPath(
     );
   }
 
+  // ---- 实质回答 / 元评论：记纪要并按质量门控落槽（P0）----
+  // 本地渲染辅助：统一回传看板 + 未完成标记。
+  const renderNow = (): void => {
+    data.progressUpdate.step3SubpointCompleted = false;
+    data.progressUpdate.isCompleted = false;
+    data.progressUpdate.secretaryBoard = renderBoard(sp);
+    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+  };
+
   // ---- 打转熔断出口：stall 已触发（或该空槽已多次被拒）时，学生说「跳过」或
   //      表达「展开不了/想不出来」（exhausted 意图）→ 确定性暂略当前槽 ----
   // V1.1 修复（2026-08-18 UI 全流程复现）：学生反复"这个点我暂时展开不了更多"，
@@ -4775,27 +4799,39 @@ function enforceStep3SecretaryPath(
 
   if (isRej) {
     // 拒绝 → 全部 landed 回退为 recorded，不写板（支持批量）
-    for (const lm of landedList) {
+    // 但当所有槽已 confirmed 且无 landed 草稿时，"不对/重新说"是修正已确认槽，
+    // 不是拒绝草稿——走 P-correction 确定性 fallback（见下方分支）。
+    const hasLandedForReject = landedList.length > 0;
+    const CORRECTION_SIGNAL_RE =
+      /^(不对|不是|错了|有误|不准确|重新说|重说|改一下|改成|应该是|其实是|我刚才说的|我之前说的|更正|修正)/;
+    const allConfirmedForCorrection =
+      firstEmptySlotKey(sp) === null &&
+      Array.isArray(sp.skeleton?.blocks) &&
+      sp.skeleton.blocks.length > 0;
+    if (
+      !hasLandedForReject &&
+      allConfirmedForCorrection &&
+      CORRECTION_SIGNAL_RE.test(msg)
+    ) {
+      // 走 correction fallback，不 return
       console.warn(
-        `[Secretary] REJECT minute=${lm.id} slotKey=${lm.slotKey} → reverted to recorded`,
+        "[Secretary] isRej 但 allConfirmed + 修正信号 → 走 P-correction fallback",
       );
-      lm.status = "recorded";
-      lm.slotKey = undefined;
+    } else {
+      for (const lm of landedList) {
+        console.warn(
+          `[Secretary] REJECT minute=${lm.id} slotKey=${lm.slotKey} → reverted to recorded`,
+        );
+        lm.status = "recorded";
+        lm.slotKey = undefined;
+      }
+      data.progressUpdate.secretaryBoard = renderBoard(sp);
+      data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+      return;
     }
-    data.progressUpdate.secretaryBoard = renderBoard(sp);
-    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
-    return;
   }
 
   // ---- 实质回答 / 元评论：记纪要并按质量门控落槽（P0）----
-  // 本地渲染辅助：统一回传看板 + 未完成标记。
-  const renderNow = (): void => {
-    data.progressUpdate.step3SubpointCompleted = false;
-    data.progressUpdate.isCompleted = false;
-    data.progressUpdate.secretaryBoard = renderBoard(sp);
-    data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
-  };
-
   // P-#9 历史回填通道：meta 指回历史且无 pending 草稿时，若 LLM 给出 reuseQuote
   // （学生历史发言原文子串），子串校验通过后把该引用文本落到当前槽（走正常
   // landed→确认流程），不落当前 meta 消息；校验失败记日志并按无 reuseQuote 处理。
@@ -4948,6 +4984,135 @@ function enforceStep3SecretaryPath(
     );
     renderNow();
     return;
+  }
+
+  // ---- P-correction：学生在修正/澄清某个已确认槽的内容 ----
+  // 触发条件：LLM 判定 intent=correction 且给出 slotKey 指明要修正哪个已确认槽。
+  // 典型场景：所有槽已确认后，学生说"不对，我说的空调是车里的空调"——
+  // 当前 pipeline 会走 all_slots_filled，新内容无法写板，看板与对话脱节。
+  // 修复：reopen 目标槽（confirmed→landed），把学生新消息作为 minute 落到该槽
+  //（landMinuteToSlot 会把旧 reopened landed 回退为 recorded），待学生确认写板。
+  if (llmIntent === "correction") {
+    const correctionSlotKey =
+      data.step3Assessment &&
+      typeof data.step3Assessment === "object" &&
+      typeof data.step3Assessment.slotKey === "string"
+        ? String(data.step3Assessment.slotKey).trim()
+        : "";
+    // 校验 slotKey 对应一个已 confirmed 的槽
+    const targetMinute = (sp.minutes || []).find(
+      (m: any) =>
+        m.status === "confirmed" && m.slotKey === correctionSlotKey,
+    );
+    if (correctionSlotKey && targetMinute) {
+      const r = reopenSlot(sp, correctionSlotKey);
+      if (r.ok) {
+        // 把学生新消息作为 minute 落到 reopened 的槽
+        const corrSlotDef = findSlotDef(sp.skeleton, correctionSlotKey);
+        const displayText =
+          data.step3Assessment?.polishedText
+            ? validatePolishedText(
+                msg,
+                data.step3Assessment.polishedText,
+                corrSlotDef?.label,
+              )
+            : null;
+        const corrMinute = appendMinute(sp, "student", msg, {
+          displayText: displayText || undefined,
+        });
+        const land = landMinuteToSlot(sp, corrMinute);
+        if (land.ok) {
+          console.warn(
+            `[Secretary] CORRECTION reopen+land slot=${correctionSlotKey} minute=${corrMinute.id}（旧 confirmed=${targetMinute.id} 回退为 recorded）`,
+          );
+          // 给教练提示：学生修正了某槽，引导确认新内容
+          const corrHint = `学生修正了「${findSlotDef(sp.skeleton, correctionSlotKey)?.label || correctionSlotKey}」的内容。请确认学生的新表述是否准确，然后引导学生点【确认】写入。`;
+          data.progressUpdate.secretaryLensHint = corrHint;
+          sp.lastGateHint = {
+            verdict: "correction",
+            hint: corrHint,
+            slotKey: correctionSlotKey,
+          };
+          renderNow();
+          return;
+        }
+        // 落槽失败（罕见）：回退 reopen，按普通内容处理
+        console.warn(
+          `[Secretary] CORRECTION land 失败（${land.reason}）→ 回退 reopen，按普通内容处理`,
+        );
+        // reopen 已把旧 confirmed 变 landed，重新确认回去
+        targetMinute.status = "confirmed";
+        targetMinute.reopenedTag = undefined;
+      } else {
+        console.warn(
+          `[Secretary] CORRECTION reopen 失败（${r.reason}）→ 按普通内容处理`,
+        );
+      }
+    } else {
+      console.warn(
+        `[Secretary] CORRECTION slotKey 无效或未对应 confirmed 槽（${correctionSlotKey || "(空)"}）→ 按普通内容处理`,
+      );
+    }
+    // fallback：按普通内容继续处理（不 return）
+  }
+
+  // ---- P-correction 确定性 fallback：所有槽 confirmed + 学生含修正信号词 ----
+  // 当 LLM 未输出 intent=correction（常见：body 已完整时 LLM 省略 step3Assessment），
+  // 但学生明确在修正某个已确认槽（"不对，我说的空调是车里的空调"），
+  // 用确定性方式 reopen 最后一个 confirmed 槽（最近讨论点最可能被修正）。
+  // 这不是完美的（无法确定性地知道修正哪个槽），但比当前"看板不更新"好。
+  // 学生若要修正其他槽，可点「修改」按钮精确 reopen。
+  // 注意：修正信号词（不对/重新说/改一下）会被 classifyStudentReply 判为 object，
+  // 但在"所有槽已 confirmed"场景下，object 不是拒绝当前草稿（无 landed 草稿），
+  // 而是修正已确认槽——所以这里不排除 isRej。
+  const CORRECTION_SIGNAL_RE =
+    /^(不对|不是|错了|有误|不准确|重新说|重说|改一下|改成|应该是|其实是|我刚才说的|我之前说的|更正|修正)/;
+  const allConfirmed =
+    firstEmptySlotKey(sp) === null &&
+    Array.isArray(sp.skeleton?.blocks) &&
+    sp.skeleton.blocks.length > 0;
+  // 仅当没有 landed 待确认草稿时才走修正路径（有 landed 时 object 是拒绝草稿）
+  const hasLandedPending = (sp.minutes || []).some(
+    (m: any) => m.status === "landed",
+  );
+  if (
+    allConfirmed &&
+    !hasLandedPending &&
+    !isMetaComment(msg) &&
+    CORRECTION_SIGNAL_RE.test(msg)
+  ) {
+    // 找最后一个 confirmed 槽（最近的讨论点）
+    const flat = skeletonFlatSlots(sp.skeleton);
+    const confirmedMinutesList = (sp.minutes || []).filter(
+      (m: any) => m.status === "confirmed" && m.slotKey,
+    );
+    const lastConfirmed =
+      confirmedMinutesList[confirmedMinutesList.length - 1];
+    if (lastConfirmed?.slotKey) {
+      const r = reopenSlot(sp, lastConfirmed.slotKey);
+      if (r.ok) {
+        const corrMinute = appendMinute(sp, "student", msg);
+        const land = landMinuteToSlot(sp, corrMinute);
+        if (land.ok) {
+          console.warn(
+            `[Secretary] CORRECTION(deterministic) reopen+land slot=${lastConfirmed.slotKey} minute=${corrMinute.id}`,
+          );
+          const corrSlotDef = findSlotDef(sp.skeleton, lastConfirmed.slotKey);
+          const corrHint = `学生修正了「${corrSlotDef?.label || lastConfirmed.slotKey}」的内容。请确认学生的新表述是否准确，然后引导学生点【确认】写入。`;
+          data.progressUpdate.secretaryLensHint = corrHint;
+          sp.lastGateHint = {
+            verdict: "correction",
+            hint: corrHint,
+            slotKey: lastConfirmed.slotKey,
+          };
+          renderNow();
+          return;
+        }
+        // 落槽失败：回退 reopen
+        lastConfirmed.status = "confirmed";
+        lastConfirmed.reopenedTag = undefined;
+      }
+    }
   }
 
   // 目标槽 + 质量门控（LLM 评估优先，确定性透镜兜底）。
@@ -9303,6 +9468,7 @@ ${memoryDigestStr}
   - Do NOT propose paragraph modes, pointBlock splits, direct_points / total_then_points, or any structural scheme — the skeleton is already frozen.
   - STRUCTURE CHANGE OFFER (P3): if the student EXPLICITLY objects to the current structure or wants to change a body's core point (e.g. "我想把第二个论点换成…", "这个结构不合适", "我不想按这两段写"), you MAY acknowledge it, explain the cost (confirming will clear the current Step-3 progress and regenerate the plan), and ask the student to confirm or decline — set intent=structure_change. You MUST NOT change any structure yourself; the server executes the re-plan only after the student confirms.
   - HISTORY REUSE (meta 指回): if the student says they already answered earlier ("我前面已经说过了", "这前面不是已经解释了") and the slot cursor shows NO pending draft, do NOT re-ask from zero — find their earlier message in "Recent student messages" that answers the current slot, set intent=meta, and put the exact quoted substring in step3Assessment.reuseQuote. The server lands that quoted text as a pending draft for the student to confirm. If a pending draft already exists, just guide the student to confirm/edit it.
+  - CORRECTION (修正已确认槽, CRITICAL): if the student is correcting / clarifying / revising the content of a slot that is ALREADY confirmed (e.g. "不对，我说的空调是车里的空调", "这里改一下，应该是…", "我刚才说的不准确，其实是…"), set intent=correction AND set step3Assessment.slotKey to the key of the slot being corrected (see "confirmed slot texts" in the slot cursor — each is prefixed with [slotKey]). The server will reopen that slot and land the student's new message as a fresh pending draft for confirmation. This applies whether or not the body is fully confirmed — even when all slots are confirmed, a correction must update the board, not just the chat. Do NOT just acknowledge the correction in chat and leave the stale board content.
   - Keep it human: vary openers, no filler superlatives, no meta-commentary about the board/write process (「确认前不会写入右侧」类禁止), no English translations.
   - SINGLE-SUBPOINT SCOPE: each reply serves ONLY the current Active Subpoint. Do not start the next body or ask "我们接着写第二个分论点吧" — switching bodies is the UI's job.
   - No-spoiler acknowledgment: Part 1 may name WHICH slot the answer fills, but must NOT explain why it works or spell out the reasoning chain for the student (that reasoning is their own thinking practice).
@@ -9439,7 +9605,7 @@ JSON Output Schema rules:
   - part1/part2 contain NO "---" inside; the server assembles the final text from them.
   - "suggestedDimensions" MUST be an ARRAY of strings listing EVERY dimension label collected so far — copy forward verbatim every turn (with their （已探测）/（可展开） stamps); never return [] or omit it once any angle has been discussed. Returning a single concatenated string is WRONG.
   - "dimensionSides" is REQUIRED for two-side/two-question types (see Side attribution rule); each entry's "dimension" copies the dimension's core label.
-  - Omit step2Data/step3Assessment entirely when not relevant to the current step.
+  - Omit step2Data/step3Assessment entirely when not relevant to the current step. EXCEPTION (Step 3): if the student is correcting/revising a confirmed slot (intent=correction), you MUST still output step3Assessment with intent=correction and slotKey set to the slot being corrected (see "confirmed slot texts" in the slot cursor — each is prefixed with [slotKey]). Do NOT omit step3Assessment just because all slots are confirmed — a correction must update the board, not just the chat.
 - If the student has successfully completed/submitted all information for the current step and you both agree to proceed, set "progressUpdate" with "isCompleted: true" and populate the corresponding step data fully.
 - For Step 3, the right-side board is rendered by the server from the frozen skeleton + confirmed minutes (projection). You do NOT need to populate currentSubpointHint; keep "text" focused on the current slot.
 
