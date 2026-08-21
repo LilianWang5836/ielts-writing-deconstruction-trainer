@@ -208,11 +208,15 @@ export function preserveStep1ProbeTags(
 export function stripIllegalSameTurnProbeTags(
   dims: string[],
   priorDims: string[] | null | undefined,
+  keepSelfStamp?: (dim: string) => boolean,
 ): { dims: string[]; strippedCores: string[] } {
   // prior 中带合法状态戳的 core：戳由服务端掌管，模型复写时由 preserveStep1ProbeTags
   // 负责恢复，这里不动。prior 中无戳（或不存在）的 core：模型自带的任何状态戳都是
   // 自报 → 剥掉。注意不能只看"core 是否老"：上一轮剥成裸标签入会话后，模型下一轮
   // 又给它贴上自报戳，若按老 core 放行，脏戳就被当作服务端戳永久锁定（实机观测）。
+  // keepSelfStamp：对话级救援——上一轮教练消息确实探测过该维度、学生本轮已作答，
+  // 模型的自盖章是真实发生的裁决而非自封（实机：学生报维度那轮 LLM 整轮缺
+  // progressUpdate → 维度未入 session，下一轮盖章被误剥 → 同一维度被重探）。
   const legitCores = new Set<string>();
   for (const d of priorDims || []) {
     const raw = String(d || '').trim();
@@ -227,6 +231,7 @@ export function stripIllegalSameTurnProbeTags(
     const core = stripStep1AllTags(raw).toLowerCase();
     if (!core || legitCores.has(core)) return raw;
     if (!isStep1DimensionUnprobed(raw)) {
+      if (keepSelfStamp && keepSelfStamp(raw)) return raw;
       strippedCores.push(core);
       return stripStep1StatusTags(raw) || raw;
     }

@@ -1571,13 +1571,21 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
                       注意：渲染的是 split 后的气泡（id 带 -N 后缀），不能拿它
                       和 chatHistory 原始 id 做全等——用 historyIndex 比较，
                       且只在该轮最后一个气泡上渲染，避免 split 后重复出现。
-                      正则兜底测整轮文本（lastAiText），不问题型问句在哪个分片。 */}
+                      正则兜底测整轮文本（lastAiText），不问题型问句在哪个分片。
+                      关键防循环：题型槽（correctType / 右侧 boardOverrides.correctType）
+                      一旦已填，一律不再渲染——否则教练「确认题型+讲结构」的文案里
+                      也含「题型」二字，chip 会在确认消息下反复弹出，形成无限循环。 */}
                   {msg.sender === 'ai' &&
                     stepKey === 'step1' &&
                     msg.historyIndex === lastAiHistoryIndex &&
                     msg.isLastPartOfTurn &&
                     (msg.metadata?.step1Phase === 'ask-question-type' ||
                       /题型|属于什么|哪一类|Question Type|question type/i.test(lastAiText)) &&
+                    !String(
+                      session.step1.coachEvaluation?.correctType ||
+                        session.step1.boardOverrides?.correctType ||
+                        '',
+                    ).trim() &&
                     !session.step1.isCompleted && (
                       <div className="mt-2.5 flex flex-wrap gap-1.5">
                         {STEP1_QUESTION_TYPES.map((type) => (

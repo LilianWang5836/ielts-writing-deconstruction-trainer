@@ -81,7 +81,7 @@ export default function Header({
                 雅思写作“拆解式”训练营
               </h1>
               <span className="rounded-full bg-indigo-50 px-2 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
-                v0.5.4.5
+                v0.5.4.8
               </span>
               <TokenUsageBadge />
             </div>

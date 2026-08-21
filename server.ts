@@ -4866,6 +4866,22 @@ function enforceStep3SecretaryPath(
 
   // 当前 landed 待确认纪要（单条或批量多条）—— landedList 已在上方定义。
 
+  // 裸确认防护（2026-08-21 实机）：学生说「确认/对」但没有任何待写入草稿
+  // （多为前轮内容被吞后的连锁反应）。不能把「确认」当内容过质量门控——
+  // 2 个字会被透镜判薄，教练文本被覆写成"再具体一点"，学生完全摸不着头脑。
+  // 不落槽、不改文本，给教练注入指回提示：引用学生原话回填，或自然重问当前槽。
+  if (isAffEffective && landedList.length === 0) {
+    const bareAffHint =
+      "学生在确认，但当前没有待写入的草稿。不要重复问同一个问题：如果学生之前已经给过可用内容，直接引用原话整理成一句并请其确认；否则自然地问当前槽。";
+    data.progressUpdate.secretaryLensHint = bareAffHint;
+    sp.lastGateHint = { verdict: "meta", hint: bareAffHint, slotKey: null };
+    console.warn(
+      "[Secretary] AFFIRM 但无 landed 草稿 → 不落槽，提示教练引用原话回填或自然重问",
+    );
+    renderNow();
+    return;
+  }
+
   if (isAffEffective && landedList.length > 0) {
     // 确认 → 写板（支持批量：一条消息覆盖多槽时一次全过）。
     const confirmedIds: string[] = [];
@@ -4877,8 +4893,27 @@ function enforceStep3SecretaryPath(
     data.progressUpdate.isCompleted = data.progressUpdate.step3SubpointCompleted;
     data.progressUpdate.secretaryBoard = renderBoard(sp);
     data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
+    // 文本对齐（2026-08-21 实机死循环）：LLM 本轮回复是在"槽尚未确认"的视角下
+    // 生成的，Part 1 常带「可以的话点『对』确认」这类对**刚已确认**槽的二次求确认
+    // → 学生再点一次「对」→ 无草稿可确认 → 同一问题被再问一遍，绕成死循环。
+    // 与 STRUCTURE-REPLAN 分支同一修法：固定 Part 1 为确认回执；Part 2 是下一槽
+    // 问题则保留，本身也是二次求确认则丢弃（下一槽由后续轮次自然提问）。
+    const split = splitTwoParts(String(data.text || ""), 2);
+    const part2 = String(split.part2 || "").trim();
+    const part2IsReconfirm =
+      /点「对」|点【确认】|请确认|确认一下|你看可以吗|可以吗？|你确认一下/.test(
+        part2,
+      );
+    const completed = data.progressUpdate.step3SubpointCompleted === true;
+    const ack = completed
+      ? "好，这一步记下了——这一段的各个环节都齐了。"
+      : "好，这一步记下了。";
+    data.text =
+      part2 && !part2IsReconfirm && !completed
+        ? `${ack}\n\n---\n\n${part2}`
+        : ack;
     console.warn(
-      `[Secretary] AFFIRM x${confirmedIds.length} minutes=${confirmedIds.join(",")} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}`,
+      `[Secretary] AFFIRM x${confirmedIds.length} minutes=${confirmedIds.join(",")} → complete=${data.progressUpdate.step3SubpointCompleted} confirmed=${(sp.minutes || []).filter((m: any) => m.status === "confirmed").length}${part2IsReconfirm ? "（丢弃二次求确认 Part2）" : ""}`,
     );
     return;
   }
@@ -4903,7 +4938,7 @@ function enforceStep3SecretaryPath(
       console.warn(
         "[Secretary] isRej 但 allConfirmed + 修正信号 → 走 P-correction fallback",
       );
-    } else {
+    } else if (hasLandedForReject) {
       for (const lm of landedList) {
         console.warn(
           `[Secretary] REJECT minute=${lm.id} slotKey=${lm.slotKey} → reverted to recorded`,
@@ -4914,6 +4949,15 @@ function enforceStep3SecretaryPath(
       data.progressUpdate.secretaryBoard = renderBoard(sp);
       data.progressUpdate.secretaryActiveSlot = activeSlotLabel(sp);
       return;
+    } else {
+      // 误判防护（2026-08-21 实机：学生实质回答里的「替换掉」误中 OBJECT_RE
+      // 「换掉」→ isRej）：没有任何待确认草稿时的"拒绝"无对象可拒——若按拒绝
+      // 处理会把实质回答静默吞掉（无纪要、无门控、教练文本照发 → 学生下轮
+      // 「确认」时无草稿可确认，确认消息被透镜判薄 → 教练文本被覆写 → 死循环）。
+      // 按普通内容继续走质量门控。
+      console.warn(
+        "[Secretary] isRej 但无 landed 草稿 → 按普通内容处理（疑似意图误判）",
+      );
     }
   }
 
@@ -6561,9 +6605,25 @@ function enforceStep1SlotCompletion(
   }
 
   // Phase A-1: strip same-turn self-reported probe/expandable tags on NEW labels.
+  // 对话级救援（2026-08-21 实机）：学生报维度那轮 DeepSeek 可能整轮不返回
+  // progressUpdate → 维度未入 session、pendingProbeCore 未 arm；下一轮模型按对话
+  // 实际进展给已探测维度盖章时，会被误判为"新标签自封"剥掉 → 同一维度被重探。
+  // 若上一条教练消息确实探测过该维度、且学生本轮已作答，该章是真实裁决，保留。
+  const lastCoachText = (() => {
+    const hist = session?.step1?.chatHistory;
+    if (!Array.isArray(hist)) return "";
+    for (let i = hist.length - 1; i >= 0; i -= 1) {
+      if (hist[i]?.sender === "ai") return String(hist[i]?.text || "");
+    }
+    return "";
+  })();
+  const studentAnswered = Boolean(String(userMessage || "").trim());
   const stripped = stripIllegalSameTurnProbeTags(
     dims.map(String),
     priorDimsList,
+    studentAnswered && lastCoachText
+      ? (dim) => textLooksLikeProbeAskForDim(lastCoachText, dim)
+      : undefined,
   );
   if (stripped.strippedCores.length > 0) {
     dims = stripped.dims;
@@ -9214,13 +9274,27 @@ ${memoryDigestStr}
   - If the student's answer is off-target for the current slot, FIRST name the mismatch in one short sentence, THEN guide the correction. Do NOT open with empty praise like "非常准确/精准地抓住了/完美".
   - Example: student restates background as coreIssue -> "你说的是题目背景现象，还不是写作任务焦点。请改成：这道题真正要你回答的是什么？"
 
+  correctType wrong-judgment handling (CRITICAL — 启发式纠错，禁止直接报答案):
+  - The INTERNAL questionBrief.questionType is the reference answer. When the student's type judgment does NOT match it, this is a TEACHING moment — train the deconstruction method, do NOT hand over the label:
+    - FORBIDDEN: stating or hinting the correct type label in ANY form ("不对，这是双边讨论" / "其实应该是 Discuss Both Views" / "不是A，是B"). Also FORBIDDEN: writing correctType into progressUpdate yourself while the student's judgment is still wrong — the slot stays EMPTY until the student lands on the right label (or the escalation below fires).
+    - Part 1 (≤2 short sentences): say the judgment doesn't fit THIS prompt's instruction sentence, then give ONE concrete deconstruction cue grounded in the actual question text — teach the METHOD, not the answer. Pick the ONE cue that best distinguishes the student's wrong choice from the real type:
+      - 指令句给了几个观点/几类人？（给出双方观点并要求 discuss → 双边讨论型的信号）
+      - 问不问 your own opinion / to what extent agree or disagree？（只问你的立场 → 观点型）
+      - 有几个独立的问题？（两个独立问题 → Two-part）
+      - 问的是 advantages/disadvantages、positive/negative，还是 causes/solutions？
+      Quote or paraphrase the relevant instruction words from the prompt as evidence (e.g. "再看指令句：'Discuss both views and give your own opinion'——它先给了你两个观点，这意味着什么？").
+    - Part 2: ask them to re-judge with that cue. The re-ask MUST contain the word "题型" (e.g. "带着这个线索再看一遍指令句，你现在判断这道题属于哪种题型？") so the option chips re-appear.
+  - Escalation: ONLY after the student's SECOND consecutive wrong judgment (or they explicitly ask for the answer), reveal the correct type — but the reveal MUST include the one-line reasoning chain from the instruction words (which textual signals give it away), so the reveal itself teaches the method. Then set correctType and move on.
+  - When the student's re-judgment is correct: Part 1 confirms briefly + type structure briefing (below). Do NOT rehash their earlier wrong guess beyond the one-line method recap.
+
+
   Board-authority rule (CRITICAL — right-side diagnosis board may be user-edited):
   - The Coach Evaluation values in ContextSummary (Question Type / Core Issue / Constraints / Suggested Dimensions) are the SOURCE OF TRUTH for already-filled slots, including any student edits on the board.
   - When a slot already has a non-empty value in ContextSummary, treat it as filled. Do NOT overwrite it in progressUpdate with a different AI-preferred wording unless the student explicitly asks to change it in chat.
   - If the student edited dimensions on the board (ContextSummary already lists them), continue from those labels; do not silently replace or "improve" them.
   Per-slot feedback — no spoiler (CRITICAL):
   - When validating ONE filled slot while the NEXT slot is still missing, Part 1 must confirm ONLY what the student just answered for that slot (≤1 short sentence). Part 2 asks the first still-missing slot.
-  - correctType filled, coreIssue missing -> confirm the type label only (e.g. "**Two-part**，判断正确。"). FORBIDDEN in Part 1: enumerating sub-questions ("第一…第二…"), paraphrasing the essay prompt, stating causes/evaluation/stance tasks, or previewing questionBrief writingDestination/taskMap content. Treat "explaining what the two parts ask" as coreIssue content — the student must say it in Q2 first; you may echo it briefly only AFTER they answer coreIssue.
+  - correctType filled, coreIssue missing -> confirm the type label only (e.g. "**Two-part**，判断正确。") + the Type structure briefing below. FORBIDDEN in Part 1: enumerating sub-questions ("第一…第二…"), paraphrasing the essay prompt, stating causes/evaluation/stance tasks, or previewing questionBrief writingDestination/taskMap content. Treat "explaining what the two parts ask" as coreIssue content — the student must say it in Q2 first; you may echo it briefly only AFTER they answer coreIssue. (The ONE allowed exception: the generic TYPE-LEVEL structure briefing below, which never names this question's specific tasks/views.)
   - coreIssue filled, constraints missing -> confirm their coreIssue wording only; do NOT list suggested dimensions or preview the essay structure.
   - coreIssue filled, constraints auto-skipped (hasHardQualifiers=false) -> same as above: Part 1 confirms coreIssue only (≤1 sentence). Silently set constraints=[] and constraintsSkipped=true; do NOT mention skipping, absent qualifiers, or "无明显限定词" in chat or in constraints.
   - constraints filled, suggestedDimensions missing -> confirm constraints only; do NOT suggest dimension names for them.
@@ -9230,6 +9304,12 @@ ${memoryDigestStr}
   - GOOD (Q1 correct): "Two-part，判断正确。"
   - GOOD (Q2 after student answer): "核心议题抓对了。"
   - GOOD (Q2 → dimensions, no hard qualifiers): Part 1 "核心议题抓对了。" / Part 2 missing suggestedDimensions template only.
+
+  Type structure briefing (REQUIRED in the turn where correctType is newly confirmed — 判断正确当轮或升级揭示当轮):
+  - Part 1 = short confirmation + a compact 2–4 sentence briefing for THIS question type, so the student learns the 套路 before moving on:
+    1) its common essay structure, e.g. Discuss Both Views: 四段式——引言 → A方观点段 → B方观点段 → 你的立场段；Agree/Disagree: 引言 → 2个支持段（部分同意时含让步段）→ 结论；Advantages/Disadvantages: 优点段 + 缺点段 + 权衡结论；Two-part Question: 每个问题各一个主体段；Problem/Solution: 问题/原因段 → 方案段；Positive/Negative: 主体段分别论证积极与消极面或直接论证你的判断。
+    2) the roadmap for what comes next (先拆清这道题的写作任务 → 头脑风暴各方论据 → 再定立场/详略), so the student knows where the training is heading.
+  - Keep it TYPE-LEVEL and generic: describe the type's usual structure ONLY — never this specific question's sub-questions, views, or tasks (the coreIssue no-spoiler rule above still applies). ≤4 sentences, no lecture; Part 2 then asks the next missing slot (coreIssue) as usual.
 
   coreIssue definition by question type:
   - Agree / Disagree, Discuss Both Views, Advantages / Disadvantages, Positive / Negative: state the central controversy/judgment the writer must make.
@@ -9598,6 +9678,10 @@ ${memoryDigestStr}
   - SINGLE-SUBPOINT SCOPE: each reply serves ONLY the current Active Subpoint. Do not start the next body or ask "我们接着写第二个分论点吧" — switching bodies is the UI's job.
   - No-spoiler acknowledgment: Part 1 may name WHICH slot the answer fills, but must NOT explain why it works or spell out the reasoning chain for the student (that reasoning is their own thinking practice).
   - P1 OPENING RECAP (开讲点题，CRITICAL): When this turn is a BODY OPENING (kickoff / first question of a body), open with ONE plain sentence stating THIS body's mission — use "Active Body Mission" in ContextSummary (e.g. "这一段我们论证线上学习的优势——你通勤/午休碎片化学习的材料最具体。"). If this is the FIRST body of the essay, also present the overall plan briefly (see "Essay Plan Recap") in 1–2 plain sentences in your own words (e.g. "这一篇我们写两段：第一段展开优势，第二段让步收尾。"), then immediately ask the first empty slot. Do NOT repeat the plan recap in later turns.
+  - CROSS-BODY ANTI-REPEAT (跨段防重, CRITICAL — 2026-08-21 实机:第二段开场把第一段已确认的机制又问了一遍): Before opening a new body or asking ANY slot, check "Body 摘要" and "Recent student messages" in ContextSummary:
+    - Content already confirmed in EARLIER bodies is DONE — never re-ask it, and never anchor the new body's opener on an example/scenario an earlier body already consumed. The student hears that as "你又问了一遍".
+    - The new body's opener must anchor on what THIS body's claim adds BEYOND earlier bodies (a new angle, new evidence type). If earlier bodies argued mechanism, this body might argue cost/scale/etc. — pick the material that shows the NEW angle.
+    - If the student's earlier material (Step 2 cues, or their own earlier messages) already contains content that fills THIS body's first slot (e.g. cost figures for a cost-reduction body), quote/paraphrase THAT content and ask them to confirm or sharpen it — do NOT ask from zero a question whose answer is already in the conversation.
   - P3 JUDGMENT IN DIALOGUE (判断进对话): When the PREVIOUS turn's answer was judged thin/off_target/duplicate (see "上轮门控提示" in the slot cursor), Part 1 should give the student ONE short professional reason WHY, phrased in your own words — e.g. thin → "这句还停在'很灵活'，没落到具体场景或机制"; off_target → "你答的是展开原因，这一步要的是分论点"; duplicate → "这一点刚才已经记下了". Then ask the ONE follow-up / guide to confirm. Never read the hint verbatim, never open with empty praise, never just repeat "请再说具体一点".
   - CRITICAL — NO INTERNAL JARGON IN CHAT TEXT: never quote slot/field names like paragraphPlan / pointBlock / mode / step / slot / firstEmpty / skeleton in student-facing text. Use natural Chinese (这一步 / 展开原因 / 举个例子 / 影响).
   - If every slot in the current body's skeleton is confirmed (server tells you via the board), give a one-line closure and let the UI handle body switching / Step 4 CTA. Do not fabricate completion yourself.
