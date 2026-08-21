@@ -150,6 +150,14 @@ export interface ChatMessage {
   text: string;
   timestamp: string;
   isSplit?: boolean;
+  /**
+   * 服务器结构化信号（#5 解耦）：前端不再用正则猜测 AI 文本意图，
+   * 改由服务器在 res.json 前根据 session 状态写入此字段。
+   * - step1Phase='ask-question-type' → 前端渲染题型 chips
+   */
+  metadata?: {
+    step1Phase?: 'ask-question-type';
+  };
 }
 
 // ============================================================
@@ -465,6 +473,12 @@ export interface PracticeSession {
        * Server stamps tags from this; cleared after resolve.
        */
       probeVerdict?: string;
+      /**
+       * Issue #1：当前 pendingProbeCore 的连续探测轮次计数。每次服务端
+       * 引导探测同一维度时 +1，resolve（盖章）或换维度时清零。用于轮换
+       * 探针问句措辞，避免同一句重复灌给学生。
+       */
+      probeAskCount?: number;
     };
     /** User edits on the right-side board; always win over later AI progressUpdate merges. */
     boardOverrides?: {
@@ -876,6 +890,12 @@ export interface Step2PlannerPayload {
    * same fallback settle for this side; it asks an open scheme question.
    */
   settleAwaitingCustomSide?: string | null;
+  /**
+   * Turns spent in settleAwaitingCustomSide for the current side. After a
+   * bounded number of open-scheme asks with no student answer, the channel
+   * auto-commits a volume-based fallback to break the deadlock (issue #4).
+   */
+  settleAwaitingCustomTurns?: number;
   /**
    * slot_merge proposalIds the student rejected. Detection must skip these so
    * a lingering 「已整合至…」 meta line in userPoints cannot re-arm the same

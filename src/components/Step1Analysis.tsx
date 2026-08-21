@@ -292,6 +292,31 @@ ${topic.question}
                           placeholder="例如：Two-part Question"
                           autoFocus
                         />
+                        {/* #5 兜底：题型编辑态提供 7 选项快捷选择，避免学生卡在空输入框 */}
+                        <div className="flex flex-wrap gap-1.5">
+                          {[
+                            'Agree / Disagree',
+                            'Discuss Both Views',
+                            'Advantages / Disadvantages',
+                            'Two-part Question',
+                            'Problem / Solution',
+                            'Positive / Negative',
+                            'Other',
+                          ].map((type) => (
+                            <button
+                              key={type}
+                              type="button"
+                              onClick={() => setDraftText(type)}
+                              className={`rounded-md border px-2 py-1 text-[11px] font-semibold transition ${
+                                draftText.trim() === type
+                                  ? 'border-indigo-400 bg-indigo-50 text-indigo-900'
+                                  : 'border-slate-200 bg-white text-slate-700 hover:border-indigo-200 hover:bg-indigo-50/70'
+                              }`}
+                            >
+                              {type}
+                            </button>
+                          ))}
+                        </div>
                         <div className="flex gap-2">
                           <button type="button" onClick={() => saveTextField('correctType')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-indigo-700">
                             <Check className="h-3 w-3" /> 保存

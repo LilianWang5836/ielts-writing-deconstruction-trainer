@@ -4141,6 +4141,7 @@ export function normalizeStep2PlannerPayload(args: {
     stanceAwaitingCustom: stanceAwaitingCustom || undefined,
     // Phase1 proposal channel — preserve across normalize rebuilds
     settleAwaitingCustomSide: prev?.settleAwaitingCustomSide || null,
+    settleAwaitingCustomTurns: prev?.settleAwaitingCustomTurns || 0,
     rejectedMergeIds:
       Array.isArray(prev?.rejectedMergeIds) && prev.rejectedMergeIds.length
         ? [...prev.rejectedMergeIds]

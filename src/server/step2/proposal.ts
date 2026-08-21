@@ -313,6 +313,10 @@ export function commitProposal(params: {
         params.payload.settleAwaitingCustomSide === side
           ? null
           : params.payload.settleAwaitingCustomSide ?? null,
+      settleAwaitingCustomTurns:
+        params.payload.settleAwaitingCustomSide === side
+          ? 0
+          : params.payload.settleAwaitingCustomTurns ?? 0,
       updatedAt: new Date().toISOString(),
     };
     return { ok: true, payload: next, userPoints };
@@ -1202,6 +1206,10 @@ export function resolvePendingProposalDecision(params: {
         pending.kind === 'side_settle'
           ? String(pending.payload.side || '') || null
           : params.prevPayload!.settleAwaitingCustomSide ?? null,
+      settleAwaitingCustomTurns:
+        pending.kind === 'side_settle'
+          ? 0
+          : params.prevPayload!.settleAwaitingCustomTurns ?? 0,
       // Rejected merges go on a ledger so a lingering 「已整合至…」 meta line
       // in userPoints can't re-arm the identical merge next turn.
       rejectedMergeIds:
@@ -1381,7 +1389,27 @@ export function armNextProposal(params: {
   for (const side of listSettleSides(payload)) {
     // Student rejected this side's settle and owns the scheme now — never
     // auto re-arm the same fallback until they answer or ask us to suggest.
-    if (payload.settleAwaitingCustomSide === side) continue;
+    if (payload.settleAwaitingCustomSide === side) {
+      // Deadlock guard (issue #4): after a bounded number of open-scheme
+      // asks with no student answer, auto-commit a volume-based fallback
+      // so the checklist can advance. The student had a real chance to
+      // dictate their own scheme; indefinite waiting is worse than a
+      // reasonable default they can still resettle later.
+      const turns = Number(payload.settleAwaitingCustomTurns || 0);
+      if (turns >= 2 && sideReadyForSettle(payload, side, { exhausted: params.exhausted })) {
+        const auto = buildFallbackSideSettleProposal(payload, side, `auto-deadlock-${side}`);
+        if (auto) {
+          const res = commitProposal({ payload, proposal: auto });
+          if (res.ok) {
+            Object.assign(payload, res.payload);
+            console.warn(
+              `[Step2Proposal] Deadlock break: auto side_settle side=${side} after ${turns} open asks`,
+            );
+          }
+        }
+      }
+      continue;
+    }
     if (
       !sideReadyForSettle(payload, side, { exhausted: params.exhausted })
     ) {

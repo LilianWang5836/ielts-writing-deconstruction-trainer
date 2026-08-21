@@ -262,6 +262,10 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
     isRetentionHost: boolean;
     isCapacityTrimHost: boolean;
     isStanceConfirmHost: boolean;
+    /** Index of the source message in chatHistory (pre-split). */
+    historyIndex: number;
+    /** True for the last bubble of a (possibly split) coach turn. */
+    isLastPartOfTurn: boolean;
   };
 
   // Pending confirm / proposal / legacy: keep the latest Coach turn as ONE bubble.
@@ -344,10 +348,13 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
               isRetentionHost,
               isCapacityTrimHost,
               isStanceConfirmHost,
+              historyIndex,
+              isLastPartOfTurn: true,
             },
           ];
         }
-        return msg.text.split('---').map((part, i) => ({
+        const parts = msg.text.split('---');
+        return parts.map((part, i) => ({
           ...msg,
           text: part.trim(),
           id: `${msg.id}-${i}`,
@@ -358,6 +365,8 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
           isRetentionHost: false,
           isCapacityTrimHost: false,
           isStanceConfirmHost: false,
+          historyIndex,
+          isLastPartOfTurn: i === parts.length - 1,
         }));
       }
       return [
@@ -370,6 +379,8 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
           isRetentionHost: false,
           isCapacityTrimHost: false,
           isStanceConfirmHost: false,
+          historyIndex,
+          isLastPartOfTurn: false,
         },
       ];
     },
@@ -732,6 +743,8 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
         sender: 'ai',
         text: data.text,
         timestamp: new Date().toISOString(),
+        // #5 解耦：透传服务器结构化信号（step1Phase 等）到 ChatMessage。
+        ...(data.metadata ? { metadata: data.metadata } : {}),
       };
 
       let sessionUpdates: any = {};
@@ -1552,11 +1565,19 @@ const CoachChat = forwardRef<CoachChatHandle, CoachChatProps>(function CoachChat
                       Show on the LATEST AI message whenever the coach is asking
                       about question type (not only the very first turn), so that
                       after a wrong-type correction the chips re-appear for the
-                      student to pick again. */}
+                      student to pick again.
+                      #5 解耦：优先用服务器 metadata.step1Phase 信号；正则仅作
+                      历史消息兜底（旧消息无 metadata）。
+                      注意：渲染的是 split 后的气泡（id 带 -N 后缀），不能拿它
+                      和 chatHistory 原始 id 做全等——用 historyIndex 比较，
+                      且只在该轮最后一个气泡上渲染，避免 split 后重复出现。
+                      正则兜底测整轮文本（lastAiText），不问题型问句在哪个分片。 */}
                   {msg.sender === 'ai' &&
                     stepKey === 'step1' &&
-                    msg.id === chatHistory[lastAiHistoryIndex]?.id &&
-                    /题型|属于什么|哪一类|Question Type|question type/i.test(msg.text) &&
+                    msg.historyIndex === lastAiHistoryIndex &&
+                    msg.isLastPartOfTurn &&
+                    (msg.metadata?.step1Phase === 'ask-question-type' ||
+                      /题型|属于什么|哪一类|Question Type|question type/i.test(lastAiText)) &&
                     !session.step1.isCompleted && (
                       <div className="mt-2.5 flex flex-wrap gap-1.5">
                         {STEP1_QUESTION_TYPES.map((type) => (

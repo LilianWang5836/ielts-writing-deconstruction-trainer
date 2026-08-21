@@ -74,6 +74,7 @@ import {
   buildBareDimensionProbeAsk,
   countUnprobedStep1Dimensions,
   earliestUnprobedDimension,
+  ensureProbeTargetInjected,
   inferProbeVerdictFromStudentMessage,
   isStep1DimensionUnprobed,
   normalizeProbeVerdict,
@@ -82,8 +83,10 @@ import {
   stampUnprobedQualityPending,
   step1CapProbeComplete,
   stripIllegalSameTurnProbeTags,
+  studentMessageLooksThin,
   textLooksLikeProbeAskForDim,
 } from "./src/server/step1/dimension-probe";
+import type { Step1ProbeVerdict } from "./src/server/step1/dimension-probe";
 import { classifyStudentReply, isStudentExhausted } from "./src/server/intent-router";
 import {
   armNextProposal,
@@ -386,7 +389,20 @@ function buildStep2ContentAwareFallback(
       payload?.settleAwaitingCustomSide &&
       String(payload.settleAwaitingCustomSide) === String(sideNext.sideKey)
     ) {
-      return buildOpenRetentionSchemeAsk(payload, sideNext.sideKey);
+      // Issue #4 deadlock guard: count open-scheme asks. After the threshold,
+      // armNextProposal will auto-commit a volume-based fallback. Increment
+      // here so the count reflects turns actually spent waiting on the student.
+      const turns = Number(payload?.settleAwaitingCustomTurns || 0) + 1;
+      if (step2 && typeof step2 === "object") {
+        step2.plannerPayload = {
+          ...payload,
+          settleAwaitingCustomTurns: turns,
+        };
+      }
+      return buildOpenRetentionSchemeAsk(
+        { ...payload, settleAwaitingCustomTurns: turns },
+        sideNext.sideKey,
+      );
     }
     // Arm-first alignment: only speak a decision ask when the proposal channel
     // would actually arm one; otherwise expand the blocking slot instead of
@@ -445,12 +461,21 @@ function buildStep2ContentAwareFallback(
     );
   }
   if (payload?.stanceAwaitingCustom && requiresStance && !stanceText) {
-    return "好的，不采用刚才的推荐。请直接用一两句话写出你的整体立场（例如利弊参半 / 更偏积极 / 更偏消极）。";
+    const qt =
+      String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+      String(session?.step1?.boardOverrides?.questionType || "").trim() ||
+      "";
+    const hint = stanceCustomHintByType(qt);
+    return `好的，不采用刚才的推荐。${hint}`;
   }
 
   // 8) Checklist done — stance / summary
   if (requiresStance && !stanceText) {
-    return "各条论点已巡检完毕。结合已有论据强弱，你更倾向完全同意、部分同意（带让步），还是不同意？直接说一个即可。";
+    const qt =
+      String(session?.step1?.coachEvaluation?.correctType || "").trim() ||
+      String(session?.step1?.boardOverrides?.questionType || "").trim() ||
+      "";
+    return stanceFallbackAskByType(qt);
   }
   // A stance the student just accepted (locked/resolved) must not be re-confirmed.
   const stanceLocked = Boolean(
@@ -744,6 +769,7 @@ function mergeCommittedProposalIntoPayload(
   ];
   // Settle reject/commit may set or clear the awaiting-custom side.
   cur.settleAwaitingCustomSide = committed.settleAwaitingCustomSide ?? null;
+  cur.settleAwaitingCustomTurns = committed.settleAwaitingCustomTurns ?? 0;
   // Merge reject appends to this ledger; preserve so detection skips it.
   if (Array.isArray(committed.rejectedMergeIds)) {
     cur.rejectedMergeIds = [...committed.rejectedMergeIds];
@@ -824,7 +850,7 @@ function applyStep2ProposalChannelLate(
     payload.settleAwaitingCustomSide &&
     userMessageAsksForSettleRecommendation(userMessage)
   ) {
-    payload = { ...payload, settleAwaitingCustomSide: null };
+    payload = { ...payload, settleAwaitingCustomSide: null, settleAwaitingCustomTurns: 0 };
     console.warn(
       "[Step2Proposal] Awaiting-custom cleared → student asked for a recommendation",
     );
@@ -1225,6 +1251,50 @@ function detectRequiresStance(question: string, questionType: string): boolean {
   }
   // Unknown type: only ask stance if the prompt explicitly requests judgment.
   return hasExplicitStanceAsk(question);
+}
+
+/**
+ * Issue #3: per-questionType stance fallback ask. The generic
+ * "完全同意/部分同意/不同意" phrasing only fits Agree/Disagree; for other
+ * types the options are different and the generic wording confuses students.
+ */
+function stanceFallbackAskByType(questionType: string): string {
+  const type = normalizeQuestionTypeLabel(questionType);
+  if (type === "Discuss Both Views") {
+    return "各条论点已巡检完毕。你更倾向哪一方的观点？或是否要带让步（承认对方部分合理）？直接说一个即可。";
+  }
+  if (type === "Advantages / Disadvantages") {
+    return "各条论点已巡检完毕。结合已有论据强弱，你更倾向利大于弊还是弊大于利？若想带让步，也可以说「利大于弊但…」。直接说一个即可。";
+  }
+  if (type === "Positive / Negative") {
+    return "各条论点已巡检完毕。结合已有论据强弱，你认为整体更偏积极还是更偏消极？若想带让步，也可以说「偏积极但…」。直接说一个即可。";
+  }
+  if (type === "Problem / Solution") {
+    return "各条论点已巡检完毕。你认为最值得写的问题和对应方案是哪一组？直接说一个即可。";
+  }
+  if (type === "Two-part Question") {
+    return "各条论点已巡检完毕。两个子问题你各自的核心判断是什么？直接说一个即可。";
+  }
+  // Agree / Disagree, Other, or unknown — keep the original phrasing.
+  return "各条论点已巡检完毕。结合已有论据强弱，你更倾向完全同意、部分同意（带让步），还是不同意？直接说一个即可。";
+}
+
+/**
+ * Issue #3: per-questionType hint for the "rejected recommended stance, now
+ * write your own" ask. Keeps examples aligned with the question type.
+ */
+function stanceCustomHintByType(questionType: string): string {
+  const type = normalizeQuestionTypeLabel(questionType);
+  if (type === "Discuss Both Views") {
+    return "请直接用一两句话写出你的整体立场（例如更倾向哪一方、是否带让步）。";
+  }
+  if (type === "Advantages / Disadvantages") {
+    return "请直接用一两句话写出你的整体立场（例如利大于弊 / 弊大于利 / 利弊参半）。";
+  }
+  if (type === "Positive / Negative") {
+    return "请直接用一两句话写出你的整体立场（例如更偏积极 / 更偏消极 / 利弊参半）。";
+  }
+  return "请直接用一两句话写出你的整体立场（例如利弊参半 / 更偏积极 / 更偏消极）。";
 }
 
 function detectHardQualifiersInQuestion(question: string): string[] {
@@ -2572,6 +2642,10 @@ const STEP1_DIM_THIN_TAG = "空标签";
 const STEP1_DIM_QUALITY_PENDING_TAG = "质量待确认";
 const STEP1_DIM_PROBED_TAG = "已探测";
 const STEP1_DIM_EXIT_OFFERED_TAG = "已询退出";
+// #2 语义裁决标签（与 dimension-probe.ts 常量保持一致）
+const STEP1_DIM_OFF_TARGET_TAG = "偏题";
+const STEP1_DIM_DUPLICATE_TAG = "重复";
+const STEP1_DIM_STANDALONE_TAG = "独立成点";
 const STEP1_DIM_MAX = 6;
 /** PM 需求：每个问题/每一侧至少 2 个有效讨论维度。 */
 const STEP1_DIM_MIN_PER_SIDE = 2;
@@ -2581,7 +2655,7 @@ const STEP1_DIM_SIDE_TAG_RE = /[（(]\s*侧[：:]\s*([ABG])\s*[）)]/;
 /** Standalone status tags only — not mixed inside explanatory parentheses.
  *  含模型的伪戳变体「待探测」（实机观测：DeepSeek 自造此戳，语义等同裸标签，剥掉）。 */
 const STEP1_DIM_STATUS_TAG_RE =
-  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测)\s*[）)]/g;
+  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测|偏题|重复|独立成点)\s*[）)]/g;
 
 function stripStep1DimensionTags(dim: string): string {
   return String(dim || "")
@@ -2669,6 +2743,9 @@ function isStep1DimensionExpandable(dim: string): boolean {
   if (!t.trim()) return false;
   if (hasStandaloneStep1Tag(t, STEP1_DIM_THIN_TAG)) return false;
   if (hasStandaloneStep1Tag(t, STEP1_DIM_QUALITY_PENDING_TAG)) return false;
+  // #2 语义排除：偏题/重复的维度不计入有效
+  if (hasStandaloneStep1Tag(t, STEP1_DIM_OFF_TARGET_TAG)) return false;
+  if (hasStandaloneStep1Tag(t, STEP1_DIM_DUPLICATE_TAG)) return false;
   return (
     hasStandaloneStep1Tag(t, STEP1_DIM_EXPANDABLE_TAG) &&
     hasStandaloneStep1Tag(t, STEP1_DIM_PROBED_TAG)
@@ -2688,6 +2765,7 @@ function countStep1DimensionLabels(dims: any): number {
 function countEffectiveStep1Dimensions(dims: any): number {
   if (!Array.isArray(dims)) return 0;
   const seen = new Set<string>();
+  const seenCores: string[] = [];
   let n = 0;
   for (const d of dims) {
     const raw = String(d || "").trim();
@@ -2695,7 +2773,10 @@ function countEffectiveStep1Dimensions(dims: any): number {
     if (!isStep1DimensionExpandable(raw)) continue;
     const core = stripStep1DimensionTags(raw).toLowerCase();
     if (!core || seen.has(core)) continue;
+    // #2 语义去重（与 step1PerSideStatus 一致）
+    if (seenCores.some((c) => headsCompatible(core, c))) continue;
     seen.add(core);
+    seenCores.push(core);
     n += 1;
   }
   return n;
@@ -2878,12 +2959,17 @@ function step1PerSideStatus(
             return side === s.sideKey || side === "G";
           });
     const seen = new Set<string>();
+    const seenCores: string[] = [];
     let effective = 0;
     for (const d of sideLabels) {
       if (!isStep1DimensionExpandable(d)) continue;
       const core = stripStep1DimensionTags(d).toLowerCase();
       if (!core || seen.has(core)) continue;
+      // #2 语义去重：与已计入的有效维度做 headsCompatible 检查，
+      // 避免同一论点的两个面（"学习与改正"/"失去体验"等近义表述）被重复计数。
+      if (seenCores.some((c) => headsCompatible(core, c))) continue;
       seen.add(core);
+      seenCores.push(core);
       effective += 1;
     }
     const allProbed = sideLabels.every((d) => !isStep1DimensionUnprobed(d));
@@ -6501,18 +6587,43 @@ function enforceStep1SlotCompletion(
     // 误标（空标签）→ effectiveDims=0 → “0 个有效角度”死锁。模型明确裁决（expandable/thin）
     // 时以模型为准；未返回或返回无法识别的值时由服务端按学生实际回答推断：
     // 纯拒绝/含糊 → thin；任何具体内容 → expandable。
-    const verdict =
-      normalizeProbeVerdict(modelVerdict) ||
-      inferProbeVerdictFromStudentMessage(userMessage);
+    //
+    // Issue #1 双确认护栏（2026-08-20）：原 `||` 短路让 LLM 返回 thin 时服务端
+    // 兜底永不执行——DeepSeek 把“打人”等具体例子误判 thin → 不盖章 → 重问同一句。
+    // 修法：LLM 返回 thin 时，只有学生消息本身也像 thin（拒绝/含糊）才采信 LLM；
+    // 否则服务端覆盖为 expandable。LLM 返回 expandable 或缺省时维持原逻辑。
+    const normalized = normalizeProbeVerdict(modelVerdict);
+    let verdict: Step1ProbeVerdict;
+    if (normalized === "thin") {
+      verdict = studentMessageLooksThin(userMessage)
+        ? "thin"
+        : "expandable";
+    } else {
+      verdict = normalized || inferProbeVerdictFromStudentMessage(userMessage);
+    }
     dims = resolvePendingProbeAnswer(
       dims.map(String),
       pendingProbeCore,
       verdict,
     );
+    // Issue #6：probe resolve 后，若 LLM 未把该维度写入 suggestedDimensions，
+    // 服务端主动注入带戳的裸标签，右侧棋盘不再滞后于对话。
+    const injected = ensureProbeTargetInjected(
+      dims.map(String),
+      pendingProbeCore,
+      verdict,
+    );
+    if (injected.injected) {
+      dims = injected.dims;
+      console.warn(
+        `[Step1Guard] Injected probe target「${pendingProbeCore}」into suggestedDimensions (LLM dropped it)`,
+      );
+    }
     const target = ensureStep1DataBucket(data, merged);
     target.suggestedDimensions = dims;
     target.pendingProbeCore = "";
     target.probeVerdict = "";
+    target.probeAskCount = 0;
     console.warn(
       `[Step1Guard] Resolved pending probe for「${pendingProbeCore}」verdict=${String(verdict || "thin/default")}`,
     );
@@ -6589,13 +6700,27 @@ function enforceStep1SlotCompletion(
     }
     const alreadyProbing = textLooksLikeProbeAskForDim(text, unprobed);
     if (!alreadyProbing) {
+      // Issue #1：轮换探针措辞。同一维度连续引导时递增 probeAskCount，
+      // 让 buildBareDimensionProbeAsk 换问法。换维度时由 pendingProbeCore
+      // 变更自然重置（见下方 resolve 处清零）。
+      const prevCore = String(
+        session?.step1?.coachEvaluation?.pendingProbeCore || "",
+      ).trim();
+      const prevCount = Number(
+        session?.step1?.coachEvaluation?.probeAskCount || 0,
+      );
+      const askCount =
+        prevCore && prevCore === target.pendingProbeCore
+          ? prevCount + 1
+          : 1;
+      target.probeAskCount = askCount;
       const split = splitTwoParts(text, 1);
       const part1 = safeOverridePart1(
         split.part1 || "这个角度我先记下了。",
       );
-      data.text = `${part1}\n\n---\n\n${buildBareDimensionProbeAsk(unprobed)}`;
+      data.text = `${part1}\n\n---\n\n${buildBareDimensionProbeAsk(unprobed, askCount - 1)}`;
       console.warn(
-        `[Step1Guard] Probe-first: guided Part2 to probe「${target.pendingProbeCore}」(labels=${dimLabelCount}, unprobed=${countUnprobedStep1Dimensions(dims)})`,
+        `[Step1Guard] Probe-first: guided Part2 to probe「${target.pendingProbeCore}」askCount=${askCount} (labels=${dimLabelCount}, unprobed=${countUnprobedStep1Dimensions(dims)})`,
       );
     } else {
       console.warn(
@@ -9139,10 +9264,10 @@ ${memoryDigestStr}
   - Light expandability probe (ONCE per new dimension, REQUIRED before quality tags) — SERVER OWNS THE LOOP:
     1) First record the raw label WITHOUT （可展开）/（空标签）/（已探测）. FORBIDDEN: tagging status on the introduce turn.
     2) While ANY unprobed (bare) label remains: Part 2 MUST be a ONE-dimension probe ask for the earliest bare label, PRE-WRITTEN in your own natural tutor voice and continuing from what was just discussed — e.g. "「××」这个角度，你脑海里有没有浮现出具体的画面或例子？哪怕一两句话、说个大概就行。" Never use checklist-style wording ("苗头/信号/简单说一句即可"), never ask about more than one dimension in a single question, and never ask a generic "还有别的角度吗" while a bare label is still unprobed. The server only injects its own fallback when your Part 2 is not a clear single-dimension probe, so the natural phrasing you write is what the student usually reads. FORBIDDEN: jumping to the next task (e.g. Task B / 评价) while Task A / earlier labels are still unprobed. FORBIDDEN: merge-probing two labels in one ask. FORBIDDEN: re-probing a dimension that already has （已探测）.
-    3) On the student's NEXT answer to a probe: set progressUpdate.step1Data.probeVerdict to "expandable" (any concrete cue) or "thin" (no/不清楚/vague). Do NOT self-stamp （可展开）/（空标签） — the server stamps from probeVerdict. Ambiguous → "thin".
+    3) On the student's NEXT answer to a probe: set progressUpdate.step1Data.probeVerdict to one of: "expandable" (any concrete cue), "thin" (no/不清楚/vague), "off_target" (the dimension does not address the question's writing task), "duplicate" (restates an already-recorded dimension), or "standalone" (a strong, independently-paragraphable point — stronger than expandable). Do NOT self-stamp （可展开）/（空标签）/（偏题）/（重复）/（独立成点） — the server stamps from probeVerdict. Ambiguous → "thin".
   - FORBIDDEN: emitting hard completion CTA or soft exit while unprobed labels remain.
   - Probe anti-loop: each dimension gets at most ONE probe. If it fails (thin), do NOT deepen that same dimension — invite a DIFFERENT new angle instead (only when no bare labels remain).
-  - Effective count (server records): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, and （质量待确认） do NOT count toward sufficiency.
+  - Effective count (server records): ONLY dimensions that have BOTH standalone tags （已探测） AND （可展开） count. Untagged labels, （空标签）, （质量待确认）, （偏题）, and （重复） do NOT count toward sufficiency. （独立成点） is a stronger positive signal and counts.
   - DE-GATED COMPLETION (V1, server behavior): the server no longer bounces your completion back or rewrites your Part 2 (the only exceptions: a gentle ONE-dimension probe fallback when a bare label remains and you have NOT completed; and a deterministic auto-complete CTA when the student is clearly exhausted). Completion is MODEL-DRIVEN: when you judge the angle set sufficient and say so naturally (e.g. "这几个角度够了，我们进入第二步"), emit the hard CTA ("点击【下一步】…进入第二步") and set isCompleted:true — the server honors it. Keep the quality bar in this section as your own pedagogical standard: probe each new angle once, don't rush to completion while a bare label is still open, and prefer the soft-exit → student-confirms → hard-CTA sequence when the conversation allows it.
   - AI sufficiency first (CRITICAL): YOU judge whether the angle set is enough BEFORE asking the student. Set progressUpdate.step1Data.dimensionsSufficient=true only when ALL hold: (a) EVERY required side has at least 2 effective dimensions (per-side ≥2: Agree/Disagree = 1 side ≥2; Discuss Both Views & Advantages/Disadvantages = 2 sides each ≥2; Two-part / Problem-Solution / Positive-Negative = each question ≥2); (b) angles are non-duplicate and cover enough entry points for this question type (for Agree/Disagree prefer both support-side and oppose-side angles when the student has material for both); (c) thin/质量待确认 labels are not treated as "enough"; (d) no bare/unprobed labels remain. If not sufficient, keep probing bare labels or ask for another NEW angle ON THE MISSING SIDE — do NOT ask "够用了吗".
   - Soft exit offer ONLY after dimensionsSufficient=true and no bare labels: ask whether they want to add more; set exitOffered=true and tag （已询退出）. Soft ask MUST NOT include "点击【下一步】". Example soft ask: "这几个角度已经可以支撑分析了。还能想到别的吗？如果暂时想不到别的，告诉我，我们再进入第二步。"
@@ -10407,6 +10532,29 @@ Student says:
         question,
         data.progressUpdate,
       );
+
+      // #5 解耦：服务器结构化信号——Step1 题型未定且本轮 AI 文本在追问题型时，
+      // 写入 metadata.step1Phase='ask-question-type'，前端据此渲染 chips（不再正则）。
+      if (currentStepNum === 1 && !session?.step1?.isCompleted) {
+        const eval1 = {
+          ...(session?.step1?.coachEvaluation || {}),
+          ...(data?.progressUpdate?.step1Data &&
+          typeof data.progressUpdate.step1Data === "object"
+            ? data.progressUpdate.step1Data
+            : {}),
+        };
+        if (!String(eval1.correctType || "").trim()) {
+          const askText = String(data?.text || "");
+          if (
+            /题型|属于什么|哪一类|Question Type|question type/i.test(askText)
+          ) {
+            if (!data.metadata || typeof data.metadata !== "object") {
+              data.metadata = {};
+            }
+            data.metadata.step1Phase = "ask-question-type";
+          }
+        }
+      }
 
       log.endTurn(turnId, String(data.text || ''), data.progressUpdate);
       res.json(data);

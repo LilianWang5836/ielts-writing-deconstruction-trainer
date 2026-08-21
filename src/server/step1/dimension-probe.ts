@@ -9,11 +9,29 @@ export const STEP1_PROBE_THIN = '空标签';
 export const STEP1_PROBE_QUALITY_PENDING = '质量待确认';
 export const STEP1_PROBE_PROBED = '已探测';
 export const STEP1_PROBE_EXIT_OFFERED = '已询退出';
+// #2 语义裁决标签：LLM 可返回 off_target/duplicate/standalone，服务端盖章。
+export const STEP1_PROBE_OFF_TARGET = '偏题';
+export const STEP1_PROBE_DUPLICATE = '重复';
+export const STEP1_PROBE_STANDALONE = '独立成点';
 
-export type Step1ProbeVerdict = 'expandable' | 'thin' | '';
+/**
+ * #2 信号源规范：verdict 不再只有 expandable/thin，新增语义类别。
+ * - expandable: 有具体内容可展开（默认正向）
+ * - thin: 空泛/拒绝
+ * - off_target: 偏题——维度不回应题目写作任务
+ * - duplicate: 与已有维度重复
+ * - standalone: 能独立成点（比 expandable 更强的正向信号）
+ */
+export type Step1ProbeVerdict =
+  | 'expandable'
+  | 'thin'
+  | 'off_target'
+  | 'duplicate'
+  | 'standalone'
+  | '';
 
 const STATUS_TAG_RE =
-  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测)\s*[）)]/g;
+  /[（(]\s*(可展开|空标签|质量待确认|已探测|已询退出|待探测|偏题|重复|独立成点)\s*[）)]/g;
 
 const SIDE_TAG_RE = /[（(]\s*侧[：:]\s*([ABG])\s*[）)]/;
 
@@ -62,7 +80,7 @@ export function hasStep1StatusTag(dim: string, tag: string): boolean {
   return new RegExp(`[（(]\\s*${tag}\\s*[）)]`).test(String(dim || ''));
 }
 
-/** No probe verdict yet — missing 已探测 and missing expandable/thin/pending. */
+/** No probe verdict yet — missing 已探测 and missing expandable/thin/pending/语义标签. */
 export function isStep1DimensionUnprobed(dim: string): boolean {
   const t = String(dim || '').trim();
   if (!t) return false;
@@ -70,7 +88,24 @@ export function isStep1DimensionUnprobed(dim: string): boolean {
   if (hasStep1StatusTag(t, STEP1_PROBE_EXPANDABLE)) return false;
   if (hasStep1StatusTag(t, STEP1_PROBE_THIN)) return false;
   if (hasStep1StatusTag(t, STEP1_PROBE_QUALITY_PENDING)) return false;
+  // #2 新语义标签也算已探测
+  if (hasStep1StatusTag(t, STEP1_PROBE_OFF_TARGET)) return false;
+  if (hasStep1StatusTag(t, STEP1_PROBE_DUPLICATE)) return false;
+  if (hasStep1StatusTag(t, STEP1_PROBE_STANDALONE)) return false;
   return true;
+}
+
+/**
+ * #2 语义排除：维度被裁决为偏题或重复时，不计入有效维度。
+ * standalone 不排除（是更强的正向信号，仍计入）。
+ */
+export function isStep1DimensionSemanticallyExcluded(dim: string): boolean {
+  const t = String(dim || '').trim();
+  if (!t) return false;
+  return (
+    hasStep1StatusTag(t, STEP1_PROBE_OFF_TARGET) ||
+    hasStep1StatusTag(t, STEP1_PROBE_DUPLICATE)
+  );
 }
 
 export function stampStep1StatusTag(dim: string, tag: string): string {
@@ -85,6 +120,9 @@ const PROBE_STATUS_TAGS = [
   STEP1_PROBE_EXPANDABLE,
   STEP1_PROBE_THIN,
   STEP1_PROBE_QUALITY_PENDING,
+  STEP1_PROBE_OFF_TARGET,
+  STEP1_PROBE_DUPLICATE,
+  STEP1_PROBE_STANDALONE,
 ] as const;
 
 function collectCores(dims: string[] | null | undefined): Set<string> {
@@ -221,6 +259,16 @@ export function normalizeProbeVerdict(raw: unknown): Step1ProbeVerdict {
   ) {
     return 'thin';
   }
+  // #2 语义裁决映射
+  if (s === 'off_target' || s === 'off-topic' || s === '偏题' || s === '跑题') {
+    return 'off_target';
+  }
+  if (s === 'duplicate' || s === '重复' || s === '重复角度') {
+    return 'duplicate';
+  }
+  if (s === 'standalone' || s === '独立成点' || s === '独立') {
+    return 'standalone';
+  }
   return '';
 }
 
@@ -249,6 +297,17 @@ export function inferProbeVerdictFromStudentMessage(
 }
 
 /**
+ * Issue #1 双确认护栏：判断学生消息本身是否像 thin（拒绝/含糊）。
+ * 用于当 LLM 返回 thin 时做二次确认——只有学生消息也像 thin 才采信 LLM 的
+ * thin 判断；否则服务端覆盖为 expandable（避免 LLM 把"打人"等具体例子误判 thin）。
+ */
+export function studentMessageLooksThin(message: string): boolean {
+  const t = String(message || '').trim();
+  if (!t) return true;
+  return STEP1_THIN_ANSWER_RE.test(t);
+}
+
+/**
  * After a server-forced probe ask: stamp target from probeVerdict.
  * Strips any model self-tags on the target first; missing verdict → 空标签.
  */
@@ -260,19 +319,82 @@ export function resolvePendingProbeAnswer(
   const core = stripStep1AllTags(pendingCore).toLowerCase();
   if (!core) return dims;
   const v = normalizeProbeVerdict(verdict);
+  // Issue #1：core 匹配放宽。原精确相等（!==）在 LLM 重写 label 文本时
+  // （如"暴力等伤害行为"→"暴力行为"）导致不盖章 → pendingProbeCore 被清
+  // 但维度仍未探测 → 下一轮重选 → 固定模板再触发。改为双向包含匹配：
+  // pending core 是 dim core 的子串，或反过来，即视为同一维度。
+  const coreMatches = (dimCore: string): boolean => {
+    if (!dimCore) return false;
+    if (dimCore === core) return true;
+    if (dimCore.length >= 2 && core.includes(dimCore)) return true;
+    if (core.length >= 2 && dimCore.includes(core)) return true;
+    return false;
+  };
   return (dims || []).map((d) => {
     const raw = String(d || '').trim();
-    if (stripStep1AllTags(raw).toLowerCase() !== core) return raw;
+    const dimCore = stripStep1AllTags(raw).toLowerCase();
+    if (!coreMatches(dimCore)) return raw;
     // Drop self-reported status tags; keep task suffixes (原因/评价/…).
     let next = stripStep1StatusTags(raw) || raw;
     next = stampStep1StatusTag(next, STEP1_PROBE_PROBED);
-    if (v === 'expandable') {
+    // #2 语义裁决盖章：expandable/standalone → 可展开；thin → 空标签；
+    // off_target → 偏题；duplicate → 重复。空 verdict 默认 thin。
+    if (v === 'expandable' || v === 'standalone') {
       next = stampStep1StatusTag(next, STEP1_PROBE_EXPANDABLE);
+      if (v === 'standalone') {
+        next = stampStep1StatusTag(next, STEP1_PROBE_STANDALONE);
+      }
+    } else if (v === 'off_target') {
+      next = stampStep1StatusTag(next, STEP1_PROBE_OFF_TARGET);
+    } else if (v === 'duplicate') {
+      next = stampStep1StatusTag(next, STEP1_PROBE_DUPLICATE);
     } else {
       next = stampStep1StatusTag(next, STEP1_PROBE_THIN);
     }
     return next;
   });
+}
+
+/**
+ * Issue #6：probe resolve 后，若 LLM 未把该维度写入 suggestedDimensions，
+ * 服务端主动注入一条带戳的裸标签。右侧棋盘因此不再滞后于对话。
+ * 已存在匹配行（含双向包含）时不重复注入。下一轮 LLM 若丢掉它，
+ * preserveStep1ProbeTags 会按 reappendedCores 恢复。
+ */
+export function ensureProbeTargetInjected(
+  dims: string[],
+  pendingCore: string,
+  verdict?: unknown,
+): { dims: string[]; injected: boolean } {
+  const core = stripStep1AllTags(pendingCore).toLowerCase();
+  if (!core) return { dims, injected: false };
+  const v = normalizeProbeVerdict(verdict);
+  const exists = (dims || []).some((d) => {
+    const dimCore = stripStep1AllTags(String(d || '')).toLowerCase();
+    if (!dimCore) return false;
+    if (dimCore === core) return true;
+    if (dimCore.length >= 2 && core.includes(dimCore)) return true;
+    if (core.length >= 2 && dimCore.includes(core)) return true;
+    return false;
+  });
+  if (exists) return { dims, injected: false };
+  let row = String(pendingCore || '').trim() || core;
+  row = stripStep1StatusTags(row) || row;
+  row = stampStep1StatusTag(row, STEP1_PROBE_PROBED);
+  // #2 语义裁决盖章（与 resolvePendingProbeAnswer 一致）
+  if (v === 'expandable' || v === 'standalone') {
+    row = stampStep1StatusTag(row, STEP1_PROBE_EXPANDABLE);
+    if (v === 'standalone') {
+      row = stampStep1StatusTag(row, STEP1_PROBE_STANDALONE);
+    }
+  } else if (v === 'off_target') {
+    row = stampStep1StatusTag(row, STEP1_PROBE_OFF_TARGET);
+  } else if (v === 'duplicate') {
+    row = stampStep1StatusTag(row, STEP1_PROBE_DUPLICATE);
+  } else {
+    row = stampStep1StatusTag(row, STEP1_PROBE_THIN);
+  }
+  return { dims: [...(dims || []), row], injected: true };
 }
 
 /** Student-exhaust escape only: remaining bare labels → 质量待确认 + 已探测. */
@@ -296,8 +418,23 @@ export function earliestUnprobedDimension(
   return null;
 }
 
-export function buildBareDimensionProbeAsk(dim: string): string {
+export function buildBareDimensionProbeAsk(dim: string, askCount = 0): string {
   const label = stripStep1AllTags(dim) || String(dim || '').trim() || '这个角度';
+  // Issue #1：探针问句轮换措辞。第 1 次用原模板；第 2+ 次换问法，避免学生
+  // 看到几乎同一句话再问一遍（反馈："我刚刚不是已经回答了"）。措辞仍偏轻量
+  // 过滤，不升级为深度盘问。
+  if (askCount >= 2) {
+    return (
+      `「${label}」这块再具体一点呢？能想到一个实际场景或例子吗？` +
+      `哪怕一句话也行；实在没有我们就换角度。`
+    );
+  }
+  if (askCount === 1) {
+    return (
+      `「${label}」能再展开一点吗？比如举个实际的场景或对象。` +
+      `一两句话就够；暂时没有也没关系，我们换下一个角度。`
+    );
+  }
   // 真人口吻（真实用户“非常人机”反馈后自然化）：不用“苗头/信号”这类检查清单式措辞。
   return (
     `「${label}」这个角度，你脑海里有没有浮现出具体的画面或例子？` +
